@@ -1,0 +1,22 @@
+# 機密設定（真實值）
+config.py
+.env
+
+# 家人清單與執行期資料
+data/
+pending/
+
+# Log
+*.log
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# 作業系統
+Thumbs.db
+.DS_Store
