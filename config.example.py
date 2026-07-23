@@ -8,6 +8,7 @@ BOT_TOKEN = "請填入向 @BotFather 申請的 token"
 ADMIN_ID = 0  # 管理員的 Telegram ID（數字），用 @userinfobot 之類的工具查詢
 
 # ── 路徑設定（日後可自由調整）──────────────────
+ENABLE_NAS = True             # 區網硬碟目的地開關；硬碟故障/尚未設置時可設 False，只留 OneDrive
 DEST_NAS = r"\\192.168.1.1\g\照片"          # 區網硬碟
 DEST_ONEDRIVE = r"C:\Users\User\OneDrive\照片"  # OneDrive 同步夾
 TEMP_DIR = r"D:\photo-bot-temp"              # 暫存區（建議放空間大的磁碟）

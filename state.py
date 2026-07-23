@@ -90,8 +90,12 @@ class UploadSession:
     restart_clicked: bool = False
     compressed_warned: bool = False
     counter_last_update: Optional[datetime] = None
+    counter_message_id: Optional[int] = None  # 收件計數訊息 id，靠編輯同一則訊息更新，不洗版（§6.3.1）
+    confirm_message_id: Optional[int] = None  # 「確認中…」訊息 id，緩衝期間收到新照片時更新張數
     destinations: dict = field(default_factory=dict)  # label -> DestinationOutcome
     last_written_count: int = 0  # 已成功複製到目的地（含所有內部小批）的張數，供「傳完了」時計算剩餘
+    flushed_count: int = 0  # session.files 中，前面已經被進度性分批處理過（複製或列入重試）的張數
+    pending_retry_files: list = field(default_factory=list)  # 進度性分批時寫入失敗、留待批次後重試的檔案
 
     def touch(self, now: Optional[datetime] = None) -> None:
         self.last_activity_at = now or datetime.now()

@@ -244,3 +244,20 @@ def test_health_check_failure_on_unwritable_path(tmp_path):
     ok, err = storage.health_check(bad_dir)
     assert ok is False
     assert err
+
+
+# ── session 側車檔（§4.3 中斷復原策略，記錄目的地供補送使用）─────
+
+def test_write_and_read_session_info_roundtrip(tmp_path):
+    info = {"destination": "兩邊都存", "folder": "阿嬤生日", "telegram_id": 123, "name": "秀琴"}
+    storage.write_session_info(tmp_path, info)
+    assert storage.read_session_info(tmp_path) == info
+
+
+def test_read_session_info_missing_returns_none(tmp_path):
+    assert storage.read_session_info(tmp_path) is None
+
+
+def test_read_session_info_corrupted_returns_none(tmp_path):
+    (tmp_path / storage.SESSION_INFO_FILENAME).write_text("{not valid json", encoding="utf-8")
+    assert storage.read_session_info(tmp_path) is None

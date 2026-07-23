@@ -36,7 +36,16 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if member.status == STATUS_REJECTED:
         await show_welcome(update, context)
         return
-    # 已開通
+    # 已開通：若正在上傳 session 中，/start 不應該看起來像「重來」，只回報現況，
+    # 真正要重來一律走 🔄 重新開始（§6.3、§6.5，避免兩種入口語意混淆）。
+    sessions = context.application.bot_data["sessions"]
+    session = sessions.get(telegram_id)
+    if session is not None:
+        await update.effective_message.reply_text(
+            f"你正在上傳中喔（資料夾：{session.folder or '（尚未選）'} ／ 已收到 {session.received_count} 張）\n"
+            "要重來的話請用下面的『🔄 重新開始』按鈕，不是這裡。"
+        )
+        return
     await update.effective_message.reply_text("歡迎回來！", reply_markup=start_upload_keyboard())
 
 

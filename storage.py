@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import time
@@ -107,6 +108,32 @@ def session_temp_dir(user_dir: Path, timestamp: datetime, folder_name: str) -> P
     safe_folder = sanitize_folder_name(folder_name) or "未命名資料夾"
     stamp = timestamp.strftime("%Y%m%d_%H%M")
     return Path(user_dir) / f"{stamp}_{safe_folder}"
+
+
+SESSION_INFO_FILENAME = "_session_info.json"
+
+
+def write_session_info(session_dir: Path, info: dict) -> None:
+    """
+    在暫存子夾裡記一份側車檔，記錄這次上傳的目的地／資料夾／上傳者。
+    暫存資料夾名稱本身只帶得動資料夾名，記不下「選了哪個目的地」；
+    程式中斷後若沒有這份資訊，復原時就只能用預設值瞎猜，可能補送到錯的地方
+    （見規格書 §4.3 中斷復原策略）。
+    """
+    ensure_dir(session_dir)
+    (Path(session_dir) / SESSION_INFO_FILENAME).write_text(
+        json.dumps(info, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def read_session_info(session_dir: Path) -> Optional[dict]:
+    p = Path(session_dir) / SESSION_INFO_FILENAME
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 
 # ── 複製（含重試）────────────────────────────────────

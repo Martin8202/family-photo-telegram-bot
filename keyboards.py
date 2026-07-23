@@ -42,7 +42,15 @@ def folder_choice_keyboard(recent_folders: list[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows) if rows else InlineKeyboardMarkup([])
 
 
-def destination_keyboard() -> InlineKeyboardMarkup:
+def destination_keyboard(enable_nas: bool = True) -> InlineKeyboardMarkup:
+    """
+    區網硬碟可透過 config.ENABLE_NAS 整個關閉（例如硬碟暫時故障期間）：
+    關閉時只留 OneDrive，「兩邊都存」也一併隱藏，避免使用者選到用不了的選項。
+    """
+    if not enable_nas:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"☁️ {DEST_ONEDRIVE_LABEL}", callback_data=f"{CB_DEST_PREFIX}{DEST_ONEDRIVE_LABEL}")],
+        ])
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🏠 {DEST_NAS_LABEL}", callback_data=f"{CB_DEST_PREFIX}{DEST_NAS_LABEL}")],
         [InlineKeyboardButton(f"☁️ {DEST_ONEDRIVE_LABEL}", callback_data=f"{CB_DEST_PREFIX}{DEST_ONEDRIVE_LABEL}")],
@@ -55,6 +63,20 @@ def in_session_keyboard(show_finish: bool = True) -> InlineKeyboardMarkup:
     if show_finish:
         rows.append([InlineKeyboardButton("✅ 我傳完了", callback_data=CB_FINISH)])
     rows.append([InlineKeyboardButton("🔄 重新開始", callback_data=CB_RESTART)])
+    return InlineKeyboardMarkup(rows)
+
+
+def restart_row() -> list:
+    return [InlineKeyboardButton("🔄 重新開始", callback_data=CB_RESTART)]
+
+
+def with_restart(markup: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
+    """
+    在任何 inline keyboard 底下附加一顆「🔄 重新開始」。
+    規格書 §6.5：這顆按鈕在 session 進行中全程可見（選資料夾、選目的地、
+    傳照片、處理中皆可見），不是只有收到照片之後才出現。
+    """
+    rows = list(markup.inline_keyboard) + [restart_row()]
     return InlineKeyboardMarkup(rows)
 
 

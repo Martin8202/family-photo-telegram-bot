@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 
@@ -89,6 +90,10 @@ def user_msg_choose_folder_first() -> str:
     return "請先選資料夾"
 
 
+def user_msg_unsupported_media() -> str:
+    return "目前只支援傳照片喔，這個檔案類型還不支援，請見諒"
+
+
 def user_msg_error_generic() -> str:
     return "出了點狀況，已通知管理員"
 
@@ -109,6 +114,10 @@ def user_msg_correction_done(count: int, new_folder: str) -> str:
     return f"✅ 已經幫你把這 {count} 張改放到「{new_folder}」了"
 
 
+def user_msg_correction_processing(new_folder: str) -> str:
+    return f"📦 已收到，正在把這批搬到「{new_folder}」，請稍等…"
+
+
 def user_msg_health_check_failed() -> str:
     return "現在暫時無法上傳，請稍後再試"
 
@@ -121,8 +130,8 @@ def user_msg_receiving(count: int) -> str:
     return f"📥 收到照片中… {count} 張"
 
 
-def user_msg_confirming() -> str:
-    return "⏳ 確認中…"
+def user_msg_confirming(count: int) -> str:
+    return f"⏳ 確認中…（目前共 {count} 張，稍等一下確認沒有漏收）"
 
 
 def user_msg_uploading(progress_bar_text: str) -> str:
@@ -138,14 +147,29 @@ def user_msg_onedrive_cloud_note() -> str:
 
 
 class Notifier:
-    """實際發送 Telegram 訊息的薄封裝（依賴 telegram.Bot，交由呼叫端注入）。"""
+    """
+    實際發送 Telegram 訊息的薄封裝（依賴 telegram.Bot，交由呼叫端注入）。
+
+    通知失敗（例如管理員／使用者尚未對 bot 按過 START，Telegram 回
+    "Chat not found"）絕不可讓呼叫端的核心流程（健檢、上傳、復原…）
+    整個崩潰，因此這裡一律吞下例外並記錄 log，而非往外拋。
+    """
 
     def __init__(self, bot, admin_id: int):
         self._bot = bot
         self._admin_id = admin_id
+        self._logger = logging.getLogger("photo-bot.notify")
 
-    async def notify_admin(self, text: str, reply_markup=None) -> None:
-        await self._bot.send_message(chat_id=self._admin_id, text=text, reply_markup=reply_markup)
+    async def _send(self, chat_id: int, text: str, reply_markup=None) -> bool:
+        try:
+            await self._bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+            return True
+        except Exception as exc:  # noqa: BLE001 - 通知失敗不可中斷主流程
+            self._logger.error("發送 Telegram 訊息失敗（chat_id=%s）：%s", chat_id, exc)
+            return False
 
-    async def notify_user(self, telegram_id: int, text: str, reply_markup=None) -> None:
-        await self._bot.send_message(chat_id=telegram_id, text=text, reply_markup=reply_markup)
+    async def notify_admin(self, text: str, reply_markup=None) -> bool:
+        return await self._send(self._admin_id, text, reply_markup)
+
+    async def notify_user(self, telegram_id: int, text: str, reply_markup=None) -> bool:
+        return await self._send(telegram_id, text, reply_markup)
