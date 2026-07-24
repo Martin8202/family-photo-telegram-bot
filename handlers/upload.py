@@ -319,7 +319,11 @@ async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, sessio
 
 
 async def _flush_ready_chunks(context: ContextTypes.DEFAULT_TYPE, session) -> None:
-    """收照片過程中，只要累積滿一個內部小批就立刻複製到目的地（§6.3 point 2）。"""
+    """
+    收件階段（STAGE_RECEIVING_PHOTOS）只要累積滿一個內部小批就立刻複製到目的地（§6.3 point 2）。
+    只在呼叫端限定於收件階段呼叫——按下「我傳完了」進入緩衝期（STAGE_DEBOUNCE）後收到的
+    照片，一律遞延到 _finalize_upload 收齊結案時才一次處理，讓「確認中」階段不再有背景複製動作。
+    """
     _, _, config, _, _ = _services(context)
     dest_targets = _destination_targets(session.destination, config, session.folder)
     while len(session.files) - session.flushed_count >= config.BATCH_SIZE:
@@ -408,8 +412,12 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         session.counter_last_update = datetime.now()
         await _update_counter_message(update, context, session)
 
-    # 每滿一個內部小批（預設 20 張）就立刻複製到目的地，不必等「我傳完了」（§6.3 point 2）
-    await _flush_ready_chunks(context, session)
+    if session.stage == STAGE_RECEIVING_PHOTOS:
+        # 每滿一個內部小批（預設 20 張）就立刻複製到目的地，不必等「我傳完了」（§6.3 point 2）。
+        # 緩衝期間（STAGE_DEBOUNCE）收到的照片刻意不在這裡分批複製，全部遞延到
+        # debounce 結束、確定收齊後才一次處理（見 _finalize_upload），
+        # 避免「確認中」階段還在背景默默複製造成混淆。
+        await _flush_ready_chunks(context, session)
 
     if session.stage == STAGE_DEBOUNCE:
         # 緩衝期間收到新照片：一律計入本批、一律重新計時（§6.3，確保不漏收）。
@@ -483,6 +491,14 @@ async def handle_finish_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if session.stage != STAGE_RECEIVING_PHOTOS:
         return  # 其餘階段沒有這顆按鈕可點
     session.finish_clicked = True
+    if session.counter_message_id is not None:
+        # 收件階段的「📥 收到照片中…」訊息在此結束任務，點了我傳完了之後
+        # 一律改由「⏳ 確認中…」接手，避免兩則訊息同時留在畫面上。
+        try:
+            await context.bot.delete_message(chat_id=telegram_id, message_id=session.counter_message_id)
+        except Exception:
+            pass
+        session.counter_message_id = None
     session.enter_stage(STAGE_DEBOUNCE)
     sent = await query.message.reply_text(notify.user_msg_confirming(session.received_count))
     session.confirm_message_id = sent.message_id
@@ -524,6 +540,16 @@ async def check_session_timeouts(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_out: bool) -> None:
     members, notifier, config, sessions, logs = _services(context)
     telegram_id = session.telegram_id
+
+    if session.confirm_message_id is not None:
+        # 收齊結案、正式開始寫入目的地：「⏳ 確認中…」的任務結束，改由下面的
+        # 「📤 上傳中」進度條接手，避免兩則狀態訊息同時留在畫面上。
+        try:
+            await context.bot.delete_message(chat_id=telegram_id, message_id=session.confirm_message_id)
+        except Exception:
+            pass
+        session.confirm_message_id = None
+
     session.enter_stage(STAGE_PROCESSING)
 
     total = session.received_count

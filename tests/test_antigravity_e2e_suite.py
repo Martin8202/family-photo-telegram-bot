@@ -367,6 +367,69 @@ async def test_debounce_confirm_message_throttled_but_timer_always_resets(env):
         config.COUNTER_UPDATE_SEC = original_counter_sec
 
 
+@pytest.mark.asyncio
+async def test_debounce_defers_flush_until_finalize(env):
+    """
+    點下「我傳完了」進入緩衝期後，收到的新照片不該再觸發內部小批複製（_flush_ready_chunks）。
+    所有緩衝期間收到的照片，應遞延到 debounce 結束、_finalize_upload 收尾時才一次寫入目的地。
+    """
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+    original_batch_size = config.BATCH_SIZE
+    try:
+        config.BATCH_SIZE = 2  # 縮小批次門檻，方便測試觸發「滿一批」
+        ctx = DummyContext(app)
+        user = DummyUser(1003, "大姊")
+        members: MembersStore = app.bot_data["members"]
+        members.register(1003, "大姊")
+        members.approve(1003)
+
+        await upload.handle_start_upload(DummyUpdate(user, DummyMessage(1, "📷 我要上傳照片", 1003, app.bot)), ctx)
+        await upload.handle_folder_text(DummyUpdate(user, DummyMessage(2, "烤肉", 1003, app.bot)), ctx)
+        dest_msg = DummyMessage(3, "", 1003, app.bot)
+        await upload.handle_destination_button(
+            DummyUpdate(user, dest_msg, DummyCallbackQuery("dest:家裡硬碟", user, dest_msg)), ctx
+        )
+        session = app.bot_data["sessions"].get(1003)
+        dest_dir = nas_dir / "烤肉"
+
+        # 收件階段：滿一批（2 張）應該立刻複製到目的地
+        for i in range(2):
+            photo = MagicMock(); photo.file_id = f"recv_{i}"
+            await upload.handle_photo_message(
+                DummyUpdate(user, DummyMessage(10 + i, "", 1003, app.bot, photo=[photo])), ctx
+            )
+        assert session.flushed_count == 2
+        assert len(list(dest_dir.glob("*.jpg"))) == 2
+
+        # 點「我傳完了」進入緩衝期
+        finish_msg = DummyMessage(20, "", 1003, app.bot)
+        await upload.handle_finish_button(
+            DummyUpdate(user, finish_msg, DummyCallbackQuery("finish", user, finish_msg)), ctx
+        )
+        assert session.stage == "debounce"
+
+        # 緩衝期間再收到 2 張（達到 BATCH_SIZE 門檻），不應該觸發複製
+        for i in range(2):
+            photo = MagicMock(); photo.file_id = f"debounce_{i}"
+            await upload.handle_photo_message(
+                DummyUpdate(user, DummyMessage(21 + i, "", 1003, app.bot, photo=[photo])), ctx
+            )
+        assert session.received_count == 4
+        assert session.flushed_count == 2  # 緩衝期間收到的 2 張還沒被複製
+        assert len(list(dest_dir.glob("*.jpg"))) == 2  # 目的地檔案數量不變
+
+        # debounce 結束，_finalize_upload 應該一次把剩下的 2 張處理完
+        await upload._debounce_fire(ctx_with_job(ctx, 1003))
+        assert len(list(dest_dir.glob("*.jpg"))) == 4
+
+        logs: DataLogs = app.bot_data["logs"]
+        upload_rows = logs.upload_log.read_all_rows()
+        assert len(upload_rows) == 1
+        assert upload_rows[0]["張數"] == "4"
+    finally:
+        config.BATCH_SIZE = original_batch_size
+
+
 def ctx_with_job(ctx, user_id):
     ctx.job = MagicMock()
     ctx.job.data = {"telegram_id": user_id}
