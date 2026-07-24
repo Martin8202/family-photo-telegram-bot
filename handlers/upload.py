@@ -289,7 +289,9 @@ async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, sessio
         ok = all(r.success for r in results)
         chunk_ok_labels[label] = ok
         if ok:
-            outcome.written_paths.extend([r.dest_path for r in results])
+            # 存 (file_id, 實際寫入路徑) 配對，而非只存路徑：日後（如「這批傳錯了」）
+            # 需要反查某個已寫入檔案對應的 file_id 時，才不必依賴容易被重試打亂的順序去猜。
+            outcome.written_paths.extend((rf.file_id, r.dest_path) for rf, r in zip(chunk, results))
         else:
             outcome.failed = True
             outcome.error = next((r.error for r in results if not r.success), "未知錯誤")
@@ -402,7 +404,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         session.compressed_warned = True
         await update.effective_message.reply_text(notify.user_msg_compressed_hint())
 
-    if should_update_counter(session, datetime.now(), config.COUNTER_UPDATE_SEC):
+    if session.stage == STAGE_RECEIVING_PHOTOS and should_update_counter(session, datetime.now(), config.COUNTER_UPDATE_SEC):
         session.counter_last_update = datetime.now()
         await _update_counter_message(update, context, session)
 
@@ -410,13 +412,16 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     await _flush_ready_chunks(context, session)
 
     if session.stage == STAGE_DEBOUNCE:
-        # 緩衝期間收到新照片：計入本批、更新「確認中」張數、並重新計時（§6.3）。
-        # 同樣用「刪舊發新」讓這則狀態訊息留在對話最下面，不卡在中間。
-        if session.confirm_message_id is not None:
-            try:
-                await context.bot.delete_message(chat_id=telegram_id, message_id=session.confirm_message_id)
-            except Exception:
-                pass
+        # 緩衝期間收到新照片：一律計入本批、一律重新計時（§6.3，確保不漏收）。
+        # 畫面上「確認中」訊息的更新則節流至固定每 COUNTER_UPDATE_SEC 秒一次（跟收件
+        # 階段共用同一套節流），避免密集連傳時頻繁刪訊息/發訊息觸發 Telegram 限流（429）。
+        if should_update_counter(session, datetime.now(), config.COUNTER_UPDATE_SEC):
+            session.counter_last_update = datetime.now()
+            if session.confirm_message_id is not None:
+                try:
+                    await context.bot.delete_message(chat_id=telegram_id, message_id=session.confirm_message_id)
+                except Exception:
+                    pass
             try:
                 sent = await update.effective_message.reply_text(notify.user_msg_confirming(session.received_count))
                 session.confirm_message_id = sent.message_id
@@ -461,12 +466,27 @@ async def handle_finish_button(update: Update, context: ContextTypes.DEFAULT_TYP
     _, _, _, sessions, _ = _services(context)
     telegram_id = update.effective_user.id
     session = sessions.get(telegram_id)
-    if session is None or session.stage != STAGE_RECEIVING_PHOTOS:
-        return  # 重複點擊等後續一律忽略（§6.3）
+    if session is None:
+        return
+    if session.stage == STAGE_DEBOUNCE:
+        # 緩衝期間重複點擊：不重新計時、不重算張數（§6.3），但仍要回覆一次
+        # 「確認中」讓使用者知道有被接收到，避免原本完全無回應、看起來像沒反應而一直猛戳。
+        if session.confirm_message_id is not None:
+            try:
+                await context.bot.delete_message(chat_id=telegram_id, message_id=session.confirm_message_id)
+            except Exception:
+                pass
+        sent = await query.message.reply_text(notify.user_msg_confirming(session.received_count))
+        session.confirm_message_id = sent.message_id
+        session.counter_last_update = datetime.now()  # 重設節流起點，避免緊接著的照片又立刻觸發一次更新
+        return
+    if session.stage != STAGE_RECEIVING_PHOTOS:
+        return  # 其餘階段沒有這顆按鈕可點
     session.finish_clicked = True
     session.enter_stage(STAGE_DEBOUNCE)
     sent = await query.message.reply_text(notify.user_msg_confirming(session.received_count))
     session.confirm_message_id = sent.message_id
+    session.counter_last_update = datetime.now()  # 節流起點歸零，緩衝期間的更新從這裡開始算
     _schedule_debounce(context, telegram_id)
 
 
@@ -555,7 +575,9 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
                 retry_results.append(await asyncio.to_thread(_do_copy))
             if all(r.success for r in retry_results):
                 outcome.failed = False
-                outcome.written_paths.extend([r.dest_path for r in retry_results])
+                outcome.written_paths.extend(
+                    (rf.file_id, r.dest_path) for rf, r in zip(all_chunk_failures, retry_results)
+                )
 
     overall_ok = all(not o.failed for o in session.destinations.values())
     if overall_ok:
@@ -598,7 +620,7 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
         await _safe_send(context, telegram_id, "⏱️ 太久沒有動作，已自動幫你把剛剛收到的照片處理完成")
 
     if config.ONEDRIVE_FREE_SPACE and DEST_ONEDRIVE_LABEL in session.destinations:
-        onedrive_paths = session.destinations[DEST_ONEDRIVE_LABEL].written_paths
+        onedrive_paths = [p for _, p in session.destinations[DEST_ONEDRIVE_LABEL].written_paths]
         await asyncio.to_thread(storage.free_onedrive_space, onedrive_paths)
 
     sessions.clear(telegram_id)
@@ -632,8 +654,9 @@ async def handle_restart_confirm(update: Update, context: ContextTypes.DEFAULT_T
     residue_rows = []
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     for label, outcome in session.destinations.items():
-        for path in outcome.written_paths:
-            residue_rows.append((now_str, session.name, telegram_id, "中止殘留", str(Path(path).parent), Path(path).name,
+        for _file_id, path in outcome.written_paths:
+            path = Path(path)
+            residue_rows.append((now_str, session.name, telegram_id, "中止殘留", str(path.parent), path.name,
                                   "使用者重新開始，此為已寫入的中止殘留"))
     if residue_rows:
         await asyncio.to_thread(logs.log_cleanup_batch, residue_rows)
@@ -687,13 +710,22 @@ async def _apply_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     # 正在處理中，避免看起來像卡住（規格書 §6.3.1 的即時回饋精神同樣適用於此）。
     await update.effective_message.reply_text(notify.user_msg_correction_processing(new_folder))
 
-    total_moved = 0
+    uploader = members.get(telegram_id)
+    uploader_name = uploader.name if uploader else str(telegram_id)
+
     cleanup_rows = []
+    index_rows = []
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     roots = _destination_roots(config)
-    for label, paths in batch.written_paths.items():
+    # 依「每一張照片的 file_id」而非「每一個 (目的地,路徑) 組合」計算成功數，避免
+    # 「兩邊都存」時同一張照片在兩個目的地各成功一次卻被算成 2 張，導致回報張數與
+    # upload_log 加倍。written_paths 裡存的是寫入當下就配好的 (file_id, 路徑)，
+    # 不必事後用順序去猜對應關係。
+    all_file_ids = {file_id for pairs in batch.written_paths.values() for file_id, _ in pairs}
+    failed_file_ids: set[str] = set()
+    for label, pairs in batch.written_paths.items():
         new_dir = roots[label] / new_folder
-        for old_path in paths:
+        for file_id, old_path in pairs:
             old_path = Path(old_path)
 
             try:
@@ -705,17 +737,28 @@ async def _apply_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 return storage.copy_file_with_retry(old_path, new_dir, old_path.name, config.RETRY_TIMES, config.RETRY_DELAYS)
 
             result = await asyncio.to_thread(_do_copy)
+            # file_index：新位置的每一次寫入嘗試都要記錄，成功或失敗皆記（比照 §16.1 的
+            # 一般上傳流程），檔名以實際落地檔名為準，撞名時才不會與真正寫入的檔案對不上。
+            actual_filename = result.dest_path.name if result.success and result.dest_path else old_path.name
+            index_rows.append((now_str, uploader_name, telegram_id, new_folder, label, actual_filename, file_id))
             if result.success:
-                total_moved += 1
                 cleanup_rows.append((now_str, batch.destination_label, telegram_id, "傳錯更正",
                                       str(old_path.parent), old_path.name, f"已改放至「{new_folder}」"))
+            else:
+                failed_file_ids.add(file_id)
+
+    total_moved = len(all_file_ids - failed_file_ids)
 
     if cleanup_rows:
         await asyncio.to_thread(logs.log_cleanup_batch, cleanup_rows)
+    if index_rows:
+        await asyncio.to_thread(logs.log_file_index_batch, index_rows)
 
     await update.effective_message.reply_text(notify.user_msg_correction_done(total_moved, new_folder))
-    uploader = members.get(telegram_id)
-    uploader_name = uploader.name if uploader else str(telegram_id)
+    await asyncio.to_thread(
+        logs.log_upload, now_str, uploader_name, telegram_id,
+        f"{batch.folder} → {new_folder}", batch.destination_label, total_moved, "傳錯更正",
+    )
     await notifier.notify_admin(
         notify.msg_correction(uploader_name, batch.folder, new_folder, total_moved)
     )

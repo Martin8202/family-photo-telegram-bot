@@ -59,7 +59,7 @@ class DestinationOutcome:
     done: bool = False
     failed: bool = False
     error: Optional[str] = None
-    written_paths: list = field(default_factory=list)
+    written_paths: list = field(default_factory=list)  # list[(file_id, Path)]，寫入當下就配對，避免事後靠順序反推
 
 
 @dataclass
