@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -73,7 +75,8 @@ async def handle_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     name = name[:30]  # 避免超長字串造成顯示異常（§A9）
 
     context.user_data[AWAITING_NAME_KEY] = False
-    members.register(telegram_id, name)
+    # members 寫入會經由寫入佇列並等待完成，以 to_thread 執行避免阻塞事件迴圈（§3）
+    await asyncio.to_thread(members.register, telegram_id, name)
 
     await update.effective_message.reply_text(notify.user_msg_pending_review())
     await notifier.notify_admin(
@@ -88,7 +91,7 @@ async def handle_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer()
     members, notifier, _ = _services(context)
     telegram_id = int(query.data.split(":", 1)[1])
-    member = members.approve(telegram_id)
+    member = await asyncio.to_thread(members.approve, telegram_id)
     if member is None:
         return
     await query.edit_message_text(f"已開通：{member.name}（{telegram_id}）")
@@ -104,7 +107,7 @@ async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await query.answer()
     members, _, _ = _services(context)
     telegram_id = int(query.data.split(":", 1)[1])
-    member = members.reject(telegram_id)
+    member = await asyncio.to_thread(members.reject, telegram_id)
     if member is None:
         return
     await query.edit_message_text(f"已拒絕：{member.name}（{telegram_id}）")

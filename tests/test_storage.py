@@ -28,14 +28,31 @@ def test_read_exif_datetime_missing_file_returns_none(tmp_path):
     assert storage.read_exif_datetime(fake) is None
 
 
-def test_build_filename_uses_exif_when_present(tmp_path):
+def _make_photo_with_exif_original(img_path, dt_str: str):
+    """
+    產生一張把 DateTimeOriginal 存在「Exif 子標籤頁」的照片——這才是真實相機/手機
+    的存法。若寫進根標籤頁（早期測試的錯誤寫法）會測不到實際的讀取路徑。
+    """
     from PIL import Image
 
-    img_path = tmp_path / "photo.jpg"
     img = Image.new("RGB", (4, 4), color="red")
     exif = img.getexif()
-    exif[36867] = "2008:02:27 14:30:15"  # DateTimeOriginal
+    sub = exif.get_ifd(storage.EXIF_SUB_IFD_TAG)
+    sub[storage.TAG_DATETIME_ORIGINAL] = dt_str
     img.save(img_path, exif=exif)
+
+
+def test_read_exif_datetime_from_sub_ifd(tmp_path):
+    """回歸測試：DateTimeOriginal 存在子標籤頁時必須讀得到（先前的 bug 就是讀不到）。"""
+    img_path = tmp_path / "camera.jpg"
+    _make_photo_with_exif_original(img_path, "2008:02:27 14:30:15")
+    dt = storage.read_exif_datetime(img_path)
+    assert dt == datetime(2008, 2, 27, 14, 30, 15)
+
+
+def test_build_filename_uses_exif_when_present(tmp_path):
+    img_path = tmp_path / "photo.jpg"
+    _make_photo_with_exif_original(img_path, "2008:02:27 14:30:15")
 
     received = datetime(2026, 7, 23, 10, 0, 0, 999999)
     name = storage.build_filename(received, ext=".jpg", source_path=img_path, use_exif=True)

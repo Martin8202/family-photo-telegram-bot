@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -147,7 +148,9 @@ async def startup_health_check(app: Application) -> None:
     if cfg.ENABLE_NAS:
         targets.insert(0, ("家裡硬碟", cfg.DEST_NAS))
     for label, path in targets:
-        ok, err = storage.health_check(Path(path))
+        # 健檢會對網芳寫入測試檔，SMB 卡住時可能耗時數十秒；必須以 to_thread 執行，
+        # 否則會阻塞整個 asyncio 事件迴圈、讓 bot 對所有人失去回應（規格書 §3）。
+        ok, err = await asyncio.to_thread(storage.health_check, Path(path))
         if not ok:
             logger.error("啟動健檢失敗：%s %s", label, err)
             await notifier.notify_admin(notify.msg_health_check_failed(label, err or "未知錯誤"))

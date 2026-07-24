@@ -24,11 +24,21 @@ except ImportError:
 
 
 def load_groups(data_dir: Path):
+    """
+    依「目標資料夾＋上傳者＋日期」分組。同一張照片在「📦 兩邊都存」時，file_index
+    會有兩列（家裡硬碟、OneDrive）但 file_id 相同——必須依 file_id 去重，否則
+    工具會對同一張照片重複下載兩次、且顯示張數加倍（review 問題二）。
+    """
     logs = DataLogs(data_dir)
     rows = logs.file_index.read_all_rows()
     groups = defaultdict(list)
+    seen = defaultdict(set)  # 每組已收錄的 file_id，用於去重
     for row in rows:
         key = (row["目標資料夾"], row["上傳者"], row["時間"][:10])
+        file_id = row.get("file_id")
+        if file_id and file_id in seen[key]:
+            continue
+        seen[key].add(file_id)
         groups[key].append(row)
     return groups
 

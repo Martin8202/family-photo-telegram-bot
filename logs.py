@@ -17,7 +17,7 @@ import io
 from pathlib import Path
 from typing import Optional
 
-from writequeue import WriteQueue, atomic_write_text, default_write_queue
+from writequeue import WriteQueue, append_bytes, atomic_write_text, default_write_queue
 
 UPLOAD_LOG_HEADER = ["時間", "上傳者", "Telegram ID", "資料夾", "目的地", "張數", "結果"]
 CLEANUP_LIST_HEADER = ["時間", "上傳者", "Telegram ID", "類型", "待刪位置", "檔名", "備註"]
@@ -49,12 +49,15 @@ class CsvLog:
         if not rows:
             return
 
+        # 追加的資料列用純 utf-8（不帶 BOM，BOM 只屬於檔首、由建檔時的 header 帶入）。
+        data = self._render(rows).encode("utf-8")
+
         def _write():
-            existing = ""
-            if self.path.exists():
-                existing = self.path.read_text(encoding="utf-8-sig")
-            new_text = existing + self._render(rows)
-            atomic_write_text(self.path, new_text)
+            # 防呆：若檔案在執行期被外部刪除，先補回帶 BOM 的 header 再追加，
+            # 確保 Excel 仍能正確辨識編碼與欄位。
+            if not self.path.exists():
+                atomic_write_text(self.path, self._render([self.header]))
+            append_bytes(self.path, data)
 
         self._write_queue.submit(_write)
 

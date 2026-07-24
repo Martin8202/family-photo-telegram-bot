@@ -10,7 +10,6 @@ from state import (
     ReceivedFile,
     SessionManager,
     chunk_files,
-    group_by_media_group,
     progress_bar,
     recent_folder_icon,
     should_update_counter,
@@ -108,7 +107,7 @@ def test_chunk_files_exact_multiple():
     assert [len(c) for c in chunks] == [20, 20]
 
 
-# ── media group 聚合（相簿，§6.3、C7）─────────────────
+# ── 相簿（media group）計數：逐張加入即為正確計數（§6.3、C7）──────
 
 def _rf(file_id, media_group_id=None):
     return ReceivedFile(
@@ -117,19 +116,14 @@ def _rf(file_id, media_group_id=None):
     )
 
 
-def test_group_by_media_group_aggregates_album():
-    files = [_rf("a", "g1"), _rf("b", "g1"), _rf("c", None), _rf("d", "g1")]
-    groups = group_by_media_group(files)
-    sizes = sorted(len(g) for g in groups)
-    assert sizes == [1, 3]
-    total = sum(len(g) for g in groups)
-    assert total == len(files)  # 計數不重複、不遺漏（C7）
-
-
-def test_group_by_media_group_all_singles():
-    files = [_rf("a"), _rf("b"), _rf("c")]
-    groups = group_by_media_group(files)
-    assert len(groups) == 3
+def test_album_photos_counted_individually():
+    """相簿每張各自 add_file，received_count 應等於張數，不重複也不漏算。"""
+    mgr = SessionManager()
+    s = mgr.start(1, "秀琴")
+    for fid in ["a", "b", "c", "d"]:
+        s.add_file(_rf(fid, media_group_id="g1"))
+    s.add_file(_rf("e", media_group_id=None))
+    assert s.received_count == 5
 
 
 # ── 收件計數節流（§6.3.1、C1）──────────────────────────

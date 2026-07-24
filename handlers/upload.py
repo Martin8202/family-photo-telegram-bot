@@ -12,25 +12,9 @@ from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
-logger = logging.getLogger("photo-bot.upload")
-
-
-async def _safe_send(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, reply_markup=None):
-    """
-    送出 Telegram 訊息，失敗只記 log、不拋例外。
-
-    關鍵原則（照片不遺失）：實際搬運照片的流程，絕不可以因為「送一則狀態訊息
-    失敗」（例如網路瞬斷造成的 NetworkError）而整個中斷——否則暫存區的照片
-    會滯留、session 卡住無法收尾。所有收尾階段的 Telegram 呼叫一律走這裡。
-    """
-    try:
-        return await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("送出 Telegram 訊息失敗（chat_id=%s）：%s", chat_id, exc)
-        return None
-
 import notify
 import storage
+from members import STATUS_APPROVED
 from telegram import InlineKeyboardMarkup
 
 from keyboards import (
@@ -68,7 +52,35 @@ from state import (
     should_update_counter,
 )
 
+logger = logging.getLogger("photo-bot.upload")
+
 AWAITING_CORRECTION_FLAG = "awaiting_correction_folder"
+
+
+async def _safe_send(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, reply_markup=None):
+    """
+    送出 Telegram 訊息，失敗只記 log、不拋例外。
+
+    關鍵原則（照片不遺失）：實際搬運照片的流程，絕不可以因為「送一則狀態訊息
+    失敗」（例如網路瞬斷造成的 NetworkError）而整個中斷——否則暫存區的照片
+    會滯留、session 卡住無法收尾。所有收尾階段的 Telegram 呼叫一律走這裡。
+    """
+    try:
+        return await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("送出 Telegram 訊息失敗（chat_id=%s）：%s", chat_id, exc)
+        return None
+
+
+async def _safe_delete_temp(path, temp_root) -> None:
+    """
+    刪除暫存區內的檔案／資料夾，以 to_thread 執行避免阻塞事件迴圈（規格書 §3），
+    並吞下刪除圍籬例外（非暫存區路徑一律拒絕，屬預期行為）。
+    """
+    try:
+        await asyncio.to_thread(storage.safe_delete_in_temp, path, temp_root)
+    except storage.TempFenceViolation:
+        pass
 NOT_STARTED_REMINDER_KEY = "last_not_started_reminder_at"
 NOT_STARTED_REMINDER_COOLDOWN_SEC = 30
 
@@ -113,7 +125,7 @@ async def handle_start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     members, notifier, config, sessions, logs = _services(context)
     telegram_id = update.effective_user.id
     member = members.get(telegram_id)
-    if member is None or member.status != "已開通":
+    if member is None or member.status != STATUS_APPROVED:
         await update.effective_message.reply_text(notify.user_msg_not_started())
         return
 
@@ -126,10 +138,12 @@ async def handle_start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if config.HEALTH_CHECK_ON_SESSION:
+        # 健檢寫測試檔到網芳，SMB 卡住可能耗時數十秒；以 to_thread 執行避免
+        # 阻塞事件迴圈、害其他家人同時也被卡住（規格書 §3）。
         ok_nas, err_nas = (True, None)
         if config.ENABLE_NAS:
-            ok_nas, err_nas = storage.health_check(Path(config.DEST_NAS))
-        ok_od, err_od = storage.health_check(Path(config.DEST_ONEDRIVE))
+            ok_nas, err_nas = await asyncio.to_thread(storage.health_check, Path(config.DEST_NAS))
+        ok_od, err_od = await asyncio.to_thread(storage.health_check, Path(config.DEST_ONEDRIVE))
         if not (ok_nas and ok_od):
             err = err_nas or err_od
             await notifier.notify_admin(notify.msg_health_check_failed("開 session 健檢", err or "未知錯誤"))
@@ -291,15 +305,14 @@ async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, sessio
     for label, pairs in index_rows_by_label.items():
         for rf, actual_filename in pairs:
             index_rows.append((now_str, session.name, telegram_id, session.folder, label, actual_filename, rf.file_id))
-    logs.log_file_index_batch(index_rows)
+    # 寫入佇列的 submit 會等待背景執行緒完成（done_event.wait），以 to_thread
+    # 執行才不會阻塞事件迴圈（§3）。下方其他 logs.*／members.* 寫入亦同理。
+    await asyncio.to_thread(logs.log_file_index_batch, index_rows)
 
     chunk_fully_ok = all(chunk_ok_labels.values())
     if chunk_fully_ok:
         for rf in chunk:
-            try:
-                storage.safe_delete_in_temp(rf.temp_path, Path(config.TEMP_DIR))
-            except storage.TempFenceViolation:
-                pass
+            await _safe_delete_temp(rf.temp_path, Path(config.TEMP_DIR))
     return chunk_fully_ok
 
 
@@ -469,15 +482,21 @@ async def _debounce_fire(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ── 逾時保險（忘記按「我傳完了」）─────────────────────
 
 async def check_session_timeouts(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """由 job_queue 定期呼叫，掃描所有 session 是否完全閒置逾時（§6.4）。"""
+    """由 job_queue 定期呼叫，掃描 session 逾時與遺棄清理（§6.4）。"""
     _, _, config, sessions, _ = _services(context)
     now = datetime.now()
+    abandoned_max_min = getattr(config, "ABANDONED_SESSION_MAX_MIN", 60)
     for session in list(sessions.all_sessions()):
         if session.is_idle_timed_out(config.SESSION_TIMEOUT_MIN, now):
+            # 收件階段閒置逾時：有照片就自動當一批收尾，沒照片就清掉（§6.3 保險機制）
             if session.received_count > 0:
                 await _finalize_upload(context, session, timed_out=True)
             else:
                 sessions.clear(session.telegram_id)
+        elif session.is_abandoned(abandoned_max_min, now):
+            # 記憶體安全網：點了「我要上傳」後停在選資料夾/目的地就再也沒回來、
+            # 且一張都沒傳的 session，超過絕對存活上限即靜默清除（不動任何檔案）。
+            sessions.clear(session.telegram_id)
 
 
 # ── 實際處理一次上傳（收尾）───────────────────────────
@@ -541,20 +560,16 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
     overall_ok = all(not o.failed for o in session.destinations.values())
     if overall_ok:
         for rf in all_chunk_failures:
-            try:
-                storage.safe_delete_in_temp(rf.temp_path, Path(config.TEMP_DIR))
-            except storage.TempFenceViolation:
-                pass
-        try:
-            storage.safe_delete_in_temp(session.temp_dir, Path(config.TEMP_DIR))
-        except storage.TempFenceViolation:
-            pass
+            await _safe_delete_temp(rf.temp_path, Path(config.TEMP_DIR))
+        await _safe_delete_temp(session.temp_dir, Path(config.TEMP_DIR))
 
     dest_label_text = session.destination
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    logs.log_upload(now_str, session.name, telegram_id, session.folder, dest_label_text, total,
-                     "成功" if overall_ok else "部分失敗")
-    members.push_recent_folder(telegram_id, session.folder, dest_label_text)
+    await asyncio.to_thread(
+        logs.log_upload, now_str, session.name, telegram_id, session.folder, dest_label_text, total,
+        "成功" if overall_ok else "部分失敗",
+    )
+    await asyncio.to_thread(members.push_recent_folder, telegram_id, session.folder, dest_label_text)
 
     if overall_ok:
         text = notify.user_msg_done(total, session.folder, dest_label_text)
@@ -621,7 +636,7 @@ async def handle_restart_confirm(update: Update, context: ContextTypes.DEFAULT_T
             residue_rows.append((now_str, session.name, telegram_id, "中止殘留", str(Path(path).parent), Path(path).name,
                                   "使用者重新開始，此為已寫入的中止殘留"))
     if residue_rows:
-        logs.log_cleanup_batch(residue_rows)
+        await asyncio.to_thread(logs.log_cleanup_batch, residue_rows)
         for label, outcome in session.destinations.items():
             if outcome.written_paths:
                 await notifier.notify_admin(
@@ -629,10 +644,7 @@ async def handle_restart_confirm(update: Update, context: ContextTypes.DEFAULT_T
                 )
 
     if session.temp_dir is not None:
-        try:
-            storage.safe_delete_in_temp(session.temp_dir, Path(config.TEMP_DIR))
-        except storage.TempFenceViolation:
-            pass
+        await _safe_delete_temp(session.temp_dir, Path(config.TEMP_DIR))
 
     sessions.clear(telegram_id)
     await query.message.reply_text(notify.user_msg_restart_done())
@@ -699,7 +711,7 @@ async def _apply_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                                       str(old_path.parent), old_path.name, f"已改放至「{new_folder}」"))
 
     if cleanup_rows:
-        logs.log_cleanup_batch(cleanup_rows)
+        await asyncio.to_thread(logs.log_cleanup_batch, cleanup_rows)
 
     await update.effective_message.reply_text(notify.user_msg_correction_done(total_moved, new_folder))
     uploader = members.get(telegram_id)

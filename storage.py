@@ -31,8 +31,29 @@ except ImportError:  # Pillow 未安裝時仍可 import 本模組（EXIF 功能�
 
 # ── 檔名 ────────────────────────────────────────────
 
+EXIF_SUB_IFD_TAG = 0x8769       # 指向 Exif 子標籤頁的指標標籤
+TAG_DATETIME_ORIGINAL = 0x9003  # DateTimeOriginal（實際拍攝時間，存在子標籤頁）
+TAG_DATETIME = 0x0132           # DateTime（根標籤頁的修改時間，退而求其次）
+
+
+def _parse_exif_datetime(value) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value).strip(), "%Y:%m:%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return None
+
+
 def read_exif_datetime(file_path: Path) -> Optional[datetime]:
-    """讀取照片的 EXIF DateTimeOriginal。讀不到、損毀或非圖片一律回傳 None。"""
+    """
+    讀取照片的 EXIF 拍攝時間（規格書 §10）。讀不到、損毀或非圖片一律回傳 None。
+
+    重要：標準相機／手機（iOS/Android）把 `DateTimeOriginal`（0x9003）存在
+    **Exif 子標籤頁**（ExifSubIFD，由根標籤頁的 0x8769 指向），而不是根標籤頁。
+    因此必須先用 `getexif().get_ifd(0x8769)` 進到子頁去讀，只掃根標籤頁永遠讀不到。
+    子頁讀不到時，才退而求其次用根標籤頁的 DateTime（0x0132）。
+    """
     if Image is None:
         return None
     try:
@@ -40,13 +61,26 @@ def read_exif_datetime(file_path: Path) -> Optional[datetime]:
             exif = img.getexif()
             if not exif:
                 return None
-            for tag_id, value in exif.items():
-                tag = TAGS.get(tag_id, tag_id)
-                if tag == "DateTimeOriginal":
-                    return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+
+            # 1) 首選：Exif 子標籤頁的 DateTimeOriginal（實際拍攝時間）
+            try:
+                sub_ifd = exif.get_ifd(EXIF_SUB_IFD_TAG)
+            except Exception:
+                sub_ifd = {}
+            if sub_ifd:
+                dt = _parse_exif_datetime(sub_ifd.get(TAG_DATETIME_ORIGINAL))
+                if dt is not None:
+                    return dt
+
+            # 2) 相容退回：少數檔案可能把 DateTimeOriginal 放在根標籤頁
+            dt = _parse_exif_datetime(exif.get(TAG_DATETIME_ORIGINAL))
+            if dt is not None:
+                return dt
+
+            # 3) 最後退回：根標籤頁的 DateTime（修改時間，聊勝於無）
+            return _parse_exif_datetime(exif.get(TAG_DATETIME))
     except Exception:
         return None
-    return None
 
 
 def build_filename(

@@ -110,6 +110,21 @@ class UploadSession:
         now = now or datetime.now()
         return (now - self.last_activity_at) >= timedelta(minutes=timeout_min)
 
+    def is_abandoned(self, max_lifetime_min: int, now: Optional[datetime] = None) -> bool:
+        """
+        絕對存活上限的記憶體安全網（與 §6.4 的 10 分鐘閒置逾時無關）。
+
+        §6.4 明訂「選資料夾／選目的地」階段不計入閒置、session 不會逾時——這是為了
+        不要在使用者正常操作中途誤殺 session。但若使用者點了「我要上傳」後就再也
+        沒回來（停在選資料夾且一張都沒傳），這個 session 會永遠佔著記憶體。
+        此方法用一個「遠比正常互動長」的上限（預設 60 分鐘）辨識這種真正被遺棄、
+        且尚未收到任何照片的 session，交由排程靜默清除，不影響任何實體檔案。
+        """
+        if self.received_count > 0:
+            return False  # 已收到照片者交給正常逾時流程處理，這裡不碰，避免誤刪暫存
+        now = now or datetime.now()
+        return (now - self.started_at) >= timedelta(minutes=max_lifetime_min)
+
     def add_file(self, rf: ReceivedFile) -> None:
         self.files.append(rf)
 
@@ -160,26 +175,12 @@ def chunk_files(files: list, batch_size: int) -> list[list]:
     return [files[i:i + batch_size] for i in range(0, len(files), batch_size)]
 
 
-# ── media group 聚合（相簿多張，§6.3）────────────────
-
-def group_by_media_group(files: list) -> list[list]:
-    """
-    依 media_group_id 把同一次「相簿」傳送的照片聚合在一起，維持原始收到順序。
-    沒有 media_group_id（單張傳送）的各自成一組。
-    只用於顯示/除錯層面的分組；計數以 files 總長度為準，不受影響。
-    """
-    groups: dict[str, list] = {}
-    order: list[str] = []
-    singles: list[list] = []
-    for f in files:
-        if f.media_group_id:
-            if f.media_group_id not in groups:
-                groups[f.media_group_id] = []
-                order.append(f.media_group_id)
-            groups[f.media_group_id].append(f)
-        else:
-            singles.append([f])
-    return [groups[gid] for gid in order] + singles
+# ── 相簿（media group）計數說明 ───────────────────────
+#
+# 手機以「相簿」一次傳多張時，Telegram 會把每張拆成獨立 update 送達。
+# 本程式對每一則 update 各自 add_file、逐張計數，因此計數天生正確，
+# 不需要再依 media_group_id 做聚合（規格書 §6.3 的目標「計數不重複、不漏算」
+# 已由逐張計數達成）。media_group_id 仍記在 ReceivedFile 上，保留供除錯查閱。
 
 
 # ── 進度顯示輔助 ─────────────────────────────────────

@@ -21,6 +21,7 @@ NAS_PASSWORD = ""
 # ── 行為參數 ────────────────────────────────
 BATCH_SIZE = 20               # 內部小批張數
 SESSION_TIMEOUT_MIN = 10      # session 逾時（分鐘）；亦為「忘記按我傳完了」的保險
+ABANDONED_SESSION_MAX_MIN = 60  # 遺棄 session 的絕對存活上限（分鐘）：點了上傳卻停在選資料夾/目的地且沒傳照片，超過即靜默清除
 RETRY_TIMES = 3               # 單檔重試次數
 RETRY_DELAYS = [1, 3, 5]      # 重試間隔（秒）
 WRITE_THROTTLE_SEC = 0.3      # 每張寫入間隔
