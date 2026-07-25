@@ -17,6 +17,9 @@ CB_FINISH = "finish"
 CB_CORRECTION = "correction"
 CB_DEST_PREFIX = "dest:"
 CB_RECENT_FOLDER_PREFIX = "recent:"
+# 更正流程的資料夾按鈕另用一組 prefix：它發生在 session 已結束之後，
+# 不可與 session 內的選資料夾按鈕（CB_RECENT_FOLDER_PREFIX）混用。
+CB_CORRECTION_FOLDER_PREFIX = "corrfolder:"
 
 
 def register_keyboard() -> InlineKeyboardMarkup:
@@ -40,6 +43,20 @@ def folder_choice_keyboard(recent_folders: list[dict]) -> InlineKeyboardMarkup:
         icon = recent_folder_icon(f["last_dest"])
         rows.append([InlineKeyboardButton(f"{icon} {f['name']}", callback_data=f"{CB_RECENT_FOLDER_PREFIX}{f['name']}")])
     return InlineKeyboardMarkup(rows) if rows else InlineKeyboardMarkup([])
+
+
+def correction_folder_keyboard(recent_folders: list[dict]) -> InlineKeyboardMarkup:
+    """
+    「↩️ 這批傳錯了」要改放到哪個資料夾（規格書 §7 第 1 點）。
+    規格明訂須同時提供「近 3 次資料夾」按鈕與打字輸入兩種方式，不可只接受打字。
+    """
+    rows = []
+    for f in recent_folders:
+        icon = recent_folder_icon(f["last_dest"])
+        rows.append([InlineKeyboardButton(
+            f"{icon} {f['name']}", callback_data=f"{CB_CORRECTION_FOLDER_PREFIX}{f['name']}"
+        )])
+    return InlineKeyboardMarkup(rows)
 
 
 def destination_keyboard(enable_nas: bool = True) -> InlineKeyboardMarkup:

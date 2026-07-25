@@ -30,6 +30,7 @@ from handlers import register, upload
 from keyboards import (
     CB_APPROVE_PREFIX,
     CB_CORRECTION,
+    CB_CORRECTION_FOLDER_PREFIX,
     CB_DEST_PREFIX,
     CB_FINISH,
     CB_RECENT_FOLDER_PREFIX,
@@ -267,6 +268,28 @@ async def periodic_timeout_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     await upload.check_session_timeouts(context)
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    全域錯誤處理（規格書 §17）：接住所有沒被個別 handler 攔下的例外。
+
+    v2 完全沒有註冊 error handler，於是「✅ 我傳完了」因 callback query 逾時而
+    整個處理函式爆掉時，例外只是被框架靜默記掉——使用者沒反應、管理員沒通知、
+    也沒有任何線索可循。這裡一律記 log ＋ 通知管理員，並對使用者回一句不揭露
+    技術細節的訊息。
+    """
+    err = context.error
+    logger.error("未處理的例外", exc_info=err)
+    notifier: Notifier = context.application.bot_data.get("notifier")
+    if notifier is not None:
+        where = type(update).__name__ if update is not None else "unknown"
+        await notifier.notify_admin(notify.msg_unhandled_error(where, type(err).__name__, str(err)))
+    try:
+        if isinstance(update, Update) and update.effective_message is not None:
+            await update.effective_message.reply_text(notify.user_msg_error_generic())
+    except Exception:
+        pass  # 連錯誤通知都送不出去時，不能再往外拋而讓錯誤處理本身變成新的錯誤
+
+
 async def on_startup(app: Application) -> None:
     await startup_health_check(app)
     await startup_recover_temp(app)
@@ -301,6 +324,9 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(upload.handle_restart_confirm, pattern=f"^{CB_RESTART_CONFIRM}$"))
     app.add_handler(CallbackQueryHandler(upload.handle_restart_cancel, pattern=f"^{CB_RESTART_CANCEL}$"))
     app.add_handler(CallbackQueryHandler(upload.handle_correction_button, pattern=f"^{CB_CORRECTION}$"))
+    app.add_handler(CallbackQueryHandler(
+        upload.handle_correction_folder_button, pattern=f"^{CB_CORRECTION_FOLDER_PREFIX}"
+    ))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, route_text))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, route_photo))
@@ -310,6 +336,9 @@ def build_application() -> Application:
         | filters.Sticker.ALL | (filters.Document.ALL & ~filters.Document.IMAGE),
         route_unsupported_media,
     ))
+
+    # 全域錯誤處理必須註冊（規格書 §17），否則未攔下的例外會靜默消失
+    app.add_error_handler(on_error)
 
     if app.job_queue is not None:
         app.job_queue.run_repeating(periodic_timeout_check, interval=30, first=30)

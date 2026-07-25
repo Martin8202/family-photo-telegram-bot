@@ -1,10 +1,27 @@
-"""上傳照片流程（規格書 §6、§7）。"""
+"""
+上傳照片流程（規格書 §6、§7）。
+
+v3 架構準則（規格書 §3.1，最重要）
+────────────────────────────────
+這支檔案裡的 `handle_*` 事件處理函式一律只做「登記 ＋ 回覆」等**毫秒級**動作，
+實際的下載與複製全部交給 `SessionPipeline` 的背景 worker。
+
+原因：python-telegram-bot 預設 `max_concurrent_updates=1`，**一則 update 沒處理完
+就不會去取下一則**。家人傳的每張照片是一則 update，按下的每顆按鈕也是一則 update，
+共用同一條佇列。v2 把下載與「每滿 20 張複製到目的地」同步寫在照片處理函式裡，
+以「兩邊都存」為例光是寫入節流就是 20×0.3×2 = 12 秒／批——這段期間佇列完全停滯，
+使用者按下的「✅ 我傳完了」只能排隊，超過 Telegram callback 的約 15 秒有效期還會
+直接失效被丟棄。
+
+⚠️ `asyncio.to_thread()` 解決不了這件事：它只保證「不凍結事件迴圈」，處理函式本身
+仍在 await、仍未返回，佇列照樣被堵住。這是兩件不同的事。
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -19,12 +36,14 @@ from telegram import InlineKeyboardMarkup
 
 from keyboards import (
     CB_CORRECTION,
+    CB_CORRECTION_FOLDER_PREFIX,
     CB_DEST_PREFIX,
     CB_FINISH,
     CB_RECENT_FOLDER_PREFIX,
     CB_RESTART,
     CB_RESTART_CANCEL,
     CB_RESTART_CONFIRM,
+    correction_folder_keyboard,
     correction_keyboard,
     destination_keyboard,
     folder_choice_keyboard,
@@ -37,7 +56,6 @@ from state import (
     DEST_BOTH_LABEL,
     DEST_NAS_LABEL,
     DEST_ONEDRIVE_LABEL,
-    STAGE_AWAITING_CORRECTION_FOLDER,
     STAGE_AWAITING_DESTINATION,
     STAGE_AWAITING_FOLDER,
     STAGE_AWAITING_RESTART_CONFIRM,
@@ -49,13 +67,41 @@ from state import (
     ReceivedFile,
     chunk_files,
     progress_bar,
+    should_update_confirm,
     should_update_counter,
 )
 
 logger = logging.getLogger("photo-bot.upload")
 
 AWAITING_CORRECTION_FLAG = "awaiting_correction_folder"
+CORRECTION_FLAG_AT = "awaiting_correction_folder_at"
 
+NOT_STARTED_REMINDER_KEY = "last_not_started_reminder_at"
+NOT_STARTED_REMINDER_COOLDOWN_SEC = 30
+
+# v3 新增參數的預設值，容許尚未同步更新的 config.py 也能運作（見規格書 §12.1）
+_DEFAULTS = {
+    "DOWNLOAD_WORKERS": 3,
+    "DOWNLOAD_RETRY_TIMES": 3,
+    "COUNTER_UPDATE_COUNT": 8,
+    "CONFIRM_UPDATE_SEC": 2,
+    "CONFIRM_UPDATE_COUNT": 3,
+    "COUNTER_REANCHOR_SEC": 5,
+    "CORRECTION_PROMPT_MAX_MIN": 10,
+    "STAGE_STUCK_MAX_MIN": 30,
+}
+
+
+def _cfg(config, name: str):
+    return getattr(config, name, _DEFAULTS[name])
+
+
+def _services(context: ContextTypes.DEFAULT_TYPE):
+    bd = context.application.bot_data
+    return bd["members"], bd["notifier"], bd["config"], bd["sessions"], bd["logs"]
+
+
+# ── Telegram 呼叫的安全封裝 ───────────────────────────
 
 async def _safe_send(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, reply_markup=None):
     """
@@ -72,22 +118,40 @@ async def _safe_send(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str
         return None
 
 
+async def _safe_answer(query) -> None:
+    """
+    回應 callback query，失敗只記 log、不中斷後續動作（規格書 §8）。
+
+    Telegram 的 callback query 約 15 秒後就會過期，逾期呼叫 `answer()` 會回
+    BadRequest。v2 沒有保護，於是大批次照片造成佇列積壓時，「✅ 我傳完了」的整個
+    處理函式在第一行就爆掉——使用者按了完全沒反應，session 一路卡到 10 分鐘逾時。
+    """
+    try:
+        await query.answer()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("回應 callback query 失敗（可能已逾時）：%s", exc)
+
+
+async def _delete_message_safe(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: Optional[int]) -> None:
+    if message_id is None:
+        return
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass  # 刪不掉（例如使用者手動刪過）也無妨
+
+
 async def _safe_delete_temp(path, temp_root) -> None:
     """
     刪除暫存區內的檔案／資料夾，以 to_thread 執行避免阻塞事件迴圈（規格書 §3），
     並吞下刪除圍籬例外（非暫存區路徑一律拒絕，屬預期行為）。
     """
+    if path is None:
+        return
     try:
         await asyncio.to_thread(storage.safe_delete_in_temp, path, temp_root)
     except storage.TempFenceViolation:
         pass
-NOT_STARTED_REMINDER_KEY = "last_not_started_reminder_at"
-NOT_STARTED_REMINDER_COOLDOWN_SEC = 30
-
-
-def _services(context: ContextTypes.DEFAULT_TYPE):
-    bd = context.application.bot_data
-    return bd["members"], bd["notifier"], bd["config"], bd["sessions"], bd["logs"]
 
 
 async def remind_not_started(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -137,6 +201,10 @@ async def handle_start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
+    # 開新的上傳一定要清掉「這批傳錯了」的待輸入狀態（§7 第 10 點）：否則使用者
+    # 待會輸入的新資料夾名稱，會被誤判成上一批的更正目標。
+    _clear_correction_flag(context)
+
     if config.HEALTH_CHECK_ON_SESSION:
         # 健檢寫測試檔到網芳，SMB 卡住可能耗時數十秒；以 to_thread 執行避免
         # 阻塞事件迴圈、害其他家人同時也被卡住（規格書 §3）。
@@ -183,9 +251,14 @@ async def handle_folder_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # 傳錯復原（↩️ 這批傳錯了）的新資料夾輸入必須最先檢查：這個情境發生在
     # 上一次上傳已經完成、session 早已被清除（session is None）之後，
     # 若放在 session 檢查之後，會被下面的 early return 攔截而永遠進不來。
-    if context.user_data.get(AWAITING_CORRECTION_FLAG):
-        context.user_data[AWAITING_CORRECTION_FLAG] = False
-        await _apply_correction(update, context, storage.sanitize_folder_name(update.effective_message.text))
+    if _correction_flag_active(context):
+        new_folder = storage.sanitize_folder_name(update.effective_message.text or "")
+        if not new_folder:
+            # 名稱過濾後是空的：保留待輸入狀態、明確請他重打，不可靜默無反應（§7 第 10 點）
+            await update.effective_message.reply_text("資料夾名稱不能是空的或全部是特殊符號，請重新輸入")
+            return True
+        _clear_correction_flag(context)
+        await _apply_correction(update, context, new_folder)
         return True
 
     _, _, _, sessions, _ = _services(context)
@@ -196,15 +269,12 @@ async def handle_folder_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if session.stage == STAGE_AWAITING_FOLDER:
         await _set_folder_and_ask_destination(update.effective_message, context, session, update.effective_message.text)
         return True
-    if session.stage == STAGE_RECEIVING_PHOTOS:
-        # 尚未選資料夾但已是 receiving 階段不會發生；保留保險：等待選擇時仍可視為忽略
-        return False
     return False
 
 
 async def handle_recent_folder_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     _, _, _, sessions, _ = _services(context)
     telegram_id = update.effective_user.id
     session = sessions.get(telegram_id)
@@ -216,7 +286,7 @@ async def handle_recent_folder_button(update: Update, context: ContextTypes.DEFA
 
 async def handle_destination_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     _, _, config, sessions, _ = _services(context)
     telegram_id = update.effective_user.id
     session = sessions.get(telegram_id)
@@ -244,13 +314,212 @@ async def handle_destination_button(update: Update, context: ContextTypes.DEFAUL
     )
 
 
-# ── 內部小批複製（收照片中progressive flush、與收尾remainder共用）────
+# ── 背景工作管線：下載 worker ×N ＋ 複製 worker ×1（§3.1、§6.3.3）──
+
+class SessionPipeline:
+    """
+    一個 upload session 的背景工作管線。
+
+    並行上限固定、**不隨照片數量增加**（規格書 §6.3.3）：
+    - 下載 worker：`DOWNLOAD_WORKERS` 個（預設 3），兼顧速度與對 Telegram API 的禮貌。
+    - 複製 worker：**固定 1 個**。網芳（SMB）最怕並行寫入，維持與 v2 相同的
+      「一批一批依序寫、每張間隔 WRITE_THROTTLE_SEC」行為。
+    - 佇列裡放的只是 metadata（`ReceivedFile`，每筆數百 bytes），不是照片本體，
+      所以一次傳幾千張也只佔一兩 MB 記憶體。
+
+    磁碟 I/O 的**總量與 v2 完全相同**——每張照片仍是「下載寫入暫存 1 次 ＋ 每個
+    目的地複製 1 次 ＋ 刪暫存 1 次」，v3 只改變由誰觸發、何時觸發。
+    """
+
+    def __init__(self, context: ContextTypes.DEFAULT_TYPE, session):
+        self.context = context
+        self.session = session
+        self.download_queue: asyncio.Queue = asyncio.Queue()
+        self.copy_queue: asyncio.Queue = asyncio.Queue()
+        self.buffer: list = []  # 已落地暫存區、尚未複製到目的地的照片
+        self._tasks: list = []
+        self._download_worker_count = 0
+        self._stopped = False
+
+    @property
+    def config(self):
+        return self.context.application.bot_data["config"]
+
+    def start(self) -> None:
+        workers = max(1, int(_cfg(self.config, "DOWNLOAD_WORKERS")))
+        self._download_worker_count = workers
+        for _ in range(workers):
+            self._tasks.append(asyncio.create_task(_download_worker(self)))
+        self._tasks.append(asyncio.create_task(_copy_worker(self)))
+
+    def submit(self, rf: ReceivedFile) -> None:
+        """登記完成後把下載工作丟進佇列——**不等它做完**，處理函式毫秒級返回。"""
+        self.download_queue.put_nowait(rf)
+
+    async def settle(self) -> None:
+        """等目前已排入的下載與複製工作全部做完，但保留 worker 繼續服務。"""
+        await self.download_queue.join()
+        await self.copy_queue.join()
+
+    async def drain(self) -> None:
+        """
+        等所有工作結束並收掉 worker。收尾（`_finalize_upload`）前必須呼叫，
+        對應規格書 §6.3 流程第 5 步「先等待所有尚未完成的下載工作全部落地」。
+        """
+        if self._stopped:
+            return
+        self._stopped = True
+        await self.settle()
+        for _ in range(self._download_worker_count):
+            self.download_queue.put_nowait(None)
+        self.copy_queue.put_nowait(None)
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks = []
+
+    async def cancel(self) -> None:
+        """
+        中止所有背景工作（供「🔄 重新開始」使用）。刻意不是 drain——使用者要的是
+        中止，繼續把在途的照片複製到目的地只會製造更多需要人工清理的殘留（§6.5）。
+        """
+        if self._stopped:
+            return
+        self._stopped = True
+        for task in self._tasks:
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks = []
+        self.buffer.clear()
+
+
+async def _download_one(pipeline: SessionPipeline, rf: ReceivedFile) -> None:
+    """
+    把一張照片從 Telegram 下載到暫存區，含重試（規格書 §6.3.2 下載重試層）。
+
+    v2 這段完全沒有例外保護：一旦網路瞬斷，該張照片不落地、不計數、不記錄，
+    使用者與管理員都無從得知，直接違背「照片不遺失」與「成功失敗一律記錄」。
+    """
+    config = pipeline.config
+    session = pipeline.session
+    retry_times = max(1, int(_cfg(config, "DOWNLOAD_RETRY_TIMES")))
+    delays = list(getattr(config, "RETRY_DELAYS", None) or [1])
+    last_error = None
+
+    for attempt in range(1, retry_times + 1):
+        try:
+            await asyncio.to_thread(storage.ensure_dir, session.temp_dir)
+            file_obj = await pipeline.context.bot.get_file(rf.file_id)
+            ext = Path(file_obj.file_path or "photo.jpg").suffix or ".jpg"
+            local_path = session.temp_dir / f"{rf.file_id}{ext}"
+            await file_obj.download_to_drive(custom_path=str(local_path))
+            rf.temp_path = local_path
+            rf.filename = local_path.name
+            rf.downloaded = True
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 網路錯誤種類不定
+            last_error = str(exc)
+            logger.warning("下載照片失敗（第 %s 次，file_id=%s）：%s", attempt, rf.file_id, exc)
+            if attempt < retry_times:
+                await asyncio.sleep(delays[min(attempt - 1, len(delays) - 1)])
+
+    rf.download_failed = True
+    rf.download_error = last_error or "未知錯誤"
+
+
+async def _record_download_failure(pipeline: SessionPipeline, rf: ReceivedFile) -> None:
+    """
+    下載失敗仍要留下紀錄：file_index.csv 記一列並保留 file_id，日後可用
+    redownload.py 補救（規格書 §6.3.2、§8、§16.1）。
+    """
+    _, notifier, _, _, logs = _services(pipeline.context)
+    session = pipeline.session
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    try:
+        await asyncio.to_thread(
+            logs.log_file_index_batch,
+            [(now_str, session.name, session.telegram_id, session.folder, "下載失敗", "", rf.file_id)],
+        )
+    except Exception:
+        logger.exception("寫入下載失敗紀錄時發生例外")
+    await notifier.notify_admin(
+        notify.msg_download_failure(session.name, session.folder or "(未命名)", 1, rf.download_error or "未知錯誤")
+    )
+
+
+async def _download_worker(pipeline: SessionPipeline) -> None:
+    while True:
+        rf = await pipeline.download_queue.get()
+        try:
+            if rf is None:
+                return
+            await _download_one(pipeline, rf)
+            if rf.downloaded:
+                # 必須在 task_done 之前交棒，否則 settle() 可能在照片還沒進到
+                # 複製佇列時就誤判為「全部做完」。
+                await pipeline.copy_queue.put(rf)
+            else:
+                await _record_download_failure(pipeline, rf)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("下載 worker 發生非預期例外")
+        finally:
+            pipeline.download_queue.task_done()
+
+
+async def _copy_worker(pipeline: SessionPipeline) -> None:
+    while True:
+        rf = await pipeline.copy_queue.get()
+        try:
+            if rf is None:
+                return
+            pipeline.buffer.append(rf)
+            config = pipeline.config
+            # 只有收件階段才主動分批複製。緩衝期間（STAGE_DEBOUNCE）刻意遞延，
+            # 全部留給 _finalize_upload 收齊後一次處理（規格書 §6.3 流程第 4 步）。
+            while (pipeline.session.stage == STAGE_RECEIVING_PHOTOS
+                   and len(pipeline.buffer) >= config.BATCH_SIZE):
+                chunk = pipeline.buffer[:config.BATCH_SIZE]
+                del pipeline.buffer[:config.BATCH_SIZE]
+                await _copy_and_account(pipeline.context, pipeline.session, chunk)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("複製 worker 發生非預期例外")
+        finally:
+            pipeline.copy_queue.task_done()
+
+
+def _ensure_pipeline(context: ContextTypes.DEFAULT_TYPE, session) -> SessionPipeline:
+    if session.pipeline is None:
+        session.pipeline = SessionPipeline(context, session)
+        session.pipeline.start()
+    return session.pipeline
+
+
+# ── 內部小批複製 ─────────────────────────────────────
+
+async def _copy_and_account(context: ContextTypes.DEFAULT_TYPE, session, chunk: list) -> bool:
+    """複製一個內部小批並更新 session 的統計（已存好張數／待重試清單）。"""
+    _, _, config, _, _ = _services(context)
+    dest_targets = _destination_targets(session.destination, config, session.folder)
+    ok = await _copy_chunk_to_destinations(context, session, chunk, dest_targets)
+    session.flushed_count += len(chunk)
+    if ok:
+        for rf in chunk:
+            rf.copied = True
+        session.stored_count += len(chunk)
+    else:
+        session.pending_retry_files.extend(chunk)
+    return ok
+
 
 async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, session, chunk: list, dest_targets: dict) -> bool:
     """
     把一個內部小批複製到所有目的地，寫入 file_index，全部目的地成功才清暫存。
-    規格書 §6.3 point 2：每滿 20 張（內部小批）即複製到目的地，不必等使用者按
-    「我傳完了」——這裡同時被「收照片中progressive flush」與「收尾remainder」呼叫。
     回傳這個小批是否所有目的地都成功。
     """
     _, notifier, config, _, logs = _services(context)
@@ -283,6 +552,8 @@ async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, sessio
             # 實際落地的檔名以 dest_path 為準（撞名時會被改成 _(2) 等），
             # 失敗則退而求其次記錄本來要用的檔名，方便追查。
             actual_filenames.append(result.dest_path.name if result.success and result.dest_path else attempted_filename)
+            # 大批次的複製可能持續數十分鐘；沿路 touch 才不會被 §6.4 的閒置逾時誤殺。
+            session.touch()
             if config.WRITE_THROTTLE_SEC:
                 await asyncio.sleep(config.WRITE_THROTTLE_SEC)
 
@@ -318,45 +589,68 @@ async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, sessio
     return chunk_fully_ok
 
 
-async def _flush_ready_chunks(context: ContextTypes.DEFAULT_TYPE, session) -> None:
-    """
-    收件階段（STAGE_RECEIVING_PHOTOS）只要累積滿一個內部小批就立刻複製到目的地（§6.3 point 2）。
-    只在呼叫端限定於收件階段呼叫——按下「我傳完了」進入緩衝期（STAGE_DEBOUNCE）後收到的
-    照片，一律遞延到 _finalize_upload 收齊結案時才一次處理，讓「確認中」階段不再有背景複製動作。
-    """
-    _, _, config, _, _ = _services(context)
-    dest_targets = _destination_targets(session.destination, config, session.folder)
-    while len(session.files) - session.flushed_count >= config.BATCH_SIZE:
-        chunk = session.files[session.flushed_count: session.flushed_count + config.BATCH_SIZE]
-        ok = await _copy_chunk_to_destinations(context, session, chunk, dest_targets)
-        session.flushed_count += len(chunk)
-        if not ok:
-            session.pending_retry_files.extend(chunk)
-
-
-# ── 收照片 ───────────────────────────────────────────
+# ── 收照片（事件處理層：毫秒級）────────────────────────
 
 async def _update_counter_message(update: Update, context: ContextTypes.DEFAULT_TYPE, session) -> None:
     """
     永遠只保留一則「收到照片中… N 張」訊息，不洗版（§6.3.1）。
     做法是刪掉舊的那則、在最下面重發一則新的——而不是原地編輯——
     這樣這則狀態訊息會持續跟著對話移到最下面，不會卡在畫面中間看起來像卡住。
+
+    同時顯示「（已存好 N 張）」：背景 worker 正在同步備份，讓使用者一路看得到
+    進度，緩衝結束後進度條的起跳點才不會顯得突兀（§6.3 設計取捨二）。
     """
-    text = notify.user_msg_receiving(session.received_count)
-    markup = in_session_keyboard()
-    telegram_id = session.telegram_id
+    text = notify.user_msg_receiving(session.received_count, session.stored_count)
+    await _delete_message_safe(context, session.telegram_id, session.counter_message_id)
+    try:
+        sent = await update.effective_message.reply_text(text, reply_markup=in_session_keyboard())
+        session.counter_message_id = sent.message_id
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("更新收件計數訊息失敗：%s", exc)
 
-    if session.counter_message_id is not None:
+
+async def _update_confirm_message(context: ContextTypes.DEFAULT_TYPE, session, message, now: datetime) -> None:
+    """
+    「⏳ 確認中…」的雙層更新（規格書 §6.3.1）：
+
+    ① 張數變動用 `editMessageText` **原地編輯**——單次 API 呼叫、不閃爍、數字直接跳動；
+    ② 每隔 `COUNTER_REANCHOR_SEC` 秒才用一次「刪舊發新」把訊息拉回對話最下方
+       （緩衝期間陸續抵達的照片仍會把訊息往上推）。
+
+    如此同時達成「張數一直跳」的即時感，又把刪除／重發的次數壓到最低，避免 429。
+    """
+    config = context.application.bot_data["config"]
+    text = notify.user_msg_confirming(session.received_count)
+    reanchor_sec = _cfg(config, "COUNTER_REANCHOR_SEC")
+    need_reanchor = (
+        session.confirm_message_id is None
+        or session.confirm_last_reanchor is None
+        or (now - session.confirm_last_reanchor).total_seconds() >= reanchor_sec
+    )
+
+    if not need_reanchor:
         try:
-            await context.bot.delete_message(chat_id=telegram_id, message_id=session.counter_message_id)
+            await context.bot.edit_message_text(
+                chat_id=session.telegram_id, message_id=session.confirm_message_id, text=text
+            )
+            return
         except Exception:
-            pass  # 刪不掉（例如使用者手動刪過）也無妨，重發一則新的即可
+            pass  # 編輯失敗（訊息被刪、內容完全相同）就退回下面的刪舊發新
 
-    sent = await update.effective_message.reply_text(text, reply_markup=markup)
-    session.counter_message_id = sent.message_id
+    await _delete_message_safe(context, session.telegram_id, session.confirm_message_id)
+    try:
+        sent = await message.reply_text(text)
+        session.confirm_message_id = sent.message_id
+        session.confirm_last_reanchor = now
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("更新確認中訊息失敗：%s", exc)
 
 
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    收到照片：**只做登記與畫面更新，毫秒級返回**（規格書 §3.1、§6.3）。
+    真正的下載與複製交給 SessionPipeline 的背景 worker。
+    """
     members, notifier, config, sessions, logs = _services(context)
     telegram_id = update.effective_user.id
     session = sessions.get(telegram_id)
@@ -366,7 +660,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if session.stage not in (STAGE_RECEIVING_PHOTOS, STAGE_DEBOUNCE):
         # 緩衝（STAGE_DEBOUNCE）期間仍要正常收照片、計入本批（§6.3）；
         # 其餘非收件階段（選資料夾/目的地中）才提示「請先選資料夾」。
-        if session.stage == STAGE_AWAITING_FOLDER or session.stage == STAGE_AWAITING_DESTINATION:
+        if session.stage in (STAGE_AWAITING_FOLDER, STAGE_AWAITING_DESTINATION):
             await update.effective_message.reply_text(notify.user_msg_choose_folder_first())
         return
 
@@ -381,65 +675,42 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         return  # 非圖片訊息，交由其他 handler（若有）處理
 
-    try:
-        await context.bot.send_chat_action(chat_id=telegram_id, action=ChatAction.TYPING)
-    except Exception:
-        pass  # 「正在輸入中」純粹是視覺提示，失敗不影響正事（§6.3.1）
-
-    storage.ensure_dir(session.temp_dir)
-    file_obj = await context.bot.get_file(tg_file.file_id)
-    ext = Path(file_obj.file_path or "photo.jpg").suffix or ".jpg"
-    local_name = f"{tg_file.file_id}{ext}"
-    local_path = session.temp_dir / local_name
-    await file_obj.download_to_drive(custom_path=str(local_path))
-
+    # ── 登記：純記憶體、不碰磁碟、不等網路（§6.3「登記與落地是兩件事」）──
+    now = datetime.now()
     rf = ReceivedFile(
-        temp_path=local_path,
-        filename=local_name,
         file_id=tg_file.file_id,
         media_group_id=getattr(message, "media_group_id", None),
-        received_at=datetime.now(),
+        received_at=now,
         is_original_quality=is_original,
     )
     session.add_file(rf)
-    session.touch()
+    session.touch(now)
+    _ensure_pipeline(context, session).submit(rf)
 
     if not is_original and not session.compressed_warned:
         session.compressed_warned = True
-        await update.effective_message.reply_text(notify.user_msg_compressed_hint())
-
-    if session.stage == STAGE_RECEIVING_PHOTOS and should_update_counter(session, datetime.now(), config.COUNTER_UPDATE_SEC):
-        session.counter_last_update = datetime.now()
-        await _update_counter_message(update, context, session)
+        try:
+            await message.reply_text(notify.user_msg_compressed_hint())
+        except Exception:
+            pass
 
     if session.stage == STAGE_RECEIVING_PHOTOS:
-        # 每滿一個內部小批（預設 20 張）就立刻複製到目的地，不必等「我傳完了」（§6.3 point 2）。
-        # 緩衝期間（STAGE_DEBOUNCE）收到的照片刻意不在這裡分批複製，全部遞延到
-        # debounce 結束、確定收齊後才一次處理（見 _finalize_upload），
-        # 避免「確認中」階段還在背景默默複製造成混淆。
-        await _flush_ready_chunks(context, session)
+        if should_update_counter(session, now, config.COUNTER_UPDATE_SEC, _cfg(config, "COUNTER_UPDATE_COUNT")):
+            session.mark_counter_updated(now)
+            await _update_counter_message(update, context, session)
+        return
 
-    if session.stage == STAGE_DEBOUNCE:
-        # 緩衝期間收到新照片：一律計入本批、一律重新計時（§6.3，確保不漏收）。
-        # 畫面上「確認中」訊息的更新則節流至固定每 COUNTER_UPDATE_SEC 秒一次（跟收件
-        # 階段共用同一套節流），避免密集連傳時頻繁刪訊息/發訊息觸發 Telegram 限流（429）。
-        if should_update_counter(session, datetime.now(), config.COUNTER_UPDATE_SEC):
-            session.counter_last_update = datetime.now()
-            if session.confirm_message_id is not None:
-                try:
-                    await context.bot.delete_message(chat_id=telegram_id, message_id=session.confirm_message_id)
-                except Exception:
-                    pass
-            try:
-                sent = await update.effective_message.reply_text(notify.user_msg_confirming(session.received_count))
-                session.confirm_message_id = sent.message_id
-            except Exception:
-                pass
-        _schedule_debounce(context, telegram_id, restart=True)
+    # ── 緩衝期間（STAGE_DEBOUNCE）──
+    # 重新計時「不可節流」：只要登記到一張新照片就立刻重新起算，這是不漏收的核心
+    # 保證。畫面更新則走獨立且更靈敏的雙門檻節流（§6.3.1）。
+    if should_update_confirm(session, now, _cfg(config, "CONFIRM_UPDATE_SEC"), _cfg(config, "CONFIRM_UPDATE_COUNT")):
+        session.mark_confirm_updated(now)
+        await _update_confirm_message(context, session, message, now)
+    _schedule_debounce(context, telegram_id, restart=True)
 
 
 async def handle_unsupported_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """非照片檔案（影片、PDF、貼圖、語音等）：合理拒絕並提示，不崩潰（§8 E12）。"""
+    """非照片檔案（影片、PDF、貼圖、語音等）：合理拒絕並提示，不崩潰（§8）。"""
     _, _, _, sessions, _ = _services(context)
     telegram_id = update.effective_user.id
     session = sessions.get(telegram_id)
@@ -470,39 +741,38 @@ def _schedule_debounce(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, res
 
 async def handle_finish_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     _, _, _, sessions, _ = _services(context)
     telegram_id = update.effective_user.id
     session = sessions.get(telegram_id)
     if session is None:
         return
+
+    now = datetime.now()
     if session.stage == STAGE_DEBOUNCE:
         # 緩衝期間重複點擊：不重新計時、不重算張數（§6.3），但仍要回覆一次
-        # 「確認中」讓使用者知道有被接收到，避免原本完全無回應、看起來像沒反應而一直猛戳。
-        if session.confirm_message_id is not None:
-            try:
-                await context.bot.delete_message(chat_id=telegram_id, message_id=session.confirm_message_id)
-            except Exception:
-                pass
+        # 「確認中」讓使用者知道有被接收到，避免看起來像沒反應而一直猛戳。
+        await _delete_message_safe(context, telegram_id, session.confirm_message_id)
         sent = await query.message.reply_text(notify.user_msg_confirming(session.received_count))
         session.confirm_message_id = sent.message_id
-        session.counter_last_update = datetime.now()  # 重設節流起點，避免緊接著的照片又立刻觸發一次更新
+        session.confirm_last_reanchor = now
+        session.mark_confirm_updated(now)
         return
+
     if session.stage != STAGE_RECEIVING_PHOTOS:
         return  # 其餘階段沒有這顆按鈕可點
+
     session.finish_clicked = True
-    if session.counter_message_id is not None:
-        # 收件階段的「📥 收到照片中…」訊息在此結束任務，點了我傳完了之後
-        # 一律改由「⏳ 確認中…」接手，避免兩則訊息同時留在畫面上。
-        try:
-            await context.bot.delete_message(chat_id=telegram_id, message_id=session.counter_message_id)
-        except Exception:
-            pass
-        session.counter_message_id = None
-    session.enter_stage(STAGE_DEBOUNCE)
+    # 收件階段的「📥 收到照片中…」訊息在此結束任務，一律改由「⏳ 確認中…」接手，
+    # 避免兩則訊息同時留在畫面上。
+    await _delete_message_safe(context, telegram_id, session.counter_message_id)
+    session.counter_message_id = None
+
+    session.enter_stage(STAGE_DEBOUNCE, now)
     sent = await query.message.reply_text(notify.user_msg_confirming(session.received_count))
     session.confirm_message_id = sent.message_id
-    session.counter_last_update = datetime.now()  # 節流起點歸零，緩衝期間的更新從這裡開始算
+    session.confirm_last_reanchor = now
+    session.mark_confirm_updated(now)
     _schedule_debounce(context, telegram_id)
 
 
@@ -522,6 +792,7 @@ async def check_session_timeouts(context: ContextTypes.DEFAULT_TYPE) -> None:
     _, _, config, sessions, _ = _services(context)
     now = datetime.now()
     abandoned_max_min = getattr(config, "ABANDONED_SESSION_MAX_MIN", 60)
+    stuck_max_min = _cfg(config, "STAGE_STUCK_MAX_MIN")
     for session in list(sessions.all_sessions()):
         if session.is_idle_timed_out(config.SESSION_TIMEOUT_MIN, now):
             # 收件階段閒置逾時：有照片就自動當一批收尾，沒照片就清掉（§6.3 保險機制）
@@ -533,6 +804,13 @@ async def check_session_timeouts(context: ContextTypes.DEFAULT_TYPE) -> None:
             # 記憶體安全網：點了「我要上傳」後停在選資料夾/目的地就再也沒回來、
             # 且一張都沒傳的 session，超過絕對存活上限即靜默清除（不動任何檔案）。
             sessions.clear(session.telegram_id)
+        elif session.is_stage_stuck(stuck_max_min, now):
+            # 兜底：卡在非收件階段回不來（例如按了「重新開始」卻不回答二次確認）。
+            # 暫存區可能還有照片，不可靜默丟棄（§6.4）。
+            if session.received_count > 0:
+                await _finalize_upload(context, session, timed_out=True)
+            else:
+                sessions.clear(session.telegram_id)
 
 
 # ── 實際處理一次上傳（收尾）───────────────────────────
@@ -541,45 +819,51 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
     members, notifier, config, sessions, logs = _services(context)
     telegram_id = session.telegram_id
 
-    if session.confirm_message_id is not None:
-        # 收齊結案、正式開始寫入目的地：「⏳ 確認中…」的任務結束，改由下面的
-        # 「📤 上傳中」進度條接手，避免兩則狀態訊息同時留在畫面上。
-        try:
-            await context.bot.delete_message(chat_id=telegram_id, message_id=session.confirm_message_id)
-        except Exception:
-            pass
-        session.confirm_message_id = None
+    if session.stage == STAGE_PROCESSING:
+        return  # 已在收尾中（debounce 與逾時掃描可能同時觸發），不重入
+
+    # 「⏳ 確認中…」與「📥 收到照片中…」的任務到此結束，改由「📤 上傳中」接手，
+    # 避免多則狀態訊息同時留在畫面上。
+    await _delete_message_safe(context, telegram_id, session.confirm_message_id)
+    session.confirm_message_id = None
+    await _delete_message_safe(context, telegram_id, session.counter_message_id)
+    session.counter_message_id = None
 
     session.enter_stage(STAGE_PROCESSING)
 
-    total = session.received_count
-    # 收照片過程中已經以內部小批分次寫入目的地（§6.3 point 2），這裡只需要
-    # 處理「剩餘不足一個小批」的尾巴，加上先前分批失敗、待重試的部分。
-    remainder = session.files[session.flushed_count:]
-    processed = session.flushed_count
+    # 規格書 §6.3 流程第 5 步：先等所有尚未完成的下載工作全部落地，再統計與複製。
+    remainder: list = []
+    if session.pipeline is not None:
+        await session.pipeline.drain()
+        remainder = list(session.pipeline.buffer)
+        session.pipeline.buffer.clear()
+
+    failed_downloads = [rf for rf in session.files if rf.download_failed]
+    total = sum(1 for rf in session.files if rf.downloaded)
+    processed = session.stored_count
+
+    # 收件階段已在背景把大部分照片備份完成，緩衝結束時往往所剩無幾。若已全部
+    # 完成就不必為了畫面效果假造一段進度條，直接跳「✅ 完成」（§6.3 設計取捨二）。
     progress_message = None
-    if total > 0:
+    if total > 0 and remainder:
         progress_message = await _safe_send(
             context, telegram_id, notify.user_msg_uploading(progress_bar(processed, total))
         )
 
     dest_targets = _destination_targets(session.destination, config, session.folder)
-    all_chunk_failures: list[ReceivedFile] = list(session.pending_retry_files)
+    all_chunk_failures: list = list(session.pending_retry_files)
     session.pending_retry_files = []
 
-    if remainder:
-        for chunk in chunk_files(remainder, config.BATCH_SIZE):
-            ok = await _copy_chunk_to_destinations(context, session, chunk, dest_targets)
-            session.flushed_count += len(chunk)
-            if not ok:
-                all_chunk_failures.extend(chunk)
-
-            processed += len(chunk)
-            if progress_message is not None:
-                try:
-                    await progress_message.edit_text(notify.user_msg_uploading(progress_bar(processed, total)))
-                except Exception:
-                    pass
+    for chunk in chunk_files(remainder, config.BATCH_SIZE):
+        ok = await _copy_and_account(context, session, chunk)
+        if not ok:
+            all_chunk_failures.extend(chunk)
+        processed = session.stored_count
+        if progress_message is not None:
+            try:
+                await progress_message.edit_text(notify.user_msg_uploading(progress_bar(processed, total)))
+            except Exception:
+                pass
 
     # 批次後重試（§6.3.2）
     if config.RETRY_AFTER_BATCH and all_chunk_failures:
@@ -623,6 +907,8 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
         text = notify.user_msg_done(total, session.folder, dest_label_text)
         if DEST_ONEDRIVE_LABEL in session.destinations:
             text += "\n" + notify.user_msg_onedrive_cloud_note()
+        if failed_downloads:
+            text += "\n" + notify.user_msg_download_failed_summary(len(failed_downloads))
         await _safe_send(context, telegram_id, text, reply_markup=correction_keyboard())
         await notifier.notify_admin(notify.msg_upload_success(session.name, session.folder, total, dest_label_text))
 
@@ -636,7 +922,10 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
         )
         sessions.set_last_batch(completed)
     else:
-        await _safe_send(context, telegram_id, notify.user_msg_partial_pending())
+        msg = notify.user_msg_partial_pending()
+        if failed_downloads:
+            msg += "\n" + notify.user_msg_download_failed_summary(len(failed_downloads))
+        await _safe_send(context, telegram_id, msg)
         nas_status = "✅" if not session.destinations.get(DEST_NAS_LABEL, DestinationOutcome(DEST_NAS_LABEL)).failed else "❌ 失敗"
         od_status = "✅" if not session.destinations.get(DEST_ONEDRIVE_LABEL, DestinationOutcome(DEST_ONEDRIVE_LABEL)).failed else "❌ 失敗"
         if session.destination == DEST_BOTH_LABEL:
@@ -649,6 +938,7 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
         onedrive_paths = [p for _, p in session.destinations[DEST_ONEDRIVE_LABEL].written_paths]
         await asyncio.to_thread(storage.free_onedrive_space, onedrive_paths)
 
+    session.pipeline = None
     sessions.clear(telegram_id)
 
 
@@ -656,7 +946,7 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
 
 async def handle_restart_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     _, _, _, sessions, _ = _services(context)
     session = sessions.get(update.effective_user.id)
     if session is None:
@@ -670,12 +960,18 @@ async def handle_restart_button(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def handle_restart_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     members, notifier, config, sessions, logs = _services(context)
     telegram_id = update.effective_user.id
     session = sessions.get(telegram_id)
     if session is None:
         return
+
+    # 先中止背景 worker，否則接下來刪暫存夾時它們還在往裡面寫、也還在往目的地複製
+    # （那只會製造更多需要人工清理的殘留）。
+    if session.pipeline is not None:
+        await session.pipeline.cancel()
+        session.pipeline = None
 
     residue_rows = []
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -701,7 +997,7 @@ async def handle_restart_confirm(update: Update, context: ContextTypes.DEFAULT_T
 
 async def handle_restart_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     _, _, _, sessions, _ = _services(context)
     session = sessions.get(update.effective_user.id)
     if session is None:
@@ -712,21 +1008,65 @@ async def handle_restart_cancel(update: Update, context: ContextTypes.DEFAULT_TY
 
 # ── 傳錯復原 ─────────────────────────────────────────
 
+def _clear_correction_flag(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data[AWAITING_CORRECTION_FLAG] = False
+    context.user_data.pop(CORRECTION_FLAG_AT, None)
+
+
+def _correction_flag_active(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    「這批傳錯了」的待輸入狀態是否仍有效（規格書 §7 第 10 點）。
+
+    這個狀態**必須會過期**。v2 沒有失效條件，於是：使用者點了「↩️ 這批傳錯了」卻
+    改變主意不回覆，接著開新的上傳、輸入資料夾名稱時，那個名稱會被誤判成更正目標
+    ——上一批照片被複製到新上傳的資料夾去，而新 session 還卡在等資料夾名稱。
+    """
+    if not context.user_data.get(AWAITING_CORRECTION_FLAG):
+        return False
+    started_at = context.user_data.get(CORRECTION_FLAG_AT)
+    if started_at is None:
+        return True
+    config = context.application.bot_data["config"]
+    if datetime.now() - started_at >= timedelta(minutes=_cfg(config, "CORRECTION_PROMPT_MAX_MIN")):
+        _clear_correction_flag(context)
+        return False
+    return True
+
+
 async def handle_correction_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
-    _, _, _, sessions, _ = _services(context)
+    await _safe_answer(query)
+    members, _, _, sessions, _ = _services(context)
     telegram_id = update.effective_user.id
     batch = sessions.get_last_batch(telegram_id)
     if batch is None or batch.corrected:
         return  # 重複點擊 / 無可更正批次一律忽略（§6.3）
     context.user_data[AWAITING_CORRECTION_FLAG] = True
-    await query.message.reply_text("這批要改放到哪個資料夾？請直接打字輸入：")
+    context.user_data[CORRECTION_FLAG_AT] = datetime.now()
+    # 規格書 §7 第 1 點：須同時提供「近 3 次資料夾」按鈕與打字輸入兩種方式
+    recent = members.get_recent_folders(telegram_id)
+    await query.message.reply_text(
+        "這批要改放到哪個資料夾？可以點下面用過的，或直接打字輸入新名稱：",
+        reply_markup=correction_folder_keyboard(recent) if recent else None,
+    )
 
 
-async def _apply_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, new_folder: str) -> None:
+async def handle_correction_folder_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await _safe_answer(query)
+    if not _correction_flag_active(context):
+        return
+    folder_name = storage.sanitize_folder_name(query.data[len(CB_CORRECTION_FOLDER_PREFIX):])
+    if not folder_name:
+        return
+    _clear_correction_flag(context)
+    await _apply_correction(update, context, folder_name, message=query.message)
+
+
+async def _apply_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, new_folder: str, message=None) -> None:
     members, notifier, config, sessions, logs = _services(context)
     telegram_id = update.effective_user.id
+    message = message or update.effective_message
     batch = sessions.get_last_batch(telegram_id)
     if batch is None or batch.corrected or not new_folder:
         return
@@ -734,7 +1074,7 @@ async def _apply_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     # 搬移可能需要一點時間（重試、多目的地），先讓使用者知道請求已收到、
     # 正在處理中，避免看起來像卡住（規格書 §6.3.1 的即時回饋精神同樣適用於此）。
-    await update.effective_message.reply_text(notify.user_msg_correction_processing(new_folder))
+    await message.reply_text(notify.user_msg_correction_processing(new_folder))
 
     uploader = members.get(telegram_id)
     uploader_name = uploader.name if uploader else str(telegram_id)
@@ -748,7 +1088,7 @@ async def _apply_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     # upload_log 加倍。written_paths 裡存的是寫入當下就配好的 (file_id, 路徑)，
     # 不必事後用順序去猜對應關係。
     all_file_ids = {file_id for pairs in batch.written_paths.values() for file_id, _ in pairs}
-    failed_file_ids: set[str] = set()
+    failed_file_ids: set = set()
     for label, pairs in batch.written_paths.items():
         new_dir = roots[label] / new_folder
         for file_id, old_path in pairs:
@@ -768,7 +1108,9 @@ async def _apply_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             actual_filename = result.dest_path.name if result.success and result.dest_path else old_path.name
             index_rows.append((now_str, uploader_name, telegram_id, new_folder, label, actual_filename, file_id))
             if result.success:
-                cleanup_rows.append((now_str, batch.destination_label, telegram_id, "傳錯更正",
+                # 第 2 欄是「上傳者」，必須填姓名——v2 誤填成目的地標籤，害管理員
+                # 無法依人篩選待清理清單（規格書 §10B）。
+                cleanup_rows.append((now_str, uploader_name, telegram_id, "傳錯更正",
                                       str(old_path.parent), old_path.name, f"已改放至「{new_folder}」"))
             else:
                 failed_file_ids.add(file_id)
@@ -780,11 +1122,12 @@ async def _apply_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if index_rows:
         await asyncio.to_thread(logs.log_file_index_batch, index_rows)
 
-    await update.effective_message.reply_text(notify.user_msg_correction_done(total_moved, new_folder))
+    await message.reply_text(notify.user_msg_correction_done(total_moved, new_folder))
     await asyncio.to_thread(
         logs.log_upload, now_str, uploader_name, telegram_id,
         f"{batch.folder} → {new_folder}", batch.destination_label, total_moved, "傳錯更正",
     )
+    await asyncio.to_thread(members.push_recent_folder, telegram_id, new_folder, batch.destination_label)
     await notifier.notify_admin(
         notify.msg_correction(uploader_name, batch.folder, new_folder, total_moved)
     )

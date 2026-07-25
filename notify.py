@@ -47,6 +47,18 @@ def msg_health_check_failed(dest_label: str, error: str) -> str:
     return f"🔴 健檢失敗：{dest_label}\n原因：{error}"
 
 
+def msg_download_failure(uploader: str, folder: str, count: int, error: str) -> str:
+    return (
+        f"🔴 從 Telegram 下載照片失敗：{uploader}／{folder}／{count} 張\n"
+        f"原因：{error}\n"
+        f"已記入 file_index.csv（保留 file_id），可用 redownload.py 事後補救"
+    )
+
+
+def msg_unhandled_error(where: str, error_type: str, error: str) -> str:
+    return f"🔴 未預期的程式例外（{where}）\n{error_type}: {error}"
+
+
 def msg_recovery_report(lines: list[str]) -> str:
     body = "\n".join(lines) if lines else "（無未完成批次）"
     return f"🔁 程式重啟復原報告：\n{body}"
@@ -126,8 +138,20 @@ def user_msg_upload_ready(folder: str, dest_label: str) -> str:
     return f"✅ 準備好了！資料夾：{folder} ／ 存到：{dest_label}\n請開始傳照片，傳完後點下方按鈕"
 
 
-def user_msg_receiving(count: int) -> str:
+def user_msg_receiving(count: int, stored: int = 0) -> str:
+    """
+    收件計數。背景 worker 正同時把已收到的照片複製到目的地，故一併顯示「已存好
+    N 張」，讓使用者看得到備份進度，緩衝結束後進度條的起跳點才不會顯得突兀
+    （規格書 §6.3.1、§6.3 設計取捨二）。
+    """
+    if stored > 0:
+        return f"📥 收到照片中… {count} 張（已存好 {stored} 張）"
     return f"📥 收到照片中… {count} 張"
+
+
+def user_msg_download_failed_summary(count: int) -> str:
+    """下載失敗於本次結束時彙總告知，不逐張打擾使用者（規格書 §8）。"""
+    return f"⚠️ 有 {count} 張沒有收到，麻煩再傳一次"
 
 
 def user_msg_confirming(count: int) -> str:
