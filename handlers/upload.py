@@ -1415,6 +1415,8 @@ async def _run_correction(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, 
 
     all_file_ids = set(by_photo)
     failed_file_ids: set = set()
+    # 搬到新資料夾的照片同樣是「寫入 OneDrive 的檔案」，一樣要排釋放空間（§4.2）。
+    onedrive_written: list = []
     total_photos = len(by_photo)
     progress_message = None
     last_progress_at = datetime.now()
@@ -1445,6 +1447,8 @@ async def _run_correction(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, 
                 # 無法依人篩選待清理清單（規格書 §10B）。
                 cleanup_rows.append((now_str, uploader_name, telegram_id, "傳錯更正",
                                       str(old_path.parent), old_path.name, f"已改放至「{new_folder}」"))
+                if label == DEST_ONEDRIVE_LABEL and result.dest_path:
+                    onedrive_written.append(result.dest_path)
             else:
                 failed_file_ids.add(file_id)
 
@@ -1485,6 +1489,10 @@ async def _run_correction(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, 
         now_str, uploader_name, telegram_id,
         f"{batch.folder} → {new_folder}", batch.destination_label, total_moved, "傳錯更正",
     )
+    # 新位置的 OneDrive 檔案也要排釋放空間，否則它們會永遠留在本機（§4.2）
+    if getattr(config, "ONEDRIVE_FREE_SPACE", True) and onedrive_written:
+        await _schedule_onedrive_release(context, onedrive_written)
+
     await notifier.notify_admin(
         notify.msg_correction(uploader_name, batch.folder, new_folder, total_moved)
     )

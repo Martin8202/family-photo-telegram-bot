@@ -1568,3 +1568,101 @@ async def test_correction_applies_write_throttle(env, monkeypatch):
         config.WRITE_THROTTLE_SEC = original
 
     assert sleeps.count(0.3) == 3, f"3 張照片應該各有一次寫入節流，實際 {sleeps}"
+
+
+@pytest.mark.asyncio
+async def test_correction_schedules_onedrive_release(env):
+    """
+    實測回報的 bug：「這批傳錯了」搬到新資料夾的照片，沒有被寫進
+    pending_onedrive_release.json，所以永遠不會被標記為「僅線上」，
+    本機空間白白佔著。
+
+    寫入 OneDrive 的每一條路徑都必須排釋放空間（§4.2）。
+    """
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+    ctx = DummyContext(app)
+    user = DummyUser(1090, "十三姑")
+    members: MembersStore = app.bot_data["members"]
+    members.register(1090, "十三姑")
+    members.approve(1090)
+
+    old_dir = od_dir / "更正前"
+    old_dir.mkdir(parents=True, exist_ok=True)
+    old_photo = old_dir / "20260725_130000_deadbeef.jpg"
+    old_photo.write_bytes(b"photo")
+    app.bot_data["sessions"].set_last_batch(upload.CompletedBatch(
+        telegram_id=1090, folder="更正前", destination_label="OneDrive", files=[],
+        written_paths={"OneDrive": [("fid_od", old_photo)]}, completed_at=datetime.now(),
+    ))
+
+    corr_msg = DummyMessage(20, "", 1090, app.bot)
+    await upload.handle_correction_button(
+        DummyUpdate(user, corr_msg, DummyCallbackQuery("correction", user, corr_msg)), ctx
+    )
+    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(21, "更正後", 1090, app.bot)), ctx)
+    await drain_background_tasks(app)
+
+    new_photo = od_dir / "更正後" / old_photo.name
+    assert new_photo.exists(), "照片要搬到新資料夾"
+
+    pending = storage.read_pending_releases(data_dir)
+    assert len(pending) == 1, "更正後的新位置也要排 OneDrive 釋放空間"
+    assert str(new_photo) in pending[0]["paths"], "待辦要指向新位置的檔案"
+
+    jobs = [j for j in app.job_queue.jobs if j.name.startswith(upload.ONEDRIVE_RELEASE_JOB_PREFIX)]
+    assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_correction_to_nas_does_not_schedule_onedrive_release(env):
+    """只搬到家裡硬碟時不該排 OneDrive 釋放（那裡根本沒有 OneDrive 檔案）。"""
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+    ctx = DummyContext(app)
+    user = DummyUser(1091, "十四伯")
+    members: MembersStore = app.bot_data["members"]
+    members.register(1091, "十四伯")
+    members.approve(1091)
+
+    old_dir = nas_dir / "硬碟更正前"
+    old_dir.mkdir(parents=True, exist_ok=True)
+    old_photo = old_dir / "20260725_131000_cafebabe.jpg"
+    old_photo.write_bytes(b"photo")
+    app.bot_data["sessions"].set_last_batch(upload.CompletedBatch(
+        telegram_id=1091, folder="硬碟更正前", destination_label="家裡硬碟", files=[],
+        written_paths={"家裡硬碟": [("fid_nas", old_photo)]}, completed_at=datetime.now(),
+    ))
+
+    corr_msg = DummyMessage(20, "", 1091, app.bot)
+    await upload.handle_correction_button(
+        DummyUpdate(user, corr_msg, DummyCallbackQuery("correction", user, corr_msg)), ctx
+    )
+    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(21, "硬碟更正後", 1091, app.bot)), ctx)
+    await drain_background_tasks(app)
+
+    assert (nas_dir / "硬碟更正後" / old_photo.name).exists()
+    assert storage.read_pending_releases(data_dir) == []
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_schedules_onedrive_release(env):
+    """
+    同一類漏洞的第二處：當機復原補送到 OneDrive 的照片，也要排釋放空間。
+    """
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+
+    user_temp = temp_dir / "1092_十五嬸"
+    session_temp = user_temp / "20260725_1300_復原相簿"
+    session_temp.mkdir(parents=True, exist_ok=True)
+    orphan = session_temp / "file_id_recover.jpg"
+    orphan.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00`\x00`\x00\x00\xff\xd9")
+    storage.write_session_info(session_temp, {
+        "destination": "OneDrive", "folder": "復原相簿",
+        "telegram_id": 1092, "name": "十五嬸",
+    })
+
+    await startup_recover_temp(app)
+
+    assert list((od_dir / "復原相簿").glob("*.jpg")), "照片要被補送到 OneDrive"
+    pending = storage.read_pending_releases(data_dir)
+    assert len(pending) == 1, "復原補送的照片也要排 OneDrive 釋放空間"
+    assert pending[0]["paths"]

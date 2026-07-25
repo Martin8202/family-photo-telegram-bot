@@ -219,6 +219,8 @@ async def startup_recover_temp(app: Application) -> None:
             fail_count = 0
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
             index_rows = []
+            # 補送進 OneDrive 的照片同樣要排釋放空間，否則永遠留在本機（§4.2）
+            onedrive_written: list = []
             for label, dest_dir in dest_targets.items():
                 for f in files:
                     # 復原時同樣套用檔名規則（EXIF 拍攝時間優先），與正常流程一致，
@@ -234,6 +236,8 @@ async def startup_recover_temp(app: Application) -> None:
                     index_rows.append((now_str, name, telegram_id, folder_name, label, actual_name, file_id))
                     if result.success:
                         success_count += 1
+                        if label == "OneDrive" and result.dest_path:
+                            onedrive_written.append(result.dest_path)
                     else:
                         fail_count += 1
 
@@ -242,6 +246,14 @@ async def startup_recover_temp(app: Application) -> None:
                     logs.log_file_index_batch(index_rows)
                 except Exception:
                     logger.exception("復原批次寫入 file_index 失敗，繼續處理其餘批次")
+
+            if getattr(cfg, "ONEDRIVE_FREE_SPACE", True) and onedrive_written:
+                class _Ctx:  # 啟動階段還沒有真正的 CallbackContext，包一個最小的替身
+                    application = app
+                try:
+                    await upload._schedule_onedrive_release(_Ctx(), onedrive_written)
+                except Exception:
+                    logger.exception("復原批次排程 OneDrive 釋放空間失敗")
 
             all_ok = fail_count == 0
             guess_note = "（未找到目的地紀錄，已預設補送到區網硬碟，請確認是否正確）" if destination_guessed else ""
