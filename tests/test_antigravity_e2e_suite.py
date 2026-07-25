@@ -366,10 +366,10 @@ async def test_debounce_confirm_message_dual_layer_update(env):
     await upload.handle_finish_button(
         DummyUpdate(user, finish_msg, DummyCallbackQuery("finish", user, finish_msg)), ctx
     )
-    assert session.confirm_message_id is not None
+    assert session.status_message_id is not None
     sent_baseline = len(app.bot.sent_messages)
     edited_baseline = len(app.bot.edited_messages)
-    confirm_id_after_first = session.confirm_message_id
+    confirm_id_after_first = session.status_message_id
 
     # ① 兩個門檻都拉到極大 → 畫面不動，但計數與計時照常
     config.CONFIRM_UPDATE_SEC = 9999
@@ -380,8 +380,8 @@ async def test_debounce_confirm_message_dual_layer_update(env):
     assert session.received_count == 2
     assert len(app.bot.sent_messages) == sent_baseline
     assert len(app.bot.edited_messages) == edited_baseline
-    assert session.confirm_message_id == confirm_id_after_first
-    # 舊 job 被換掉，仍只有一個在排隊中——代表 5 秒計時確實重啟了
+    assert session.status_message_id == confirm_id_after_first
+    # 舊 job 被換掉，仍只有一個在排隊中——代表計時確實重啟了
     assert len(app.job_queue.get_jobs_by_name("debounce:1002")) == 1
 
     # ② 張數門檻放行（時間門檻仍極大）→ 應原地編輯，不多發訊息
@@ -393,17 +393,18 @@ async def test_debounce_confirm_message_dual_layer_update(env):
     assert len(app.bot.sent_messages) == sent_baseline, "重錨視窗內不該重發訊息"
     assert len(app.bot.edited_messages) == edited_baseline + 1
     assert "3" in app.bot.edited_messages[-1]["text"]
-    assert session.confirm_message_id == confirm_id_after_first
+    assert "確認中" in app.bot.edited_messages[-1]["text"], "確認標記要一直帶著"
+    assert session.status_message_id == confirm_id_after_first
 
     # ③ 超過重錨秒數 → 才刪舊發新，把訊息拉回對話最下方
-    session.confirm_last_reanchor = datetime(2000, 1, 1)
+    session.status_last_reanchor = datetime(2000, 1, 1)
     photo4 = MagicMock(); photo4.file_id = "p4"
     await upload.handle_photo_message(DummyUpdate(user, DummyMessage(8, "", 1002, app.bot, photo=[photo4])), ctx)
 
     assert session.received_count == 4
     assert len(app.bot.sent_messages) == sent_baseline + 1
     assert "4" in app.bot.sent_messages[-1]["text"]
-    assert session.confirm_message_id != confirm_id_after_first
+    assert session.status_message_id != confirm_id_after_first
 
 
 @pytest.mark.asyncio
@@ -760,7 +761,7 @@ async def test_finish_button_survives_expired_callback_query(env):
     await upload.handle_finish_button(DummyUpdate(user, finish_msg, expired), ctx)
 
     assert session.stage == "debounce", "answer() 失敗不該中斷後面的結案流程"
-    assert session.confirm_message_id is not None
+    assert session.status_message_id is not None
     assert any("確認中" in m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1014)
 
 

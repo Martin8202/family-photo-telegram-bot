@@ -109,8 +109,10 @@ class UploadSession:
     # 這裡，而不是一律假設他原本正在傳照片（可能是在選資料夾階段誤觸的）。
     stage_before_restart_confirm: Optional[str] = None
     compressed_warned: bool = False
-    counter_message_id: Optional[int] = None  # 收件計數訊息 id，刪舊發新置底顯示（§6.3.1）
-    confirm_message_id: Optional[int] = None  # 「確認中…」訊息 id，緩衝期間更新張數
+    # 收件與確認**共用同一則狀態訊息**（§6.3.1）。v3.1 以前分成「收到照片中」與
+    # 「確認中」兩則，但兩者講的是同一件事（還在收、目前幾張），只是使用者按過
+    # 按鈕沒有的差別——合併成一則，用句尾的狀態標記表示就夠了。
+    status_message_id: Optional[int] = None
     inactivity_prompted: bool = False  # 是否已發出過「看起來傳得差不多囉，請問傳完了嗎？」靜置提醒
     inactivity_prompt_message_id: Optional[int] = None  # 靜置提醒訊息 id
     destinations: dict = field(default_factory=dict)  # label -> DestinationOutcome
@@ -126,7 +128,7 @@ class UploadSession:
     counter_last_count: int = 0
     confirm_last_update: Optional[datetime] = None
     confirm_last_count: int = 0
-    confirm_last_reanchor: Optional[datetime] = None  # 上次用「刪舊發新」把確認中訊息拉回底部的時間
+    status_last_reanchor: Optional[datetime] = None  # 上次用「刪舊發新」把狀態訊息拉回對話底部的時間
 
     def touch(self, now: Optional[datetime] = None) -> None:
         self.last_activity_at = now or datetime.now()

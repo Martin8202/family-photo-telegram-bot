@@ -617,59 +617,51 @@ async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, sessio
 
 # ── 收照片（事件處理層：毫秒級）────────────────────────
 
-async def _update_counter_message(update: Update, context: ContextTypes.DEFAULT_TYPE, session) -> None:
+async def _update_status_message(
+    context: ContextTypes.DEFAULT_TYPE, session, message, now: datetime, force_resend: bool = False
+) -> None:
     """
-    永遠只保留一則「收到照片中… N 張」訊息，不洗版（§6.3.1）。
-    做法是刪掉舊的那則、在最下面重發一則新的——而不是原地編輯——
-    這樣這則狀態訊息會持續跟著對話移到最下面，不會卡在畫面中間看起來像卡住。
+    更新那**唯一一則**狀態訊息（規格書 §6.3.1）。
 
-    同時顯示「（已存好 N 張）」：背景 worker 正在同步備份，讓使用者一路看得到
-    進度，緩衝結束後進度條的起跳點才不會顯得突兀（§6.3 設計取捨二）。
-    """
-    text = notify.user_msg_receiving(session.received_count, session.stored_count)
-    await _delete_message_safe(context, session.telegram_id, session.counter_message_id)
-    try:
-        sent = await update.effective_message.reply_text(text, reply_markup=in_session_keyboard())
-        session.counter_message_id = sent.message_id
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("更新收件計數訊息失敗：%s", exc)
+    收件與確認共用同一則訊息，差別只在句尾的狀態標記——使用者按下結束後才會多出
+    「⏳ 確認中…」那一行，那既是狀態說明，也是「你按到了」的回饋。
 
-
-async def _update_confirm_message(context: ContextTypes.DEFAULT_TYPE, session, message, now: datetime) -> None:
-    """
-    「⏳ 確認中…」的雙層更新（規格書 §6.3.1）：
-
-    ① 張數變動用 `editMessageText` **原地編輯**——單次 API 呼叫、不閃爍、數字直接跳動；
-    ② 每隔 `COUNTER_REANCHOR_SEC` 秒才用一次「刪舊發新」把訊息拉回對話最下方
-       （緩衝期間陸續抵達的照片仍會把訊息往上推）。
-
-    如此同時達成「張數一直跳」的即時感，又把刪除／重發的次數壓到最低，避免 429。
+    更新方式依階段不同：
+    - **收件階段**：刪舊發新。使用者正在傳照片，每張照片都會把訊息往上推，
+      唯有重發才能讓它持續貼在最下面（這是實測後使用者明確要求保留的設計）。
+    - **確認階段**：使用者已停手，改以 `editMessageText` **原地編輯**更新數字——
+      單次 API 呼叫、不閃爍、數字直接跳；只有隔了 `COUNTER_REANCHOR_SEC` 秒
+      才重新刪舊發新把它拉回底部（緩衝期間仍可能有照片陸續抵達把它推上去）。
+    - `force_resend`：使用者主動點擊按鈕時用，直接重發到對話最下方，
+      確保他立刻在眼前看到回饋。
     """
     config = context.application.bot_data["config"]
-    text = notify.user_msg_confirming(session.received_count)
-    reanchor_sec = _cfg(config, "COUNTER_REANCHOR_SEC")
-    need_reanchor = (
-        session.confirm_message_id is None
-        or session.confirm_last_reanchor is None
-        or (now - session.confirm_last_reanchor).total_seconds() >= reanchor_sec
-    )
+    confirming = session.stage == STAGE_DEBOUNCE
+    text = notify.user_msg_status(session.received_count, session.stored_count, confirming=confirming)
 
-    if not need_reanchor:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=session.telegram_id, message_id=session.confirm_message_id, text=text
-            )
-            return
-        except Exception:
-            pass  # 編輯失敗（訊息被刪、內容完全相同）就退回下面的刪舊發新
+    if confirming and not force_resend and session.status_message_id is not None:
+        reanchor_sec = _cfg(config, "COUNTER_REANCHOR_SEC")
+        need_reanchor = (
+            session.status_last_reanchor is None
+            or (now - session.status_last_reanchor).total_seconds() >= reanchor_sec
+        )
+        if not need_reanchor:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=session.telegram_id, message_id=session.status_message_id,
+                    text=text, reply_markup=in_session_keyboard(),
+                )
+                return
+            except Exception:
+                pass  # 編輯失敗（訊息被刪、內容完全相同）就退回下面的刪舊發新
 
-    await _delete_message_safe(context, session.telegram_id, session.confirm_message_id)
+    await _delete_message_safe(context, session.telegram_id, session.status_message_id)
     try:
-        sent = await message.reply_text(text)
-        session.confirm_message_id = sent.message_id
-        session.confirm_last_reanchor = now
+        sent = await message.reply_text(text, reply_markup=in_session_keyboard())
+        session.status_message_id = sent.message_id
+        session.status_last_reanchor = now
     except Exception as exc:  # noqa: BLE001
-        logger.warning("更新確認中訊息失敗：%s", exc)
+        logger.warning("更新狀態訊息失敗：%s", exc)
 
 
 async def _start_auto_append_session(update: Update, context: ContextTypes.DEFAULT_TYPE, last_batch, message):
@@ -708,7 +700,7 @@ async def _start_auto_append_session(update: Update, context: ContextTypes.DEFAU
          "telegram_id": telegram_id, "name": session.name},
     )
     session.enter_stage(STAGE_DEBOUNCE, now)
-    session.confirm_last_reanchor = now
+    session.status_last_reanchor = now
     session.mark_confirm_updated(now)
 
     try:
@@ -784,13 +776,13 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if session.stage == STAGE_RECEIVING_PHOTOS:
         if should_update_counter(session, now, config.COUNTER_UPDATE_SEC, _cfg(config, "COUNTER_UPDATE_COUNT")):
             session.mark_counter_updated(now)
-            await _update_counter_message(update, context, session)
+            await _update_status_message(context, session, message, now)
         return
 
     # ── 緩衝期間（STAGE_DEBOUNCE）──
     if should_update_confirm(session, now, _cfg(config, "CONFIRM_UPDATE_SEC"), _cfg(config, "CONFIRM_UPDATE_COUNT")):
         session.mark_confirm_updated(now)
-        await _update_confirm_message(context, session, message, now)
+        await _update_status_message(context, session, message, now)
     _schedule_debounce(context, telegram_id, restart=True)
 
 
@@ -845,10 +837,7 @@ async def handle_finish_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if session.stage == STAGE_DEBOUNCE:
         # 緩衝期間重複點擊：不重新計時、不重算張數（§6.3），但仍要回覆一次
         # 「確認中」讓使用者知道有被接收到，避免看起來像沒反應而一直猛戳。
-        await _delete_message_safe(context, telegram_id, session.confirm_message_id)
-        sent = await query.message.reply_text(notify.user_msg_confirming(session.received_count))
-        session.confirm_message_id = sent.message_id
-        session.confirm_last_reanchor = now
+        await _update_status_message(context, session, query.message, now, force_resend=True)
         session.mark_confirm_updated(now)
         return
 
@@ -856,16 +845,14 @@ async def handle_finish_button(update: Update, context: ContextTypes.DEFAULT_TYP
         return  # 其餘階段沒有這顆按鈕可點
 
     session.finish_clicked = True
-    # 收件階段的「📥 收到照片中…」與靜置提醒訊息在此結束任務
-    await _delete_message_safe(context, telegram_id, session.counter_message_id)
-    session.counter_message_id = None
+    # 靜置提醒訊息在此結束任務（狀態訊息不刪，它要繼續用下去）
     await _delete_message_safe(context, telegram_id, session.inactivity_prompt_message_id)
     session.inactivity_prompt_message_id = None
 
     session.enter_stage(STAGE_DEBOUNCE, now)
-    sent = await query.message.reply_text(notify.user_msg_confirming(session.received_count))
-    session.confirm_message_id = sent.message_id
-    session.confirm_last_reanchor = now
+    # 同一則狀態訊息換上「⏳ 確認中」標記並重發到最下方：使用者立刻看到自己按到了，
+    # 而且畫面上不會多出一則跟原本講同樣事情的訊息（§6.3.1）。
+    await _update_status_message(context, session, query.message, now, force_resend=True)
     session.mark_confirm_updated(now)
     _schedule_debounce(context, telegram_id)
 
@@ -949,10 +936,8 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
     if session.stage == STAGE_PROCESSING:
         return  # 已在收尾中（debounce 與逾時掃描可能同時觸發），不重入
 
-    # 「⏳ 確認中…」訊息保留在對話紀錄中不刪除（方便對照查看歷史張數）
-    session.confirm_message_id = None
-    await _delete_message_safe(context, telegram_id, session.counter_message_id)
-    session.counter_message_id = None
+    # 狀態訊息保留在對話紀錄中不刪除，方便使用者回頭對照「當時到底收到幾張」（§6.3.1）
+    session.status_message_id = None
     await _delete_message_safe(context, telegram_id, session.inactivity_prompt_message_id)
     session.inactivity_prompt_message_id = None
 

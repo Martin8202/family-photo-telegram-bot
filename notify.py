@@ -158,15 +158,24 @@ def user_msg_upload_ready(folder: str, dest_label: str) -> str:
     return f"✅ 準備好了！資料夾：{folder} ／ 存到：{dest_label}\n請開始傳照片，傳完後點下方按鈕"
 
 
-def user_msg_receiving(count: int, stored: int = 0) -> str:
+def user_msg_status(count: int, stored: int = 0, confirming: bool = False) -> str:
     """
-    收件計數。背景 worker 正同時把已收到的照片複製到目的地，故一併顯示「已存好
-    N 張」，讓使用者看得到備份進度，緩衝結束後進度條的起跳點才不會顯得突兀
-    （規格書 §6.3.1、§6.3 設計取捨二）。
+    收件階段與確認階段**共用的單一狀態訊息**（規格書 §6.3.1）。
+
+    v3.1 以前分成「📥 收到照片中… X 張」與「⏳ 確認中…（目前共 X 張）」兩則訊息，
+    但兩者講的其實是同一件事——「還在收，目前 X 張」——只是使用者按過結束按鈕
+    沒有的差別。為此刪一則、發一則，畫面雜訊大於資訊量。合併成一則之後，
+    **句尾的狀態標記**就是唯一的差異，也是使用者「我按到了沒」的回饋。
+
+    一併顯示「已存好 N 張」：背景 worker 正同時把照片複製到目的地，讓使用者
+    看得到備份進度，緩衝結束後進度條的起跳點才不會顯得突兀（§6.3 設計取捨二）。
     """
+    base = f"📥 已收到 {count} 張"
     if stored > 0:
-        return f"📥 收到照片中… {count} 張（已存好 {stored} 張）"
-    return f"📥 收到照片中… {count} 張"
+        base += f"（已存好 {stored} 張）"
+    if confirming:
+        base += "\n⏳ 確認中，稍等一下，我再看看還有沒有照片進來…"
+    return base
 
 
 def user_msg_download_failed_summary(count: int) -> str:
@@ -175,7 +184,8 @@ def user_msg_download_failed_summary(count: int) -> str:
 
 
 def user_msg_confirming(count: int) -> str:
-    return f"⏳ 確認中…（目前共 {count} 張，稍等一下確認沒有漏收）"
+    """保留給不需要備份張數的呼叫端（例如緩衝期間重複點擊的即時回覆）。"""
+    return user_msg_status(count, confirming=True)
 
 
 def user_msg_uploading(progress_bar_text: str) -> str:
