@@ -55,6 +55,16 @@ def msg_download_failure(uploader: str, folder: str, count: int, error: str) -> 
     )
 
 
+def msg_log_write_failure(what: str, error: str) -> str:
+    return (
+        f"🔴 寫入「{what}」失敗，這次的紀錄沒有存進去\n"
+        f"最可能的原因：你正用 Excel 開著這個檔案，Windows 會鎖住它不讓程式寫入。\n"
+        f"請把 Excel 關掉，之後的紀錄就會恢復正常。\n"
+        f"（照片本身完全不受影響，已經正常存好了；這次漏掉的內容可到 logs/photo-bot.log 查回）\n"
+        f"錯誤訊息：{error}"
+    )
+
+
 def msg_unhandled_error(where: str, error_type: str, error: str) -> str:
     return f"🔴 未預期的程式例外（{where}）\n{error_type}: {error}"
 
@@ -156,6 +166,18 @@ def user_msg_auto_appended(folder: str) -> str:
 
 def user_msg_upload_ready(folder: str, dest_label: str) -> str:
     return f"✅ 準備好了！資料夾：{folder} ／ 存到：{dest_label}\n請開始傳照片，傳完後點下方按鈕"
+
+
+def user_msg_folder_exists(folder: str, dest_labels: list) -> str:
+    """
+    使用者打的資料夾名稱已經存在時的說明。
+
+    讓他清楚知道這次是「加進既有相簿」而不是「開一本新的」——不講的話，
+    使用者無從分辨，可能以為打錯字開了重複的相簿，或反過來以為開了新的
+    結果混進舊照片裡。
+    """
+    where = "、".join(dest_labels)
+    return f"📁 「{folder}」這個資料夾已經有了（{where}），照片會直接存進去，不會另外開新的"
 
 
 def user_msg_status(count: int, stored: int = 0, confirming: bool = False) -> str:

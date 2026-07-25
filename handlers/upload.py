@@ -147,6 +147,30 @@ async def _delete_message_safe(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
         pass  # 刪不掉（例如使用者手動刪過）也無妨
 
 
+async def _write_record_safe(context: ContextTypes.DEFAULT_TYPE, what: str, fn, *args) -> bool:
+    """
+    寫入 CSV 紀錄檔／成員清單，失敗只記 log ＋ 通知管理員，**絕不中斷照片處理流程**。
+
+    規格書 §2 的「通知失敗不可中斷本體工作」同樣適用於記錄檔。實測踩到的坑：
+    管理員用 Excel 開著 `待清理清單.csv`（那正是這個檔案存在的目的——照著它刪檔），
+    Windows 鎖檔導致 `open(path,"ab")` 拋 PermissionError，例外一路往上炸掉整個
+    「這批傳錯了」流程——照片其實**已經複製完成**了，卻沒回覆使用者、沒寫
+    file_index、新資料夾沒進「最近使用」，而且 `batch.corrected` 已被設為 True
+    導致連重試都不行。一個記錄檔寫不進去，絕不該有這種連鎖後果。
+    """
+    try:
+        await asyncio.to_thread(fn, *args)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.error("寫入%s失敗：%s", what, exc)
+        try:
+            _, notifier, _, _, _ = _services(context)
+            await notifier.notify_admin(notify.msg_log_write_failure(what, str(exc)))
+        except Exception:
+            pass  # 連通知都送不出去時也不能再往外拋
+        return False
+
+
 async def _safe_delete_temp(path, temp_root) -> None:
     """
     刪除暫存區內的檔案／資料夾，以 to_thread 執行避免阻塞事件迴圈（規格書 §3），
@@ -303,7 +327,8 @@ async def handle_destination_button(update: Update, context: ContextTypes.DEFAUL
         return
     destination = query.data[len(CB_DEST_PREFIX):]
     session.destination = destination
-    for label in _destination_targets(destination, config, session.folder):
+    dest_targets = _destination_targets(destination, config, session.folder)
+    for label in dest_targets:
         session.destinations[label] = DestinationOutcome(label=label)
 
     now = datetime.now()
@@ -317,10 +342,21 @@ async def handle_destination_button(update: Update, context: ContextTypes.DEFAUL
     )
     session.enter_stage(STAGE_RECEIVING_PHOTOS, now)
 
-    await query.message.reply_text(
-        notify.user_msg_upload_ready(session.folder, destination),
-        reply_markup=in_session_keyboard(show_finish=False),
-    )
+    # 讓使用者分得清「這次是開新相簿」還是「加進既有相簿」。存在性檢查可能打到
+    # 網芳，以 to_thread 執行避免阻塞事件迴圈（§3）。
+    existing_labels = []
+    for label, target in dest_targets.items():
+        try:
+            if await asyncio.to_thread(target.exists):
+                existing_labels.append(label)
+        except Exception:
+            pass  # 檢查失敗不影響上傳本身，頂多少一句提示
+
+    ready_text = notify.user_msg_upload_ready(session.folder, destination)
+    if existing_labels:
+        ready_text += "\n" + notify.user_msg_folder_exists(session.folder, existing_labels)
+
+    await query.message.reply_text(ready_text, reply_markup=in_session_keyboard(show_finish=False))
 
 
 # ── 背景工作管線：下載 worker ×N ＋ 複製 worker ×1（§3.1、§6.3.3）──
@@ -597,7 +633,7 @@ async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, sessio
 
     # 重複檔案清單先落地，管理員才有依據可以精準刪除（§10B）
     if duplicate_rows:
-        await asyncio.to_thread(logs.log_cleanup_batch, duplicate_rows)
+        await _write_record_safe(context, "待清理清單", logs.log_cleanup_batch, duplicate_rows)
 
     # file_index：成功或失敗一律記錄（§16.1），檔名一律是實際寫入目的地的檔名
     index_rows = []
@@ -606,7 +642,7 @@ async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, sessio
             index_rows.append((now_str, session.name, telegram_id, session.folder, label, actual_filename, rf.file_id))
     # 寫入佇列的 submit 會等待背景執行緒完成（done_event.wait），以 to_thread
     # 執行才不會阻塞事件迴圈（§3）。下方其他 logs.*／members.* 寫入亦同理。
-    await asyncio.to_thread(logs.log_file_index_batch, index_rows)
+    await _write_record_safe(context, "照片索引 file_index.csv", logs.log_file_index_batch, index_rows)
 
     chunk_fully_ok = all(chunk_ok_labels.values())
     if chunk_fully_ok:
@@ -1010,11 +1046,15 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
 
     dest_label_text = session.destination
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    await asyncio.to_thread(
-        logs.log_upload, now_str, session.name, telegram_id, session.folder, dest_label_text, total,
+    await _write_record_safe(
+        context, "上傳紀錄 upload_log.csv", logs.log_upload,
+        now_str, session.name, telegram_id, session.folder, dest_label_text, total,
         "成功" if overall_ok else "部分失敗",
     )
-    await asyncio.to_thread(members.push_recent_folder, telegram_id, session.folder, dest_label_text)
+    await _write_record_safe(
+        context, "最近使用的資料夾", members.push_recent_folder,
+        telegram_id, session.folder, dest_label_text,
+    )
 
     # 「兩邊都存」時同一張照片會在兩個目的地各記一次重複，換算回實際照片數才不會加倍
     dest_count = max(1, len(session.destinations))
@@ -1103,7 +1143,7 @@ async def handle_restart_confirm(update: Update, context: ContextTypes.DEFAULT_T
             residue_rows.append((now_str, session.name, telegram_id, "中止殘留", str(path.parent), path.name,
                                   "使用者重新開始，此為已寫入的中止殘留"))
     if residue_rows:
-        await asyncio.to_thread(logs.log_cleanup_batch, residue_rows)
+        await _write_record_safe(context, "待清理清單", logs.log_cleanup_batch, residue_rows)
         for label, outcome in session.destinations.items():
             if outcome.written_paths:
                 await notifier.notify_admin(
@@ -1273,17 +1313,24 @@ async def _apply_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     total_moved = len(all_file_ids - failed_file_ids)
 
-    if cleanup_rows:
-        await asyncio.to_thread(logs.log_cleanup_batch, cleanup_rows)
-    if index_rows:
-        await asyncio.to_thread(logs.log_file_index_batch, index_rows)
-
+    # 照片已經搬完了，先把「使用者看得到的結果」做完，記錄檔擺到後面——
+    # 這個順序很重要：原本記錄檔寫在最前面，Excel 鎖檔造成的例外會讓使用者
+    # 收不到回覆、新資料夾也進不了「最近使用」，明明照片早就複製好了。
     await message.reply_text(notify.user_msg_correction_done(total_moved, new_folder))
-    await asyncio.to_thread(
-        logs.log_upload, now_str, uploader_name, telegram_id,
+    await _write_record_safe(
+        context, "最近使用的資料夾", members.push_recent_folder,
+        telegram_id, new_folder, batch.destination_label,
+    )
+
+    if cleanup_rows:
+        await _write_record_safe(context, "待清理清單", logs.log_cleanup_batch, cleanup_rows)
+    if index_rows:
+        await _write_record_safe(context, "照片索引 file_index.csv", logs.log_file_index_batch, index_rows)
+    await _write_record_safe(
+        context, "上傳紀錄 upload_log.csv", logs.log_upload,
+        now_str, uploader_name, telegram_id,
         f"{batch.folder} → {new_folder}", batch.destination_label, total_moved, "傳錯更正",
     )
-    await asyncio.to_thread(members.push_recent_folder, telegram_id, new_folder, batch.destination_label)
     await notifier.notify_admin(
         notify.msg_correction(uploader_name, batch.folder, new_folder, total_moved)
     )

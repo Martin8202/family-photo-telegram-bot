@@ -1165,3 +1165,113 @@ async def test_duplicate_photo_never_overwrites_and_is_listed_for_cleanup(env):
     assert any("1 張跟相簿裡已經有的照片是同一張" in t for t in user_texts)
     admin_texts = [m["text"] for m in app.bot.sent_messages if m["chat_id"] == 999999]
     assert any("待清理清單" in t and "重複" in t for t in admin_texts)
+
+
+# ── 記錄檔被鎖住（Excel 開著）不可中斷照片處理（實測 bug 回歸）────────
+
+class _LockedCsv:
+    """模擬被 Excel 鎖住的 CSV：任何寫入都拋 PermissionError。"""
+    def __init__(self, real):
+        self._real = real
+        self.path = real.path
+        self.header = real.header
+
+    def append_row(self, row):
+        self.append_rows([row])
+
+    def append_rows(self, rows):
+        raise PermissionError(13, "Permission denied", str(self.path))
+
+    def read_all_rows(self):
+        return self._real.read_all_rows()
+
+
+@pytest.mark.asyncio
+async def test_locked_csv_does_not_break_correction(env):
+    """
+    實測 bug：管理員用 Excel 開著「待清理清單.csv」時，「這批傳錯了」會整個炸掉。
+
+    照片其實**已經複製到新資料夾了**，但寫清單的 PermissionError 一路往上炸，
+    導致：使用者收不到完成回覆、file_index 沒寫、新資料夾沒進「最近使用」，
+    而且 batch.corrected 已被設為 True 連重試都不行。
+
+    規格書 §2「通知失敗不可中斷本體工作」同樣適用於記錄檔。
+    """
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+    ctx = DummyContext(app)
+    user = DummyUser(1040, "四弟")
+    members: MembersStore = app.bot_data["members"]
+    members.register(1040, "四弟")
+    members.approve(1040)
+
+    old_dir = nas_dir / "打錯了"
+    old_dir.mkdir(parents=True, exist_ok=True)
+    old_photo = old_dir / "20260725_120000_aabbccdd.jpg"
+    old_photo.write_bytes(b"photo")
+    batch = upload.CompletedBatch(
+        telegram_id=1040, folder="打錯了", destination_label="家裡硬碟", files=[],
+        written_paths={"家裡硬碟": [("fid_lock", old_photo)]}, completed_at=datetime.now(),
+    )
+    app.bot_data["sessions"].set_last_batch(batch)
+
+    # 把待清理清單換成「被鎖住」的版本
+    logs: DataLogs = app.bot_data["logs"]
+    logs.cleanup_list = _LockedCsv(logs.cleanup_list)
+
+    corr_msg = DummyMessage(20, "", 1040, app.bot)
+    await upload.handle_correction_button(
+        DummyUpdate(user, corr_msg, DummyCallbackQuery("correction", user, corr_msg)), ctx
+    )
+    # 這一行以前會拋 PermissionError
+    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(21, "正確的夾", 1040, app.bot)), ctx)
+
+    # 照片照樣搬到新資料夾、原檔保留
+    assert (nas_dir / "正確的夾" / old_photo.name).exists()
+    assert old_photo.exists()
+
+    # 使用者要收到完成回覆（以前會因為例外而收不到）
+    user_texts = [m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1040]
+    assert any("已經幫你把" in t and "正確的夾" in t for t in user_texts)
+
+    # 新資料夾要進「最近使用」（以前被崩潰擋在後面永遠執行不到）
+    recent = [f["name"] for f in members.get_recent_folders(1040)]
+    assert "正確的夾" in recent
+
+    # 管理員要收到「檔案被鎖住」的說明，而不是一則看不懂的例外
+    admin_texts = [m["text"] for m in app.bot.sent_messages if m["chat_id"] == 999999]
+    assert any("Excel" in t and "待清理清單" in t for t in admin_texts)
+
+
+@pytest.mark.asyncio
+async def test_existing_folder_is_announced_to_user(env):
+    """使用者打的資料夾名稱已經存在時，要明確說明照片會存進既有資料夾。"""
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+    ctx = DummyContext(app)
+    user = DummyUser(1041, "五妹")
+    members: MembersStore = app.bot_data["members"]
+    members.register(1041, "五妹")
+    members.approve(1041)
+
+    (nas_dir / "去年中秋").mkdir(parents=True, exist_ok=True)  # 先讓資料夾存在
+
+    await upload.handle_start_upload(DummyUpdate(user, DummyMessage(1, "📷 我要上傳照片", 1041, app.bot)), ctx)
+    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(2, "去年中秋", 1041, app.bot)), ctx)
+    dest_msg = DummyMessage(3, "", 1041, app.bot)
+    await upload.handle_destination_button(
+        DummyUpdate(user, dest_msg, DummyCallbackQuery("dest:家裡硬碟", user, dest_msg)), ctx
+    )
+
+    ready = app.bot.sent_messages[-1]["text"]
+    assert "準備好了" in ready
+    assert "已經有了" in ready and "去年中秋" in ready
+
+    # 全新的資料夾就不該出現這句
+    user2 = DummyUser(1042, "六弟")
+    members.register(1042, "六弟"); members.approve(1042)
+    await upload.handle_start_upload(DummyUpdate(user2, DummyMessage(1, "📷 我要上傳照片", 1042, app.bot)), ctx)
+    await upload.handle_folder_text(DummyUpdate(user2, DummyMessage(2, "全新的夾", 1042, app.bot)), ctx)
+    dest_msg2 = DummyMessage(3, "", 1042, app.bot)
+    await upload.handle_destination_button(
+        DummyUpdate(user2, dest_msg2, DummyCallbackQuery("dest:家裡硬碟", user2, dest_msg2)), ctx
+    )
+    assert "已經有了" not in app.bot.sent_messages[-1]["text"]

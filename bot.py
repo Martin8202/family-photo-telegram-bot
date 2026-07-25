@@ -238,7 +238,10 @@ async def startup_recover_temp(app: Application) -> None:
                         fail_count += 1
 
             if index_rows:
-                logs.log_file_index_batch(index_rows)
+                try:
+                    logs.log_file_index_batch(index_rows)
+                except Exception:
+                    logger.exception("復原批次寫入 file_index 失敗，繼續處理其餘批次")
 
             all_ok = fail_count == 0
             guess_note = "（未找到目的地紀錄，已預設補送到區網硬碟，請確認是否正確）" if destination_guessed else ""
@@ -252,10 +255,16 @@ async def startup_recover_temp(app: Application) -> None:
                     storage.safe_delete_in_temp(session_dir, temp_root)
                 except storage.TempFenceViolation:
                     pass
-                logs.log_upload(now_str, name, telegram_id, folder_name, destination, len(files), "成功(復原)")
+                try:
+                    logs.log_upload(now_str, name, telegram_id, folder_name, destination, len(files), "成功(復原)")
+                except Exception:
+                    logger.exception("復原批次寫入 upload_log 失敗")
                 report_lines.append(f"{name}／{folder_name}：{len(files)} 張已補送成功{guess_note}")
             else:
-                logs.log_upload(now_str, name, telegram_id, folder_name, destination, len(files), "部分失敗(復原)")
+                try:
+                    logs.log_upload(now_str, name, telegram_id, folder_name, destination, len(files), "部分失敗(復原)")
+                except Exception:
+                    logger.exception("復原批次寫入 upload_log 失敗")
                 report_lines.append(
                     f"{name}／{folder_name}：{success_count} 成功／{fail_count} 失敗（保留暫存待人工處理）{guess_note}"
                 )
