@@ -164,6 +164,7 @@ class DummyApplication:
             "config": config,
             "data_dir": data_dir,
         }
+        self.background_tasks = []
         # 動態設定測試專用路徑
         config.TEMP_DIR = str(temp_dir)
         config.DEST_NAS = str(nas_dir)
@@ -183,6 +184,20 @@ class DummyApplication:
         config.COUNTER_REANCHOR_SEC = 5
         config.CORRECTION_PROMPT_MAX_MIN = 10
         config.STAGE_STUCK_MAX_MIN = 30
+
+    def create_task(self, coro):
+        """比照 telegram.ext.Application.create_task：建立背景工作並持有參考。"""
+        task = asyncio.ensure_future(coro)
+        self.background_tasks.append(task)
+        return task
+
+
+async def drain_background_tasks(app: DummyApplication):
+    """等 application.create_task 丟出去的背景工作全部做完（例如更正流程的搬移）。"""
+    while app.background_tasks:
+        pending = list(app.background_tasks)
+        app.background_tasks.clear()
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 class DummyContext:
@@ -519,6 +534,7 @@ async def test_correction_flow_and_cleanup_csv(env):
     new_folder_msg = DummyMessage(21, "新相簿", 1001, app.bot)
     handled = await upload.handle_folder_text(DummyUpdate(user, new_folder_msg), ctx)
     assert handled is True
+    await drain_background_tasks(app)  # 實際搬移在背景執行（§3.1）
 
     # 驗證新相簿已建立且有照片
     new_dir = nas_dir / "新相簿"
@@ -867,6 +883,7 @@ async def test_correction_offers_recent_folder_buttons(env):
     await upload.handle_correction_folder_button(
         DummyUpdate(user, pick_msg, DummyCallbackQuery("corrfolder:去年過年", user, pick_msg)), ctx
     )
+    await drain_background_tasks(app)
     assert (nas_dir / "去年過年" / old_photo.name).exists()
     assert old_photo.exists(), "原位置的照片絕不刪除"
 
@@ -1227,6 +1244,7 @@ async def test_locked_csv_does_not_break_correction(env):
     )
     # 這一行以前會拋 PermissionError
     await upload.handle_folder_text(DummyUpdate(user, DummyMessage(21, "正確的夾", 1040, app.bot)), ctx)
+    await drain_background_tasks(app)
 
     # 照片照樣搬到新資料夾、原檔保留
     assert (nas_dir / "正確的夾" / old_photo.name).exists()
@@ -1433,3 +1451,120 @@ async def test_pending_release_file_survives_corruption(env):
 
     ctx = DummyContext(app)
     assert await upload.resume_pending_onedrive_releases(ctx) == 0
+
+
+@pytest.mark.asyncio
+async def test_correction_does_not_block_and_shows_progress(env, monkeypatch):
+    """
+    §3.1：「這批傳錯了」的搬移不可以佔住 update 佇列。
+
+    原本整段複製都在訊息處理函式裡跑完才返回——100 張「兩邊都存」＝ 200 次
+    網芳複製期間，bot 對所有人完全沒反應。這裡把每次複製故意拖慢，驗證
+    處理函式仍然立刻返回，且搬移期間會顯示進度。
+    """
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+    ctx = DummyContext(app)
+    user = DummyUser(1080, "十一叔")
+    members: MembersStore = app.bot_data["members"]
+    members.register(1080, "十一叔")
+    members.approve(1080)
+
+    old_dir = nas_dir / "搬移前"
+    old_dir.mkdir(parents=True, exist_ok=True)
+    pairs = []
+    for i in range(5):
+        f = old_dir / f"2026072{i}_120000_abcd000{i}.jpg"
+        f.write_bytes(f"photo {i}".encode())
+        pairs.append((f"fid_{i}", f))
+
+    batch = upload.CompletedBatch(
+        telegram_id=1080, folder="搬移前", destination_label="家裡硬碟", files=[],
+        written_paths={"家裡硬碟": pairs}, completed_at=datetime.now(),
+    )
+    app.bot_data["sessions"].set_last_batch(batch)
+
+    # 每次複製故意慢下來，模擬網芳
+    real_copy = storage.copy_file_with_retry
+    async def _slow_marker():
+        pass
+    def slow_copy(*a, **kw):
+        import time; time.sleep(0.02)
+        return real_copy(*a, **kw)
+    monkeypatch.setattr(storage, "copy_file_with_retry", slow_copy)
+
+    corr_msg = DummyMessage(20, "", 1080, app.bot)
+    await upload.handle_correction_button(
+        DummyUpdate(user, corr_msg, DummyCallbackQuery("correction", user, corr_msg)), ctx
+    )
+
+    # 關鍵：受理的處理函式必須立刻返回，不等搬移做完
+    await asyncio.wait_for(
+        upload.handle_folder_text(DummyUpdate(user, DummyMessage(21, "搬移後", 1080, app.bot)), ctx),
+        timeout=1,
+    )
+    assert not (nas_dir / "搬移後").exists() or not list((nas_dir / "搬移後").glob("*.jpg")), \
+        "搬移應該還在背景進行，不該在處理函式返回前就做完"
+    assert any("正在把這批搬到" in m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1080)
+
+    # 背景做完後，結果要完全正確
+    await drain_background_tasks(app)
+    assert len(list((nas_dir / "搬移後").glob("*.jpg"))) == 5
+    for _fid, f in pairs:
+        assert f.exists(), "原位置的照片絕不刪除"
+
+    texts = [m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1080]
+    assert any("搬移中" in t for t in texts), "搬移期間要有進度回饋"
+    assert any("已經幫你把這 5 張改放到" in t for t in texts)
+
+    # 待清理清單、file_index、upload_log 都要照常寫入
+    logs: DataLogs = app.bot_data["logs"]
+    assert len([r for r in logs.cleanup_list.read_all_rows() if r["類型"] == "傳錯更正"]) == 5
+    assert len([r for r in logs.file_index.read_all_rows() if r["目標資料夾"] == "搬移後"]) == 5
+    assert any(r["結果"] == "傳錯更正" for r in logs.upload_log.read_all_rows())
+
+
+@pytest.mark.asyncio
+async def test_correction_applies_write_throttle(env, monkeypatch):
+    """
+    §6.3.2 寫入節流：更正流程每張之間也要有間隔，不可用最高速連打網芳。
+    原本這條路徑完全沒有節流。
+    """
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+    ctx = DummyContext(app)
+    user = DummyUser(1081, "十二嬸")
+    members: MembersStore = app.bot_data["members"]
+    members.register(1081, "十二嬸")
+    members.approve(1081)
+
+    old_dir = nas_dir / "節流前"
+    old_dir.mkdir(parents=True, exist_ok=True)
+    pairs = []
+    for i in range(3):
+        f = old_dir / f"20260725_12000{i}_ffff000{i}.jpg"
+        f.write_bytes(b"x")
+        pairs.append((f"tid_{i}", f))
+    app.bot_data["sessions"].set_last_batch(upload.CompletedBatch(
+        telegram_id=1081, folder="節流前", destination_label="家裡硬碟", files=[],
+        written_paths={"家裡硬碟": pairs}, completed_at=datetime.now(),
+    ))
+
+    sleeps = []
+    real_sleep = asyncio.sleep
+    async def spy_sleep(sec, *a, **kw):
+        sleeps.append(sec)
+        return await real_sleep(0)
+    monkeypatch.setattr(upload.asyncio, "sleep", spy_sleep)
+
+    original = config.WRITE_THROTTLE_SEC
+    try:
+        config.WRITE_THROTTLE_SEC = 0.3
+        corr_msg = DummyMessage(20, "", 1081, app.bot)
+        await upload.handle_correction_button(
+            DummyUpdate(user, corr_msg, DummyCallbackQuery("correction", user, corr_msg)), ctx
+        )
+        await upload.handle_folder_text(DummyUpdate(user, DummyMessage(21, "節流後", 1081, app.bot)), ctx)
+        await drain_background_tasks(app)
+    finally:
+        config.WRITE_THROTTLE_SEC = original
+
+    assert sleeps.count(0.3) == 3, f"3 張照片應該各有一次寫入節流，實際 {sleeps}"

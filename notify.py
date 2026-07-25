@@ -140,6 +140,14 @@ def user_msg_correction_processing(new_folder: str) -> str:
     return f"📦 已收到，正在把這批搬到「{new_folder}」，請稍等…"
 
 
+def user_msg_correction_progress(progress_bar_text: str) -> str:
+    return f"📦 搬移中 {progress_bar_text}"
+
+
+def user_msg_correction_failed(new_folder: str) -> str:
+    return f"⚠️ 搬到「{new_folder}」的過程出了狀況，已通知管理員處理"
+
+
 def user_msg_health_check_failed() -> str:
     return "現在暫時無法上傳，請稍後再試"
 

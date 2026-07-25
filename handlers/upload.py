@@ -1369,7 +1369,14 @@ async def handle_correction_folder_button(update: Update, context: ContextTypes.
 
 
 async def _apply_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, new_folder: str, message=None) -> None:
-    members, notifier, config, sessions, logs = _services(context)
+    """
+    受理「這批傳錯了」的新資料夾輸入。**只做受理與回覆，實際搬移交給背景**（§3.1）。
+
+    原本整段複製都在這裡跑完才返回，但以 PTB 一次只處理一則 update 的機制，
+    100 張「兩邊都存」＝ 200 次網芳複製期間，bot 對所有人完全沒反應——按鈕點了
+    沒用、別人傳照片也不會被處理。這正是 v3 重構要根除的問題，更正流程漏掉了。
+    """
+    _, _, _, sessions, _ = _services(context)
     telegram_id = update.effective_user.id
     message = message or update.effective_message
     batch = sessions.get_last_batch(telegram_id)
@@ -1377,9 +1384,16 @@ async def _apply_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         return
     batch.corrected = True  # 首次生效後立即失效，避免重複複製（§6.3）
 
-    # 搬移可能需要一點時間（重試、多目的地），先讓使用者知道請求已收到、
-    # 正在處理中，避免看起來像卡住（規格書 §6.3.1 的即時回饋精神同樣適用於此）。
     await message.reply_text(notify.user_msg_correction_processing(new_folder))
+    # 交給背景執行，本函式立刻返回，不佔住 update 佇列
+    context.application.create_task(
+        _run_correction(context, telegram_id, batch, new_folder, message)
+    )
+
+
+async def _run_correction(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, batch, new_folder: str, message) -> None:
+    """實際把這批照片複製到新資料夾（背景執行，含進度條與寫入節流）。"""
+    members, notifier, config, sessions, logs = _services(context)
 
     uploader = members.get(telegram_id)
     uploader_name = uploader.name if uploader else str(telegram_id)
@@ -1392,12 +1406,26 @@ async def _apply_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     # 「兩邊都存」時同一張照片在兩個目的地各成功一次卻被算成 2 張，導致回報張數與
     # upload_log 加倍。written_paths 裡存的是寫入當下就配好的 (file_id, 路徑)，
     # 不必事後用順序去猜對應關係。
-    all_file_ids = {file_id for pairs in batch.written_paths.values() for file_id, _ in pairs}
-    failed_file_ids: set = set()
+    # 以「照片」為外層迴圈（而非目的地），進度條的分母才是使用者看得懂的張數：
+    # 「兩邊都存」時同一張照片要複製兩次，但對使用者來說仍然只是一張。
+    by_photo: dict = {}
     for label, pairs in batch.written_paths.items():
-        new_dir = roots[label] / new_folder
         for file_id, old_path in pairs:
-            old_path = Path(old_path)
+            by_photo.setdefault(file_id, []).append((label, Path(old_path)))
+
+    all_file_ids = set(by_photo)
+    failed_file_ids: set = set()
+    total_photos = len(by_photo)
+    progress_message = None
+    last_progress_at = datetime.now()
+    if total_photos:
+        progress_message = await _safe_send(
+            context, telegram_id, notify.user_msg_correction_progress(progress_bar(0, total_photos))
+        )
+
+    for done, (file_id, targets) in enumerate(by_photo.items(), start=1):
+        for label, old_path in targets:
+            new_dir = roots[label] / new_folder
 
             try:
                 await context.bot.send_chat_action(chat_id=telegram_id, action=ChatAction.UPLOAD_PHOTO)
@@ -1419,6 +1447,23 @@ async def _apply_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                                       str(old_path.parent), old_path.name, f"已改放至「{new_folder}」"))
             else:
                 failed_file_ids.add(file_id)
+
+            # 寫入節流：與一般上傳一致，避免高速連續寫入壓垮網芳（§6.3.2）。
+            # 原本更正流程完全沒有節流，會用最高速連打網芳。
+            if config.WRITE_THROTTLE_SEC:
+                await asyncio.sleep(config.WRITE_THROTTLE_SEC)
+
+        now = datetime.now()
+        if progress_message is not None and (
+            done == total_photos or (now - last_progress_at).total_seconds() >= config.COUNTER_UPDATE_SEC
+        ):
+            last_progress_at = now
+            try:
+                await progress_message.edit_text(
+                    notify.user_msg_correction_progress(progress_bar(done, total_photos))
+                )
+            except Exception:
+                pass
 
     total_moved = len(all_file_ids - failed_file_ids)
 
