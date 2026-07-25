@@ -32,6 +32,9 @@ from keyboards import (
     CB_CORRECTION,
     CB_CORRECTION_FOLDER_PREFIX,
     CB_DEST_PREFIX,
+    CB_DUP_COPY,
+    CB_DUP_SKIP,
+    CB_UPLOAD_AGAIN,
     CB_FINISH,
     CB_CONTINUE_RECEIVING,
     CB_RECENT_FOLDER_PREFIX,
@@ -89,6 +92,8 @@ async def route_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     text = (update.effective_message.text or "").strip()
+    # 常駐按鈕雖已移除，仍要認得它送出的文字：清除指令要等下一則訊息才會送達，
+    # 在那之前使用者還是點得到舊按鈕。
     if text == UPLOAD_BUTTON_TEXT:
         await upload.handle_start_upload(update, context)
         return
@@ -336,7 +341,10 @@ async def on_startup(app: Application) -> None:
     await startup_health_check(app)
     await startup_recover_temp(app)
     await startup_resume_onedrive_release(app)
-    await app.bot.set_my_commands([BotCommand("start", "開始使用")])
+    # 選單只放「我要上傳照片」：使用者最常做的就是這件事，一點就直接進流程。
+    # /start 仍然保留為可用指令（Telegram 對新使用者顯示的 START 按鈕就是送 /start，
+    # 註冊流程靠它），只是不再出現在選單裡佔位置。
+    await app.bot.set_my_commands([BotCommand("upload", "📷 我要上傳照片")])
 
 
 def build_application() -> Application:
@@ -356,6 +364,8 @@ def build_application() -> Application:
     app.bot_data["data_dir"] = DATA_DIR
 
     app.add_handler(CommandHandler("start", register.handle_start))
+    # 選單裡那一項。未開通者會被 handle_start_upload 擋下並提示，不必另外判斷。
+    app.add_handler(CommandHandler("upload", upload.handle_start_upload))
 
     app.add_handler(CallbackQueryHandler(register.handle_register_button, pattern=f"^{CB_REGISTER}$"))
     app.add_handler(CallbackQueryHandler(register.handle_approve, pattern=f"^{CB_APPROVE_PREFIX}"))
@@ -371,9 +381,12 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(upload.handle_restart_confirm, pattern=f"^{CB_RESTART_CONFIRM}$"))
     app.add_handler(CallbackQueryHandler(upload.handle_restart_cancel, pattern=f"^{CB_RESTART_CANCEL}$"))
     app.add_handler(CallbackQueryHandler(upload.handle_correction_button, pattern=f"^{CB_CORRECTION}$"))
+    app.add_handler(CallbackQueryHandler(upload.handle_upload_again_button, pattern=f"^{CB_UPLOAD_AGAIN}$"))
     app.add_handler(CallbackQueryHandler(
         upload.handle_correction_folder_button, pattern=f"^{CB_CORRECTION_FOLDER_PREFIX}"
     ))
+    app.add_handler(CallbackQueryHandler(upload.handle_duplicate_copy, pattern=f"^{CB_DUP_COPY}$"))
+    app.add_handler(CallbackQueryHandler(upload.handle_duplicate_skip, pattern=f"^{CB_DUP_SKIP}$"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, route_text))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, route_photo))

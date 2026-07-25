@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 
 from state import DEST_BOTH_LABEL, DEST_NAS_LABEL, DEST_ONEDRIVE_LABEL, recent_folder_icon
 
@@ -16,6 +20,9 @@ CB_RESTART_CANCEL = "restart_cancel"
 CB_FINISH = "finish"
 CB_CONTINUE_RECEIVING = "continue_receiving"
 CB_CORRECTION = "correction"
+CB_UPLOAD_AGAIN = "upload_again"
+CB_DUP_COPY = "dup_copy"
+CB_DUP_SKIP = "dup_skip"
 CB_DEST_PREFIX = "dest:"
 CB_RECENT_FOLDER_PREFIX = "recent:"
 # 更正流程的資料夾按鈕另用一組 prefix：它發生在 session 已結束之後，
@@ -34,8 +41,17 @@ def approve_reject_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
-def start_upload_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([["📷 我要上傳照片"]], resize_keyboard=True)
+def clear_persistent_keyboard() -> ReplyKeyboardRemove:
+    """
+    清除輸入框下方的常駐按鈕（v3.12）。
+
+    上傳功能已移進 Telegram 的 ☰ 指令選單（見規格書 §6.1），常駐按鈕變成多餘——
+    而且它在使用者開始打字時會被 Telegram 用戶端自動收起來，本來就不是可靠的入口。
+
+    ⚠️ 必須**主動送出這個移除指令**：Telegram 的常駐鍵盤是「每個對話的持續狀態」，
+    只是不再附上新的鍵盤並不會讓舊的消失——已經看得到按鈕的使用者會一直看得到。
+    """
+    return ReplyKeyboardRemove()
 
 
 def folder_choice_keyboard(recent_folders: list[dict]) -> InlineKeyboardMarkup:
@@ -106,8 +122,25 @@ def restart_confirm_keyboard() -> InlineKeyboardMarkup:
     ]])
 
 
+def duplicate_decision_keyboard() -> InlineKeyboardMarkup:
+    """偵測到重複照片時，問使用者要不要還是存一份（§10）。"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ 要，還是存一份", callback_data=CB_DUP_COPY)],
+        [InlineKeyboardButton("❌ 不用了，跳過", callback_data=CB_DUP_SKIP)],
+    ])
+
+
 def correction_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("↩️ 這批傳錯了", callback_data=CB_CORRECTION)]])
+    """
+    上傳完成後的按鈕列。
+
+    「📷 再傳一批」是 contextual 入口：連續傳好幾批是很常見的操作，每次都要繞去
+    ☰ 選單很煩；做成 inline 按鈕則是需要時才出現，不佔常駐螢幕空間。
+    """
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📷 再傳一批", callback_data=CB_UPLOAD_AGAIN),
+        InlineKeyboardButton("↩️ 這批傳錯了", callback_data=CB_CORRECTION),
+    ]])
 
 
 def inactivity_prompt_keyboard() -> InlineKeyboardMarkup:

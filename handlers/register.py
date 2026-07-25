@@ -8,7 +8,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 import notify
-from keyboards import approve_reject_keyboard, register_keyboard, start_upload_keyboard
+from keyboards import approve_reject_keyboard, clear_persistent_keyboard, register_keyboard
 from members import STATUS_APPROVED, STATUS_PENDING, STATUS_REJECTED, MembersStore
 
 AWAITING_NAME_KEY = "awaiting_register_name"
@@ -48,7 +48,12 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "要重來的話請用下面的『🔄 重新開始』按鈕，不是這裡。"
         )
         return
-    await update.effective_message.reply_text("歡迎回來！", reply_markup=start_upload_keyboard())
+
+    # 沒有進行中的 session：直接進上傳流程，不要停在「歡迎回來」這個沒有作用的中繼站。
+    # 規格書 §5.1 對已開通者的規定本來就是「正常進入上傳流程」——先前的實作只是
+    # 把按鈕遞出去，等於多要求使用者再點一次。
+    from handlers import upload  # 區域匯入：避免 register ↔ upload 的模組級循環相依
+    await upload.handle_start_upload(update, context)
 
 
 async def handle_register_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -97,8 +102,9 @@ async def handle_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.edit_message_text(f"已開通：{member.name}（{telegram_id}）")
     await notifier.notify_user(
         telegram_id,
-        notify.user_msg_approved() + "\n\n" + notify.user_msg_original_quality_tutorial(),
-        reply_markup=start_upload_keyboard(),
+        notify.user_msg_approved() + "\n\n" + notify.user_msg_how_to_start()
+        + "\n\n" + notify.user_msg_original_quality_tutorial(),
+        reply_markup=clear_persistent_keyboard(),
     )
 
 

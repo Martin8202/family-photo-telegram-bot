@@ -15,6 +15,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import re
 import shutil
 import subprocess
 import time
@@ -31,6 +33,16 @@ try:
 except ImportError:  # Pillow 未安裝時仍可 import 本模組（EXIF 功能退化）
     Image = None
     TAGS = None
+
+# iPhone「以檔案傳送」的原檔是 HEIC，Pillow 本身打不開，必須註冊 pillow-heif
+# 才讀得到裡面的 EXIF 拍攝時間。沒裝也不影響程式運作，只是 HEIC 會退回用
+# 接收時間命名（規格書 §10 的時間來源優先序會少一層）。
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    HEIC_SUPPORTED = True
+except Exception:  # noqa: BLE001 - 套件缺失或註冊失敗都只是功能退化
+    HEIC_SUPPORTED = False
 
 
 # ── 檔名 ────────────────────────────────────────────
@@ -118,6 +130,69 @@ def content_fingerprint(file_path: Path) -> Optional[str]:
     """
     md5_hex = calculate_md5(file_path)
     return md5_hex[:FINGERPRINT_LENGTH] if md5_hex else None
+
+
+# 檔名格式：YYYYMMDD_HHMMSS_{8碼指紋}[_(2)].副檔名
+_FINGERPRINT_IN_NAME = re.compile(r"_([0-9a-f]{%d})(?:_\(\d+\))?$" % FINGERPRINT_LENGTH)
+
+
+def extract_fingerprint(filename: str) -> Optional[str]:
+    """從既有檔名反查出指紋。認不出格式（例如使用者自己放進去的檔案）回傳 None。"""
+    m = _FINGERPRINT_IN_NAME.search(Path(filename).stem)
+    return m.group(1) if m else None
+
+
+def scan_existing_fingerprints(dest_dir: Path) -> dict:
+    """
+    掃描目的地資料夾，取出所有已存在照片的「指紋 → 檔案大小集合」。
+
+    用途：判斷「這張照片相簿裡是不是已經有了」。**不能只靠檔名相同來判斷**——
+    檔名的時間戳部分在讀不到 EXIF 時會退回接收時間，同一張照片分兩次上傳
+    會得到不同的時間戳（實測 69 張裡有 62 張如此，因為 Telegram 壓縮版的
+    EXIF 會被剝掉），檔名自然不同，重複就漏掉了。指紋才是穩定的那一半。
+
+    **為何要一併記檔案大小**：指紋只取 MD5 前 8 個十六進位字元＝32 bits，
+    理論上兩張不同的照片有極小機率撞到同一個指紋。若因此誤判為重複而略過
+    複製，那張**全新的照片就不會被存**，違反「照片不遺失」的第一原則。
+    加上「大小也要完全相同」這個條件後，誤判機率趨近於零，而檔案大小在
+    列目錄時本來就拿得到（`os.scandir` 會一併帶回），不需要額外的 I/O。
+
+    整個資料夾只掃一次、結果快取起來重複使用；對網芳而言列目錄是昂貴操作，
+    不可以每張照片都掃一遍。
+    """
+    dest_dir = Path(dest_dir)
+    found: dict = {}
+    if not dest_dir.exists():
+        return found
+    try:
+        with os.scandir(dest_dir) as it:
+            for entry in it:
+                if not entry.is_file():
+                    continue
+                fp = extract_fingerprint(entry.name)
+                if fp:
+                    try:
+                        found.setdefault(fp, set()).add(entry.stat().st_size)
+                    except OSError:
+                        found.setdefault(fp, set())
+    except OSError:
+        pass  # 列目錄失敗（權限、網芳斷線）就當作沒有既有檔案，不影響上傳
+    return found
+
+
+def looks_like_duplicate(known: dict, fingerprint: Optional[str], size: Optional[int]) -> bool:
+    """
+    這張照片是否已經在目的地資料夾裡了。
+
+    必須**指紋與檔案大小都吻合**才算重複——只比指紋有極小的誤判機率，
+    而誤判會導致一張全新的照片被略過不存（見 `scan_existing_fingerprints`）。
+    """
+    if not fingerprint or fingerprint not in known:
+        return False
+    sizes = known[fingerprint]
+    if not sizes or size is None:
+        return False  # 大小資訊不齊時寧可當作「不是重複」，照常複製
+    return size in sizes
 
 
 def build_filename(

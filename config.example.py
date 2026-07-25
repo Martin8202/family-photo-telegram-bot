@@ -53,6 +53,9 @@ COUNTER_REANCHOR_SEC = 5      # 「確認中」多久才用一次「刪舊發新
 
 # ── 其他 ────────────────────────────────────
 CORRECTION_PROMPT_MAX_MIN = 10  # 「這批傳錯了」等待輸入新資料夾的有效時間（分鐘），見規格書 §7
+DUPLICATE_PROMPT_MAX_MIN = 10   # 「重複照片還要存嗎」等待回答的時間（分鐘）；逾時視同不存，見 §10.1
+LAST_BATCH_MAX_MIN = 720        # 已完成批次的紀錄保留多久（分鐘，預設 12 小時）後回收記憶體，見 §7
+                                # 只影響「↩️ 這批傳錯了」能不能自動搬，不影響任何實體檔案
 HEALTH_CHECK_ON_START = True    # 啟動時執行 SMB 健檢
 HEALTH_CHECK_ON_SESSION = True  # 每次開 session 執行 SMB 健檢
 RECOVER_ON_START = True         # 啟動時掃描暫存區並復原未完成批次

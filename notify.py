@@ -92,6 +92,14 @@ def user_msg_approved() -> str:
     return "🎉 已開通，可以開始用了！"
 
 
+def user_msg_how_to_start() -> str:
+    """
+    告訴使用者怎麼開始。入口只有 ☰ 選單一個——輸入框下方的常駐按鈕已經移除，
+    因為它在使用者打字時會被 Telegram 用戶端收起來，不是可靠的入口（§6.1）。
+    """
+    return "要傳照片時，點左下角的選單 ☰ 選「📷 我要上傳照片」就可以開始了"
+
+
 def user_msg_original_quality_tutorial() -> str:
     return (
         "📸 小提醒：手機預設會壓縮照片畫質。\n"
@@ -105,7 +113,7 @@ def user_msg_compressed_hint() -> str:
 
 
 def user_msg_not_started() -> str:
-    return "請點下方的『📷 我要上傳照片』開始喔"
+    return "請先點左下角的選單 ☰ 選『📷 我要上傳照片』開始喔"
 
 
 def user_msg_choose_folder_first() -> str:
@@ -129,11 +137,24 @@ def user_msg_restart_confirm(count: int) -> str:
 
 
 def user_msg_restart_done() -> str:
-    return "已重新開始，請重新選擇資料夾"
+    return "已重新開始。要再傳的話，點左下角選單 ☰ 選「📷 我要上傳照片」"
 
 
 def user_msg_correction_done(count: int, new_folder: str) -> str:
     return f"✅ 已經幫你把這 {count} 張改放到「{new_folder}」了"
+
+
+def user_msg_batch_expired() -> str:
+    """
+    「↩️ 這批傳錯了」點下去，但那批的紀錄已經被回收（或程式重啟過）時的說明。
+
+    照片完全沒事，只是程式不再記得「那批是哪些照片」，沒辦法自動搬。
+    要講清楚照片沒有不見，否則使用者會嚇到。
+    """
+    return (
+        "這批已經是比較久以前的了，我這邊不再記得它包含哪些照片，沒辦法自動幫你搬。\n"
+        "照片都好好的沒有不見喔！需要調整位置的話再跟管理員說一聲。"
+    )
 
 
 def user_msg_correction_processing(new_folder: str) -> str:
@@ -222,16 +243,39 @@ def user_msg_uploading(progress_bar_text: str) -> str:
     return f"📤 上傳中 {progress_bar_text}"
 
 
-def user_msg_done(count: int, folder: str, dest_label: str, duplicate_count: int = 0) -> str:
+def user_msg_done(count: int, folder: str, dest_label: str, skipped_count: int = 0) -> str:
     """
-    完成宣告。若本次有照片與相簿裡既有的重複，一併說明——這是使用者實測時
-    「傳 15 張但相簿裡其實只有 6 張不同」的困惑來源，講清楚才不會以為漏傳。
-    程式依零刪除原則不會覆蓋既有檔案，重複的那幾張會另存一份並記入待清理清單。
+    完成宣告。**在所有決定都做完之後才發出**，故 `count` 已經是最終確定的張數。
+
+    `count` 是這次**實際存進相簿**的張數——必須跟相簿裡真正多出來的張數對得上，
+    否則就是在騙人（使用者實測時「傳 15 張但相簿裡其實只有 6 張不同」的困惑
+    正是這樣來的）。`skipped_count` 是使用者選擇「不用存」的重複張數，一併交代
+    才不會讓他以為漏傳。
     """
     base = f"✅ 完成！{count} 張 → {folder}（{dest_label}）"
-    if duplicate_count > 0:
-        base += f"\n💡 其中 {duplicate_count} 張跟相簿裡已經有的照片是同一張，已另外存一份（不會覆蓋原本的）"
+    if skipped_count > 0:
+        base += f"\n（另有 {skipped_count} 張相簿裡已經有了，依你的選擇沒有重複存）"
     return base
+
+
+def user_msg_duplicate_ask(count: int, folder: str) -> str:
+    return (
+        f"💡 這次有 {count} 張，相簿「{folder}」裡已經有一模一樣的了。\n"
+        f"還要再存一份嗎？"
+    )
+
+
+def user_msg_duplicate_copying(count: int, folder: str) -> str:
+    """按下「還是存一份」的即時回覆。複製可能要跑一陣子，先讓使用者知道有收到。"""
+    return f"好的，正在把這 {count} 張也存進「{folder}」…"
+
+
+def user_msg_duplicate_copied(count: int, folder: str) -> str:
+    return f"✅ 好的，這 {count} 張也存進「{folder}」了"
+
+
+def user_msg_duplicate_skipped(count: int) -> str:
+    return f"👍 好的，這 {count} 張就不重複存了（相簿裡原本那份完全沒動）"
 
 
 def msg_duplicates_for_admin(uploader: str, folder: str, count: int) -> str:

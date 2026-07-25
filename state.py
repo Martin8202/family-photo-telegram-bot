@@ -81,6 +81,34 @@ class DestinationOutcome:
 
 
 @dataclass
+class PendingDuplicates:
+    """
+    偵測到「相簿裡已經有了」而**尚未複製**的照片，等待使用者決定要不要還是存一份。
+
+    刻意做成獨立於 session 的物件：主批次會先正常收尾（使用者立刻看到「✅ 完成」），
+    這些重複照片的去留另外問，不阻塞整批的完成。暫存檔會保留到使用者回答或逾時。
+    """
+    telegram_id: int
+    name: str
+    folder: str
+    destination_label: str
+    files: list           # list[ReceivedFile]，暫存檔仍保留著
+    dest_targets: dict    # label -> 目的地資料夾 Path
+    created_at: datetime
+    temp_dir: object = None  # 這批的暫存子夾，決定之後才能刪
+    # 決定之後才要發的收尾（完成訊息、upload_log、last_batch、OneDrive 釋放）
+    # 需要用到整個 session 的狀態，故直接帶著它。session 本身已從 SessionManager
+    # 移除，這裡持有的只是那個物件。
+    session: object = None
+    timed_out: bool = False
+    decided: bool = False  # 只能生效一次，防重複點擊
+
+    @property
+    def count(self) -> int:
+        return len(self.files)
+
+
+@dataclass
 class CompletedBatch:
     """一次完整上傳完成後留存的紀錄，供「↩️ 這批傳錯了」使用（§7）。"""
     telegram_id: int
@@ -117,8 +145,14 @@ class UploadSession:
     inactivity_prompted: bool = False  # 是否已發出過「看起來傳得差不多囉，請問傳完了嗎？」靜置提醒
     inactivity_prompt_message_id: Optional[int] = None  # 靜置提醒訊息 id
     destinations: dict = field(default_factory=dict)  # label -> DestinationOutcome
+    # label -> 該目的地資料夾裡「已存在照片」的指紋集合。整個資料夾只掃一次就快取，
+    # 網芳列目錄很貴，不可以每張照片都重掃一遍（見 storage.scan_existing_fingerprints）。
+    existing_fingerprints: dict = field(default_factory=dict)
+    # 偵測到重複、刻意沒有複製的照片：file_id -> (ReceivedFile, [目的地標籤])
+    duplicate_files: dict = field(default_factory=dict)
+    # 使用者最後決定「不用存」的重複照片；收尾宣告要據此扣掉張數
+    skipped_duplicates: list = field(default_factory=list)
     auto_appended: bool = False  # 是否為「遲到照片自動併案」開出來的 session（§6.6）
-    duplicate_count: int = 0  # 本次撞名另存的次數（跨所有目的地累計，回報前需除以目的地數）
     flushed_count: int = 0  # 已進入過複製流程（成功或失敗）的張數
     stored_count: int = 0   # 已成功複製到「所有」目的地的張數，即畫面上的「已存好 N 張」
     pending_retry_files: list = field(default_factory=list)  # 分批寫入失敗、留待批次後重試的檔案
@@ -198,6 +232,7 @@ class SessionManager:
     def __init__(self) -> None:
         self._sessions: dict[int, UploadSession] = {}
         self._last_batches: dict[int, CompletedBatch] = {}
+        self._pending_duplicates: dict[int, PendingDuplicates] = {}
 
     # ── session ──
     def get(self, telegram_id: int) -> Optional[UploadSession]:
@@ -225,6 +260,38 @@ class SessionManager:
 
     def get_last_batch(self, telegram_id: int) -> Optional[CompletedBatch]:
         return self._last_batches.get(telegram_id)
+
+    def purge_expired_batches(self, max_age_min: int, now: Optional[datetime] = None) -> int:
+        """
+        清掉太久以前的已完成批次，回收記憶體。回傳清掉幾筆。
+
+        這份資料只為「↩️ 這批傳錯了」而保留，內容是該批每張照片的完整清單——
+        實測 3000 張約 2 MB／人。原本永不過期，要等該使用者下次上傳才被取代，
+        對長期常駐的服務而言是隻不會自己縮回去的手。
+
+        注意：**這裡只回收記憶體，不影響任何實體檔案**，也不會讓按鈕消失
+        （inline 按鈕存在 Telegram 伺服器上）。批次資料沒了之後點按鈕，
+        呼叫端會回覆明確說明。
+        """
+        now = now or datetime.now()
+        cutoff = now - timedelta(minutes=max_age_min)
+        expired = [tid for tid, b in self._last_batches.items() if b.completed_at < cutoff]
+        for tid in expired:
+            del self._last_batches[tid]
+        return len(expired)
+
+    # ── 待決的重複照片（等使用者回答要不要還是存） ──
+    def set_pending_duplicates(self, pending: "PendingDuplicates") -> None:
+        self._pending_duplicates[pending.telegram_id] = pending
+
+    def get_pending_duplicates(self, telegram_id: int) -> Optional["PendingDuplicates"]:
+        return self._pending_duplicates.get(telegram_id)
+
+    def clear_pending_duplicates(self, telegram_id: int) -> Optional["PendingDuplicates"]:
+        return self._pending_duplicates.pop(telegram_id, None)
+
+    def all_pending_duplicates(self) -> list:
+        return list(self._pending_duplicates.values())
 
 
 # ── 批次切分（內部小批，對使用者透明，§6.3）──────────

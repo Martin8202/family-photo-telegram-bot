@@ -370,3 +370,70 @@ def test_sanitize_folder_name_never_produces_invalid_path():
     assert storage.sanitize_folder_name("結尾點.") == "結尾點"
     assert storage.sanitize_folder_name("CON") == "CON_"
     assert len(storage.sanitize_folder_name("長" * 500)) <= storage.MAX_FOLDER_NAME_LENGTH
+
+
+# ── 指紋反查與重複偵測（實測 bug 回歸）────────────────────────
+
+def test_extract_fingerprint_from_filename():
+    assert storage.extract_fingerprint("20260725_151054_892e347b.JPG") == "892e347b"
+    assert storage.extract_fingerprint("20260725_151054_892e347b_(2).JPG") == "892e347b"
+    assert storage.extract_fingerprint("20260725_151054_892e347b_(13).HEIC") == "892e347b"
+    # 認不出格式的（使用者自己放進去的檔案）要回傳 None，不可誤判
+    assert storage.extract_fingerprint("我的照片.jpg") is None
+    assert storage.extract_fingerprint("IMG_1234.JPG") is None
+    assert storage.extract_fingerprint("20260725_151054_XYZ.jpg") is None
+
+
+def test_scan_existing_fingerprints(tmp_path):
+    d = tmp_path / "相簿"
+    d.mkdir()
+    (d / "20260725_151054_892e347b.JPG").write_bytes(b"a")
+    (d / "20260101_090000_deadbeef.PNG").write_bytes(b"b")
+    (d / "20260725_151054_892e347b_(2).JPG").write_bytes(b"c")  # 同指紋的副本
+    (d / "使用者自己放的.jpg").write_bytes(b"d")
+
+    found = storage.scan_existing_fingerprints(d)
+    assert set(found) == {"892e347b", "deadbeef"}
+    # 一併帶回檔案大小，用來排除指紋碰撞造成的誤判
+    assert found["892e347b"] == {1}   # 兩個同指紋的檔案都是 1 byte
+    assert found["deadbeef"] == {1}
+    assert storage.scan_existing_fingerprints(tmp_path / "不存在") == {}
+
+
+def test_looks_like_duplicate_requires_size_match():
+    """
+    指紋只有 32 bits，理論上有極小機率碰撞。若因此誤判成重複而略過複製，
+    那張全新的照片就不會被存——違反「照片不遺失」。故必須大小也吻合。
+    """
+    known = {"892e347b": {1024}}
+    assert storage.looks_like_duplicate(known, "892e347b", 1024) is True
+    # 指紋一樣但大小不同 → 是碰撞，不是重複，必須照常複製
+    assert storage.looks_like_duplicate(known, "892e347b", 2048) is False
+    assert storage.looks_like_duplicate(known, "deadbeef", 1024) is False
+    # 資訊不齊時一律當作「不是重複」，寧可多存也不要漏存
+    assert storage.looks_like_duplicate(known, None, 1024) is False
+    assert storage.looks_like_duplicate(known, "892e347b", None) is False
+
+
+def test_same_photo_different_receive_time_has_different_name_but_same_fingerprint(tmp_path):
+    """
+    這就是重複偵測不能只看檔名的原因：讀不到 EXIF 時（Telegram 壓縮版的 EXIF
+    會被剝掉），時間戳退回接收時間，同一張照片分兩次上傳檔名就不同了。
+    但**指紋必須相同**——重複偵測要靠它。
+    """
+    img = tmp_path / "photo.jpg"
+    img.write_bytes(b"IDENTICAL-PHOTO-CONTENT")
+
+    n1 = storage.build_filename(datetime(2026, 7, 25, 15, 10, 54, 1), ext=".jpg",
+                                source_path=img, use_exif=True)
+    n2 = storage.build_filename(datetime(2026, 8, 1, 9, 30, 0, 2), ext=".jpg",
+                                source_path=img, use_exif=True)
+
+    assert n1 != n2, "沒有 EXIF 時，兩次上傳的檔名本來就會不同"
+    assert storage.extract_fingerprint(n1) == storage.extract_fingerprint(n2), \
+        "但指紋必須相同，重複偵測才抓得到"
+
+
+def test_heic_support_registered():
+    """iPhone 原檔是 HEIC，需要 pillow-heif 才讀得到 EXIF 拍攝時間（§10）。"""
+    assert storage.HEIC_SUPPORTED, "pillow-heif 應該已安裝並註冊"

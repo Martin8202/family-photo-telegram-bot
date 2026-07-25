@@ -38,6 +38,8 @@ from keyboards import (
     CB_CORRECTION,
     CB_CORRECTION_FOLDER_PREFIX,
     CB_DEST_PREFIX,
+    CB_DUP_COPY,
+    CB_DUP_SKIP,
     CB_FINISH,
     CB_CONTINUE_RECEIVING,
     CB_RECENT_FOLDER_PREFIX,
@@ -47,12 +49,13 @@ from keyboards import (
     correction_folder_keyboard,
     correction_keyboard,
     destination_keyboard,
+    duplicate_decision_keyboard,
     folder_choice_keyboard,
     in_session_keyboard,
     inactivity_prompt_keyboard,
     restart_confirm_keyboard,
     restart_row,
-    start_upload_keyboard,
+    clear_persistent_keyboard,
     with_restart,
 )
 from state import (
@@ -67,7 +70,9 @@ from state import (
     STAGE_RECEIVING_PHOTOS,
     CompletedBatch,
     DestinationOutcome,
+    PendingDuplicates,
     ReceivedFile,
+    UploadSession,
     UploadSession,
     chunk_files,
     progress_bar,
@@ -94,6 +99,8 @@ _DEFAULTS = {
     "CORRECTION_PROMPT_MAX_MIN": 10,
     "STAGE_STUCK_MAX_MIN": 30,
     "ONEDRIVE_FREE_SPACE_DELAY_MIN": 10,
+    "DUPLICATE_PROMPT_MAX_MIN": 10,
+    "LAST_BATCH_MAX_MIN": 720,
     "INACTIVITY_PROMPT_TIMEOUT_SEC": 25,
     "AUTO_APPEND_WINDOW_MIN": 3,
 }
@@ -137,6 +144,29 @@ async def _safe_answer(query) -> None:
         await query.answer()
     except Exception as exc:  # noqa: BLE001
         logger.warning("回應 callback query 失敗（可能已逾時）：%s", exc)
+
+
+async def _reply_to_query(query, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None):
+    """
+    回覆一次按鈕點擊。
+
+    ⚠️ **不可以直接用 `query.message.reply_text()`**：Telegram 對超過約 48 小時的
+    訊息不會回傳完整內容，PTB 會給一個 `InaccessibleMessage`——它**沒有
+    `reply_text`**，而 `Update.effective_message` 在這種情況下會是 `None`。
+    完成訊息上的「📷 再傳一批」「↩️ 這批傳錯了」正是會被隔幾天才點的按鈕，
+    直接呼叫 `reply_text` 會拋 AttributeError，使用者只會看到一則
+    「出了點狀況」，完全不知道發生什麼事。
+
+    這裡先試著回覆原訊息（有的話版面比較連貫），失敗或訊息不可存取時，
+    改為直接對該使用者發新訊息——後者只需要 chat_id，永遠可用。
+    """
+    message = getattr(query, "message", None)
+    if message is not None and hasattr(message, "reply_text"):
+        try:
+            return await message.reply_text(text, reply_markup=reply_markup)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("回覆按鈕點擊失敗，改為直接發送訊息：%s", exc)
+    return await _safe_send(context, query.from_user.id, text, reply_markup=reply_markup)
 
 
 async def _delete_message_safe(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: Optional[int]) -> None:
@@ -219,16 +249,20 @@ def _destination_targets(destination: str, config, folder: str) -> dict:
 async def handle_start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     members, notifier, config, sessions, logs = _services(context)
     telegram_id = update.effective_user.id
+    # 一律以 chat_id 直接發送，不透過 `update.effective_message`——這個函式也會被
+    # 完成訊息上的「📷 再傳一批」呼叫，而那則訊息可能已經超過 48 小時、
+    # 拿不到完整內容，此時 `effective_message` 會是 None（見 `_reply_to_query`）。
     member = members.get(telegram_id)
     if member is None or member.status != STATUS_APPROVED:
-        await update.effective_message.reply_text(notify.user_msg_not_started())
+        await _safe_send(context, telegram_id, notify.user_msg_not_started())
         return
 
     existing = sessions.get(telegram_id)
     if existing is not None:
         # 重複點「我要上傳照片」：不重置，只回報現況（§6.3）
-        await update.effective_message.reply_text(
-            f"目前狀態：資料夾 {existing.folder or '（尚未選）'} ／ 已收到 {existing.received_count} 張"
+        await _safe_send(
+            context, telegram_id,
+            f"目前狀態：資料夾 {existing.folder or '（尚未選）'} ／ 已收到 {existing.received_count} 張",
         )
         return
 
@@ -246,18 +280,20 @@ async def handle_start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not (ok_nas and ok_od):
             err = err_nas or err_od
             await notifier.notify_admin(notify.msg_health_check_failed("開 session 健檢", err or "未知錯誤"))
-            await update.effective_message.reply_text(notify.user_msg_health_check_failed())
+            await _safe_send(context, telegram_id, notify.user_msg_health_check_failed())
             return
 
     session = sessions.start(telegram_id, member.name)
     recent = members.get_recent_folders(telegram_id)
     if recent:
-        await update.effective_message.reply_text(
+        await _safe_send(
+            context, telegram_id,
             "請選一個最近用過的資料夾，或直接打字輸入新資料夾名稱：",
             reply_markup=with_restart(folder_choice_keyboard(recent)),
         )
     else:
-        await update.effective_message.reply_text(
+        await _safe_send(
+            context, telegram_id,
             "請直接打字輸入資料夾名稱：",
             reply_markup=InlineKeyboardMarkup([restart_row()]),
         )
@@ -575,14 +611,35 @@ async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, sessio
     telegram_id = session.telegram_id
     chunk_ok_labels = {}
     index_rows_by_label: dict[str, list[tuple]] = {}
-    duplicate_rows: list[tuple] = []
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     for label, dest_dir in dest_targets.items():
         outcome = session.destinations.setdefault(label, DestinationOutcome(label=label))
         results = []
         actual_filenames = []
+        # 這個目的地資料夾裡已經有哪些照片（指紋 → 檔案大小）。整批只掃一次就快取。
+        if label not in session.existing_fingerprints:
+            session.existing_fingerprints[label] = await asyncio.to_thread(
+                storage.scan_existing_fingerprints, dest_dir
+            )
+        known_fingerprints = session.existing_fingerprints[label]
+
+        # 先把「相簿裡已經有了」的挑出來，**不複製**，留著問使用者要不要還是存（§10）。
+        # 判斷同時比對指紋與檔案大小，避免極小機率的指紋碰撞害一張新照片被略過。
+        to_copy = []
         for rf in chunk:
+            size = rf.temp_path.stat().st_size if rf.temp_path and rf.temp_path.exists() else None
+            if storage.looks_like_duplicate(known_fingerprints, rf.fingerprint, size):
+                entry = session.duplicate_files.setdefault(rf.file_id, (rf, []))
+                if label not in entry[1]:
+                    entry[1].append(label)
+            else:
+                to_copy.append(rf)
+                if rf.fingerprint:
+                    # 先登記，同一批裡若有兩張一模一樣的，第二張也算重複
+                    known_fingerprints.setdefault(rf.fingerprint, set()).add(size)
+
+        for rf in to_copy:
             try:
                 await context.bot.send_chat_action(chat_id=telegram_id, action=ChatAction.UPLOAD_PHOTO)
             except Exception:
@@ -604,15 +661,6 @@ async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, sessio
             # 實際落地的檔名以 dest_path 為準（撞名時會被改成 _(2) 等），
             # 失敗則退而求其次記錄本來要用的檔名，方便追查。
             actual_filenames.append(result.dest_path.name if result.success and result.dest_path else attempted_filename)
-            # 撞名代表「這張照片相簿裡已經有了」（指紋檔名相同＝同一張）。
-            # 依零刪除原則另存一份，並逐筆寫進待清理清單交給管理員判斷後刪除（§10B）。
-            if result.success and result.dest_path and result.dest_path.name != attempted_filename:
-                session.duplicate_count += 1
-                duplicate_rows.append((
-                    now_str, session.name, telegram_id, "重複檔案",
-                    str(result.dest_path.parent), result.dest_path.name,
-                    f"與相簿既有的「{attempted_filename}」是同一張，確認後可刪除這份副本",
-                ))
             # 大批次的複製可能持續數十分鐘；沿路 touch 才不會被 §6.4 的閒置逾時誤殺。
             session.touch()
             if config.WRITE_THROTTLE_SEC:
@@ -623,7 +671,7 @@ async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, sessio
         if ok:
             # 存 (file_id, 實際寫入路徑) 配對，而非只存路徑：日後（如「這批傳錯了」）
             # 需要反查某個已寫入檔案對應的 file_id 時，才不必依賴容易被重試打亂的順序去猜。
-            outcome.written_paths.extend((rf.file_id, r.dest_path) for rf, r in zip(chunk, results))
+            outcome.written_paths.extend((rf.file_id, r.dest_path) for rf, r in zip(to_copy, results))
         else:
             outcome.failed = True
             outcome.error = next((r.error for r in results if not r.success), "未知錯誤")
@@ -631,11 +679,7 @@ async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, sessio
                 notify.msg_write_failure(session.name, session.folder, label, outcome.error)
             )
 
-        index_rows_by_label[label] = list(zip(chunk, actual_filenames))
-
-    # 重複檔案清單先落地，管理員才有依據可以精準刪除（§10B）
-    if duplicate_rows:
-        await _write_record_safe(context, "待清理清單", logs.log_cleanup_batch, duplicate_rows)
+        index_rows_by_label[label] = list(zip(to_copy, actual_filenames))
 
     # file_index：成功或失敗一律記錄（§16.1），檔名一律是實際寫入目的地的檔名
     index_rows = []
@@ -649,6 +693,10 @@ async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, sessio
     chunk_fully_ok = all(chunk_ok_labels.values())
     if chunk_fully_ok:
         for rf in chunk:
+            # 被判定為重複、正等使用者決定的照片，暫存檔要留著——使用者可能回答
+            # 「還是存一份」，那時得從暫存區複製過去。
+            if rf.file_id in session.duplicate_files:
+                continue
             await _safe_delete_temp(rf.temp_path, Path(config.TEMP_DIR))
     return chunk_fully_ok
 
@@ -1027,7 +1075,14 @@ async def _debounce_fire(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ── 逾時保險（忘記按「我傳完了」）─────────────────────
 
 async def check_session_timeouts(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """由 job_queue 定期呼叫，掃描 session 逾時、靜置提醒與遺棄清理（§6.4）。"""
+    """由 job_queue 定期呼叫，掃描 session 逾時、遺棄清理與待決重複照片（§6.4、§10）。"""
+    await check_pending_duplicate_timeouts(context)
+    _, _, _cfg_obj, _sess, _ = _services(context)
+    # 回收太久以前的已完成批次（純記憶體，不動任何實體檔案，見 §7）
+    purged = _sess.purge_expired_batches(_cfg(_cfg_obj, "LAST_BATCH_MAX_MIN"))
+    if purged:
+        logger.info("已回收 %s 筆過期的完成批次紀錄", purged)
+
     _, _, config, sessions, _ = _services(context)
     now = datetime.now()
     abandoned_max_min = getattr(config, "ABANDONED_SESSION_MAX_MIN", 60)
@@ -1150,13 +1205,54 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
     if overall_ok:
         for rf in all_chunk_failures:
             await _safe_delete_temp(rf.temp_path, Path(config.TEMP_DIR))
-        await _safe_delete_temp(session.temp_dir, Path(config.TEMP_DIR))
+        # 有待決的重複照片時，整個暫存子夾要留著——那些照片的檔案還在裡面，
+        # 使用者可能回答「還是存一份」，那時得從這裡複製過去。
+        # 暫存夾改由 _decide_pending_duplicates 在使用者回答（或逾時）後清除。
+        if not session.duplicate_files:
+            await _safe_delete_temp(session.temp_dir, Path(config.TEMP_DIR))
 
     dest_label_text = session.destination
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    # 因為「相簿裡已經有了」而暫緩、尚未複製的張數。session.duplicate_files 以
+    # file_id 為鍵，本身就是照片張數，「兩邊都存」也不會重複計算。
+    duplicate_photos = len(session.duplicate_files)
+    # 完成訊息的張數要扣掉暫緩的，才會跟相簿裡真正多出來的張數對得上
+    stored_now = max(0, total - duplicate_photos)
+
+    session.pipeline = None
+    sessions.clear(telegram_id)
+
+    # 有「相簿裡已經有了」而暫緩、尚未複製的照片時，**先問過使用者才發完成訊息**。
+    # 反過來的話（先報「✅ 完成！2 張」再問還有 3 張要不要存）等於先報了一個假的
+    # 結果——使用者看到「完成」時流程其實還沒結束，那個張數也不是最終的。
+    if session.duplicate_files:
+        await _ask_about_duplicates(context, session, timed_out=timed_out)
+        return
+
+    await _complete_upload(context, session, timed_out=timed_out)
+
+
+async def _complete_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_out: bool) -> None:
+    """
+    發出收尾宣告：完成訊息、upload_log、記住這批（供「這批傳錯了」）、OneDrive 釋放。
+
+    抽成獨立函式的原因：有重複照片待決時，這一段必須**等使用者回答之後**才執行，
+    完成訊息的張數才會是最終確定的（見 `_ask_about_duplicates`）。
+    """
+    members, notifier, config, sessions, logs = _services(context)
+    telegram_id = session.telegram_id
+    dest_label_text = session.destination
+    total = sum(1 for rf in session.files if rf.downloaded)
+    failed_downloads = [rf for rf in session.files if rf.download_failed]
+    overall_ok = all(not o.failed for o in session.destinations.values())
+    # 實際存進相簿的張數＝已下載的，扣掉最後決定不存的重複照片
+    skipped = len(getattr(session, "skipped_duplicates", ()) or ())
+    stored_now = max(0, total - skipped)
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
     await _write_record_safe(
         context, "上傳紀錄 upload_log.csv", logs.log_upload,
-        now_str, session.name, telegram_id, session.folder, dest_label_text, total,
+        now_str, session.name, telegram_id, session.folder, dest_label_text, stored_now,
         "成功" if overall_ok else "部分失敗",
     )
     await _write_record_safe(
@@ -1164,22 +1260,17 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
         telegram_id, session.folder, dest_label_text,
     )
 
-    # 「兩邊都存」時同一張照片會在兩個目的地各記一次重複，換算回實際照片數才不會加倍
-    dest_count = max(1, len(session.destinations))
-    duplicate_photos = session.duplicate_count // dest_count
-
     if overall_ok:
-        text = notify.user_msg_done(total, session.folder, dest_label_text, duplicate_count=duplicate_photos)
+        text = notify.user_msg_done(stored_now, session.folder, dest_label_text,
+                                    skipped_count=skipped)
         if DEST_ONEDRIVE_LABEL in session.destinations:
             text += "\n" + notify.user_msg_onedrive_cloud_note()
         if failed_downloads:
             text += "\n" + notify.user_msg_download_failed_summary(len(failed_downloads))
         await _safe_send(context, telegram_id, text, reply_markup=correction_keyboard())
-        await notifier.notify_admin(notify.msg_upload_success(session.name, session.folder, total, dest_label_text))
-        if duplicate_photos > 0:
-            await notifier.notify_admin(
-                notify.msg_duplicates_for_admin(session.name, session.folder, duplicate_photos)
-            )
+        await notifier.notify_admin(
+            notify.msg_upload_success(session.name, session.folder, stored_now, dest_label_text)
+        )
 
         completed = CompletedBatch(
             telegram_id=telegram_id,
@@ -1208,8 +1299,161 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
         if onedrive_paths:
             await _schedule_onedrive_release(context, onedrive_paths)
 
-    session.pipeline = None
-    sessions.clear(telegram_id)
+
+async def _ask_about_duplicates(context: ContextTypes.DEFAULT_TYPE, session, timed_out: bool = False) -> None:
+    """
+    問使用者：偵測到 N 張跟相簿裡一模一樣的照片，還要再存一份嗎？（§10）
+
+    這些照片**尚未被複製**，暫存檔還留著。**完成訊息也還沒發**——要等使用者
+    決定之後才發，張數才會是最終確定的。逾時未回答則視同「不用了」：那份照片
+    相簿裡本來就有，跳過不會遺失任何東西。
+    """
+    _, _, config, sessions, _ = _services(context)
+    telegram_id = session.telegram_id
+    files = [rf for rf, _labels in session.duplicate_files.values()]
+    if not files:
+        await _complete_upload(context, session, timed_out=timed_out)
+        return
+
+    pending = PendingDuplicates(
+        telegram_id=telegram_id,
+        name=session.name,
+        folder=session.folder,
+        destination_label=session.destination,
+        files=files,
+        dest_targets=_destination_targets(session.destination, config, session.folder),
+        created_at=datetime.now(),
+        temp_dir=session.temp_dir,
+        session=session,
+        timed_out=timed_out,
+    )
+    sessions.set_pending_duplicates(pending)
+
+    await _safe_send(
+        context, telegram_id,
+        notify.user_msg_duplicate_ask(len(files), session.folder),
+        reply_markup=duplicate_decision_keyboard(),
+    )
+
+
+async def handle_duplicate_copy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """使用者選「要，還是存一份」：把這些重複照片照常複製進去。"""
+    query = update.callback_query
+    await _safe_answer(query)
+    members, notifier, config, sessions, logs = _services(context)
+    telegram_id = update.effective_user.id
+    pending = sessions.get_pending_duplicates(telegram_id)
+    if pending is None or pending.decided:
+        return
+    pending.decided = True
+    sessions.clear_pending_duplicates(telegram_id)
+
+    # 立刻回覆一句，複製可能要跑一陣子（重試、多目的地）——沒有這句的話，
+    # 使用者按下按鈕到完成訊息出現之間完全沒反應，正是本專案一路在修的問題。
+    await _reply_to_query(
+        query, context, notify.user_msg_duplicate_copying(pending.count, pending.folder)
+    )
+
+    # 借用一個輕量 session 走既有的複製流程，才能沿用重試、file_index、
+    # 待清理清單、OneDrive 釋放等所有既有保護（不另闢路徑，§6.6 同一原則）。
+    holder = UploadSession(
+        telegram_id=telegram_id, name=pending.name,
+        folder=pending.folder, destination=pending.destination_label,
+    )
+    for label in pending.dest_targets:
+        holder.destinations[label] = DestinationOutcome(label=label)
+    # 這些照片是「明知重複仍要存」，不可以再被重複偵測攔一次
+    for label, dest_dir in pending.dest_targets.items():
+        holder.existing_fingerprints[label] = {}
+
+    ok = await _copy_chunk_to_destinations(context, holder, pending.files, pending.dest_targets)
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    cleanup_rows = []
+    onedrive_written = []
+    for label, outcome in holder.destinations.items():
+        for _file_id, path in outcome.written_paths:
+            path = Path(path)
+            cleanup_rows.append((now_str, pending.name, telegram_id, "重複檔案",
+                                 str(path.parent), path.name,
+                                 "使用者確認後仍選擇存一份，與相簿既有照片是同一張"))
+            if label == DEST_ONEDRIVE_LABEL:
+                onedrive_written.append(path)
+
+    if cleanup_rows:
+        await _write_record_safe(context, "待清理清單", logs.log_cleanup_batch, cleanup_rows)
+    if getattr(config, "ONEDRIVE_FREE_SPACE", True) and onedrive_written:
+        await _schedule_onedrive_release(context, onedrive_written)
+
+    if ok:
+        await _discard_pending_duplicates(context, pending)
+
+    # 把這批也算進本次上傳的成果，收尾宣告的張數才會是最終的
+    if pending.session is not None:
+        for label, outcome in holder.destinations.items():
+            target = pending.session.destinations.setdefault(label, DestinationOutcome(label=label))
+            target.written_paths.extend(outcome.written_paths)
+        pending.session.skipped_duplicates = []
+
+    await notifier.notify_admin(
+        notify.msg_duplicates_for_admin(pending.name, pending.folder, pending.count)
+    )
+    if pending.session is not None:
+        await _complete_upload(context, pending.session, timed_out=pending.timed_out)
+
+
+async def handle_duplicate_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """使用者選「不用了，跳過」：不複製，清掉暫存檔。"""
+    query = update.callback_query
+    await _safe_answer(query)
+    _, _, config, sessions, _ = _services(context)
+    telegram_id = update.effective_user.id
+    pending = sessions.get_pending_duplicates(telegram_id)
+    if pending is None or pending.decided:
+        return
+    pending.decided = True
+    sessions.clear_pending_duplicates(telegram_id)
+    await _discard_pending_duplicates(context, pending)
+    if pending.session is not None:
+        pending.session.skipped_duplicates = list(pending.files)
+        await _complete_upload(context, pending.session, timed_out=pending.timed_out)
+
+
+async def _discard_pending_duplicates(context: ContextTypes.DEFAULT_TYPE, pending) -> None:
+    """
+    清掉這批待決重複照片的暫存檔。**只碰暫存區**，目的地的照片完全不動。
+
+    收尾時因為要保留這些檔案而刻意沒刪的暫存子夾，也在這裡一併清除——
+    否則使用者一直不回答的話，暫存區會留著空資料夾。
+    """
+    _, _, config, _, _ = _services(context)
+    temp_root = Path(config.TEMP_DIR)
+    for rf in pending.files:
+        await _safe_delete_temp(rf.temp_path, temp_root)
+    if pending.temp_dir is not None:
+        await _safe_delete_temp(pending.temp_dir, temp_root)
+
+
+async def check_pending_duplicate_timeouts(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    逾時未回答的重複照片詢問，一律視同「不用了」（§10）。
+
+    這個預設是安全的：那張照片相簿裡本來就有一模一樣的一份，跳過不會遺失
+    任何東西；而且暫存檔留著不清會一直佔空間。
+    """
+    _, _, config, sessions, _ = _services(context)
+    now = datetime.now()
+    max_min = _cfg(config, "DUPLICATE_PROMPT_MAX_MIN")
+    for pending in sessions.all_pending_duplicates():
+        if pending.decided:
+            continue
+        if (now - pending.created_at) >= timedelta(minutes=max_min):
+            pending.decided = True
+            sessions.clear_pending_duplicates(pending.telegram_id)
+            await _discard_pending_duplicates(context, pending)
+            if pending.session is not None:
+                pending.session.skipped_duplicates = list(pending.files)
+                await _complete_upload(context, pending.session, timed_out=pending.timed_out)
 
 
 # ── 重新開始 ─────────────────────────────────────────
@@ -1263,9 +1507,11 @@ async def handle_restart_confirm(update: Update, context: ContextTypes.DEFAULT_T
         await _safe_delete_temp(session.temp_dir, Path(config.TEMP_DIR))
 
     sessions.clear(telegram_id)
-    # §5.1「任何狀態下畫面上永遠有可點的按鈕」：回到起點時要把「📷 我要上傳照片」
-    # 重新遞給使用者，不能只留一句話讓他不知道下一步該點哪裡。
-    await query.message.reply_text(notify.user_msg_restart_done(), reply_markup=start_upload_keyboard())
+    # 順手清掉可能還留在畫面下方的舊常駐按鈕（功能已移進 ☰ 選單，見 §6.1），
+    # 並用文字明確指出下一步該點哪裡，不讓使用者卡在不知道要做什麼的狀態（§5.1）。
+    await query.message.reply_text(
+        notify.user_msg_restart_done(), reply_markup=clear_persistent_keyboard()
+    )
 
 
 async def handle_restart_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1336,19 +1582,33 @@ def _correction_flag_active(context: ContextTypes.DEFAULT_TYPE) -> bool:
     return True
 
 
+async def handle_upload_again_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """完成訊息上的「📷 再傳一批」：等同從 ☰ 選單進入，直接開始新的一次上傳。"""
+    query = update.callback_query
+    await _safe_answer(query)
+    await handle_start_upload(update, context)
+
+
 async def handle_correction_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await _safe_answer(query)
     members, _, _, sessions, _ = _services(context)
     telegram_id = update.effective_user.id
     batch = sessions.get_last_batch(telegram_id)
-    if batch is None or batch.corrected:
-        return  # 重複點擊 / 無可更正批次一律忽略（§6.3）
+    if batch is None:
+        # 批次紀錄已被回收（§7 的記憶體回收），或程式重啟過。按鈕還在，但程式
+        # 已無從得知那批照片是哪些——要講清楚，不能無聲無息什麼都不做，
+        # 而且必須說明照片沒有不見，否則使用者會嚇到。
+        await _reply_to_query(query, context, notify.user_msg_batch_expired())
+        return
+    if batch.corrected:
+        return  # 重複點擊一律忽略（§6.3）
     context.user_data[AWAITING_CORRECTION_FLAG] = True
     context.user_data[CORRECTION_FLAG_AT] = datetime.now()
     # 規格書 §7 第 1 點：須同時提供「近 3 次資料夾」按鈕與打字輸入兩種方式
     recent = members.get_recent_folders(telegram_id)
-    await query.message.reply_text(
+    await _reply_to_query(
+        query, context,
         "這批要改放到哪個資料夾？可以點下面用過的，或直接打字輸入新名稱：",
         reply_markup=correction_folder_keyboard(recent) if recent else None,
     )
@@ -1365,7 +1625,10 @@ async def handle_correction_folder_button(update: Update, context: ContextTypes.
     if not folder_name:
         return
     _clear_correction_flag(context)
-    await _apply_correction(update, context, folder_name, message=query.message)
+    # query.message 可能是超過 48 小時的 InaccessibleMessage（沒有 reply_text），
+    # 傳 None 讓 _apply_correction 走 chat_id 直送的路徑。
+    msg = query.message if hasattr(query.message, "reply_text") else None
+    await _apply_correction(update, context, folder_name, message=msg)
 
 
 async def _apply_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, new_folder: str, message=None) -> None:
@@ -1384,7 +1647,11 @@ async def _apply_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         return
     batch.corrected = True  # 首次生效後立即失效，避免重複複製（§6.3）
 
-    await message.reply_text(notify.user_msg_correction_processing(new_folder))
+    if message is not None and hasattr(message, "reply_text"):
+        await message.reply_text(notify.user_msg_correction_processing(new_folder))
+    else:
+        message = None  # 訊息不可存取，後續一律以 chat_id 直送
+        await _safe_send(context, telegram_id, notify.user_msg_correction_processing(new_folder))
     # 交給背景執行，本函式立刻返回，不佔住 update 佇列
     context.application.create_task(
         _run_correction(context, telegram_id, batch, new_folder, message)
@@ -1417,13 +1684,16 @@ async def _run_correction(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, 
     failed_file_ids: set = set()
     # 搬到新資料夾的照片同樣是「寫入 OneDrive 的檔案」，一樣要排釋放空間（§4.2）。
     onedrive_written: list = []
+    # 新位置的 (file_id, 路徑) 配對，用來把「最近一批」改指向新資料夾——
+    # 搬到 B 之後才發現 B 也不對時，要能再搬到 C。
+    new_written_paths: dict = {}
     total_photos = len(by_photo)
     progress_message = None
     last_progress_at = datetime.now()
     if total_photos:
         progress_message = await _safe_send(
             context, telegram_id, notify.user_msg_correction_progress(progress_bar(0, total_photos))
-        )
+        )  # 一律以 chat_id 直送，來源訊息可能已不可存取
 
     for done, (file_id, targets) in enumerate(by_photo.items(), start=1):
         for label, old_path in targets:
@@ -1447,6 +1717,7 @@ async def _run_correction(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, 
                 # 無法依人篩選待清理清單（規格書 §10B）。
                 cleanup_rows.append((now_str, uploader_name, telegram_id, "傳錯更正",
                                       str(old_path.parent), old_path.name, f"已改放至「{new_folder}」"))
+                new_written_paths.setdefault(label, []).append((file_id, result.dest_path))
                 if label == DEST_ONEDRIVE_LABEL and result.dest_path:
                     onedrive_written.append(result.dest_path)
             else:
@@ -1474,7 +1745,24 @@ async def _run_correction(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, 
     # 照片已經搬完了，先把「使用者看得到的結果」做完，記錄檔擺到後面——
     # 這個順序很重要：原本記錄檔寫在最前面，Excel 鎖檔造成的例外會讓使用者
     # 收不到回覆、新資料夾也進不了「最近使用」，明明照片早就複製好了。
-    await message.reply_text(notify.user_msg_correction_done(total_moved, new_folder))
+    # 把「最近一批」改指向新位置。這樣搬到 B 之後才發現 B 也不對時，還能再搬到 C；
+    # 也讓下面完成訊息上的「↩️ 這批傳錯了」真的可用——若沿用舊批次，它的
+    # corrected 已是 True，點下去會完全沒反應，比沒有按鈕更糟。
+    if new_written_paths:
+        sessions.set_last_batch(CompletedBatch(
+            telegram_id=telegram_id,
+            folder=new_folder,
+            destination_label=batch.destination_label,
+            files=batch.files,
+            written_paths=new_written_paths,
+            completed_at=datetime.now(),
+        ))
+
+    done_text = notify.user_msg_correction_done(total_moved, new_folder)
+    if message is not None:
+        await message.reply_text(done_text, reply_markup=correction_keyboard())
+    else:
+        await _safe_send(context, telegram_id, done_text, reply_markup=correction_keyboard())
     await _write_record_safe(
         context, "最近使用的資料夾", members.push_recent_folder,
         telegram_id, new_folder, batch.destination_label,

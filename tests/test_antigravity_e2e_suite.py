@@ -39,8 +39,12 @@ class DummyTelegramFile:
     async def download_to_drive(self, custom_path: str):
         path = Path(custom_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        # 寫入一張極小的 Dummy JPEG 資料
-        path.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00`\x00`\x00\x00\xff\xd9")
+        # 寫入一張極小的 Dummy JPEG，並把 file_id 混進內容裡——不同的照片必須有
+        # 不同的位元組，否則去重邏輯會（正確地）把它們全部判定成同一張照片。
+        path.write_bytes(
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00`\x00`\x00\x00"
+            + self.file_id.encode() + b"\xff\xd9"
+        )
 
 
 class DummyBot:
@@ -95,6 +99,17 @@ class DummyMessage:
     async def edit_text(self, text: str, reply_markup=None):
         self.text = text
         return self
+
+
+class InaccessibleDummyMessage:
+    """
+    模擬 Telegram 對「超過約 48 小時的訊息」回傳的 InaccessibleMessage：
+    只有 chat/message_id，**沒有 reply_text**。PTB 在這種情況下也會讓
+    Update.effective_message 變成 None。
+    """
+    def __init__(self, message_id: int, chat_id: int):
+        self.message_id = message_id
+        self.chat_id = chat_id
 
 
 class DummyUser:
@@ -1141,19 +1156,18 @@ async def test_auto_append_late_photos(env):
 
 
 @pytest.mark.asyncio
-async def test_duplicate_photo_never_overwrites_and_is_listed_for_cleanup(env):
+async def test_duplicate_is_held_and_user_is_asked(env):
     """
-    同一張照片重複上傳時（指紋檔名相同）：
-    - **絕不覆蓋**既有檔案，另存一份（§2、§8、§10）
-    - 重複的那份逐筆寫進待清理清單，讓管理員有依據可以刪（§10B）
-    - 完成訊息要說明有幾張重複，避免使用者以為漏傳
+    偵測到「相簿裡已經有一模一樣的照片」時（§10）：
+    - **先不要複製**，把它留在暫存區
+    - 主批次照常收尾，另外跳出來問使用者「還要再存一份嗎？」
+    - 既有的那張照片完全不動
     """
     app, data_dir, temp_dir, nas_dir, od_dir = env
     ctx = DummyContext(app)
     user = DummyUser(1033, "三姊")
     dest_dir = nas_dir / "重複測試"
 
-    # 第一次上傳
     session = await _open_session(app, ctx, user, "重複測試")
     await _send_photo(app, ctx, user, "dup_1", 10)
     await session.pipeline.settle()
@@ -1162,29 +1176,121 @@ async def test_duplicate_photo_never_overwrites_and_is_listed_for_cleanup(env):
     first = list(dest_dir.glob("*.jpg"))[0]
     first_bytes = first.read_bytes()
 
-    # 第二次傳同一張（同樣的 file_id → 同樣的指紋 → 同樣的檔名）
+    # 第二次傳同一張
     session2 = await _open_session(app, ctx, user, "重複測試")
     await _send_photo(app, ctx, user, "dup_1", 20)
     await session2.pipeline.settle()
     await upload._finalize_upload(ctx, session2, timed_out=False)
 
-    files = sorted(dest_dir.glob("*.jpg"))
-    assert len(files) == 2, "撞名要另存一份，不可覆蓋"
-    assert first.exists() and first.read_bytes() == first_bytes, "原本那張必須完好無損"
-    assert any("_(2)" in f.name for f in files)
+    # 關鍵：還沒複製，資料夾裡仍然只有原本那一張，內容原封不動
+    assert len(list(dest_dir.glob("*.jpg"))) == 1, "使用者還沒回答之前不可以複製"
+    assert first.read_bytes() == first_bytes, "既有的照片完全不動"
 
-    # 待清理清單要有這筆重複，且欄位對得上
+    # 有跳出來問，而且附上是/否按鈕
+    asked = [m for m in app.bot.sent_messages
+             if m["chat_id"] == 1033 and "還要再存一份嗎" in m["text"]]
+    assert len(asked) == 1
+    assert "1 張" in asked[0]["text"]
+    callbacks = [b.callback_data for row in asked[0]["reply_markup"].inline_keyboard for b in row]
+    assert "dup_copy" in callbacks and "dup_skip" in callbacks
+
+    pending = app.bot_data["sessions"].get_pending_duplicates(1033)
+    assert pending is not None and pending.count == 1
+    assert pending.files[0].temp_path.exists(), "暫存檔要留著，使用者可能回答『還是存』"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_user_chooses_to_copy(env):
+    """使用者選「要，還是存一份」→ 照常複製進去，並記入待清理清單。"""
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+    ctx = DummyContext(app)
+    user = DummyUser(1034, "四姊")
+    dest_dir = nas_dir / "還是要存"
+
+    for msg_id in (10, 20):
+        s = await _open_session(app, ctx, user, "還是要存")
+        await _send_photo(app, ctx, user, "dup_keep", msg_id)
+        await s.pipeline.settle()
+        await upload._finalize_upload(ctx, s, timed_out=False)
+
+    assert len(list(dest_dir.glob("*.jpg"))) == 1
+    pending = app.bot_data["sessions"].get_pending_duplicates(1034)
+    assert pending is not None
+    temp_before = pending.files[0].temp_path
+
+    yes_msg = DummyMessage(30, "", 1034, app.bot)
+    await upload.handle_duplicate_copy(
+        DummyUpdate(user, yes_msg, DummyCallbackQuery("dup_copy", user, yes_msg)), ctx
+    )
+
+    assert len(list(dest_dir.glob("*.jpg"))) == 2, "選了『要』就該複製進去"
+    assert not temp_before.exists(), "複製成功後暫存檔要清掉"
+    assert app.bot_data["sessions"].get_pending_duplicates(1034) is None
+
     logs: DataLogs = app.bot_data["logs"]
     dup_rows = [r for r in logs.cleanup_list.read_all_rows() if r["類型"] == "重複檔案"]
     assert len(dup_rows) == 1
-    assert dup_rows[0]["上傳者"] == "三姊"
-    assert "_(2)" in dup_rows[0]["檔名"]
+    assert dup_rows[0]["上傳者"] == "四姊"
+    assert any("也存進" in m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1034)
 
-    # 使用者訊息要講清楚有幾張重複；管理員要另外收到清理通知
-    user_texts = [m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1033]
-    assert any("1 張跟相簿裡已經有的照片是同一張" in t for t in user_texts)
-    admin_texts = [m["text"] for m in app.bot.sent_messages if m["chat_id"] == 999999]
-    assert any("待清理清單" in t and "重複" in t for t in admin_texts)
+
+@pytest.mark.asyncio
+async def test_duplicate_user_chooses_to_skip(env):
+    """使用者選「不用了，跳過」→ 不複製，清掉暫存檔，目的地完全不動。"""
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+    ctx = DummyContext(app)
+    user = DummyUser(1035, "五姊")
+    dest_dir = nas_dir / "不用存"
+
+    for msg_id in (10, 20):
+        s = await _open_session(app, ctx, user, "不用存")
+        await _send_photo(app, ctx, user, "dup_skip_me", msg_id)
+        await s.pipeline.settle()
+        await upload._finalize_upload(ctx, s, timed_out=False)
+
+    pending = app.bot_data["sessions"].get_pending_duplicates(1035)
+    temp_before = pending.files[0].temp_path
+
+    no_msg = DummyMessage(30, "", 1035, app.bot)
+    await upload.handle_duplicate_skip(
+        DummyUpdate(user, no_msg, DummyCallbackQuery("dup_skip", user, no_msg)), ctx
+    )
+
+    assert len(list(dest_dir.glob("*.jpg"))) == 1, "選了『不用』就不該複製"
+    assert not temp_before.exists(), "暫存檔要清掉，不可一直佔空間"
+    assert app.bot_data["sessions"].get_pending_duplicates(1035) is None
+    # 選「不用」之後才發完成訊息，且張數已扣掉跳過的那些
+    done = [m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1035 and "完成" in m["text"]]
+    assert done, "決定之後要發完成訊息"
+    assert "沒有重複存" in done[-1], "要交代有幾張依選擇沒存，不然使用者以為漏傳"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_timeout_defaults_to_skip(env):
+    """
+    逾時沒回答 → 視同「不用了」。這個預設是安全的：那張照片相簿裡本來就有
+    一模一樣的一份，跳過不會遺失任何東西，而暫存檔留著只會一直佔空間。
+    """
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+    ctx = DummyContext(app)
+    user = DummyUser(1036, "六姊")
+    dest_dir = nas_dir / "逾時測試"
+
+    for msg_id in (10, 20):
+        s = await _open_session(app, ctx, user, "逾時測試")
+        await _send_photo(app, ctx, user, "dup_timeout", msg_id)
+        await s.pipeline.settle()
+        await upload._finalize_upload(ctx, s, timed_out=False)
+
+    pending = app.bot_data["sessions"].get_pending_duplicates(1036)
+    temp_before = pending.files[0].temp_path
+    pending.created_at = datetime.now() - timedelta(minutes=30)
+
+    await upload.check_pending_duplicate_timeouts(ctx)
+
+    assert len(list(dest_dir.glob("*.jpg"))) == 1
+    assert not temp_before.exists()
+    assert app.bot_data["sessions"].get_pending_duplicates(1036) is None
 
 
 # ── 記錄檔被鎖住（Excel 開著）不可中斷照片處理（實測 bug 回歸）────────
@@ -1666,3 +1772,468 @@ async def test_startup_recovery_schedules_onedrive_release(env):
     pending = storage.read_pending_releases(data_dir)
     assert len(pending) == 1, "復原補送的照片也要排 OneDrive 釋放空間"
     assert pending[0]["paths"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_detected_by_fingerprint_not_filename(env, monkeypatch):
+    """
+    實測回報：同一張照片分兩次上傳，檔名還是不一樣（69 張裡有 62 張如此），
+    因為 Telegram 壓縮版的 EXIF 被剝掉、時間戳退回接收時間。
+
+    所以重複偵測**不可以只看檔名撞名**，必須依指紋判斷——否則絕大多數的
+    重複上傳都會被漏掉，使用者完全不會知道相簿裡有重複。
+    """
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+    ctx = DummyContext(app)
+    user = DummyUser(1100, "十六姨")
+    dest_dir = nas_dir / "指紋去重"
+
+    s1 = await _open_session(app, ctx, user, "指紋去重")
+    await _send_photo(app, ctx, user, "fp_same", 10)
+    await s1.pipeline.settle()
+    await upload._finalize_upload(ctx, s1, timed_out=False)
+    first = list(dest_dir.glob("*.jpg"))
+    assert len(first) == 1
+    fp = storage.extract_fingerprint(first[0].name)
+    assert fp, "檔名裡要帶得出指紋"
+
+    # 第二次上傳同一張，但讓檔名的時間戳不同（模擬不同接收時間、無 EXIF）
+    real_build = storage.build_filename
+    def build_with_other_time(received_time, **kw):
+        return real_build(datetime(2026, 8, 1, 9, 30, 0, 5), **kw)
+    monkeypatch.setattr(storage, "build_filename", build_with_other_time)
+
+    s2 = await _open_session(app, ctx, user, "指紋去重")
+    await _send_photo(app, ctx, user, "fp_same", 20)
+    await s2.pipeline.settle()
+    await upload._finalize_upload(ctx, s2, timed_out=False)
+
+    # 檔名會不同（時間戳不同），但仍必須被認出是同一張而攔下來詢問
+    assert len(list(dest_dir.glob("*.jpg"))) == 1, "檔名不同但指紋相同，仍必須認出是重複"
+    pending = app.bot_data["sessions"].get_pending_duplicates(1100)
+    assert pending is not None and pending.count == 1
+    assert any("還要再存一份嗎" in m["text"]
+               for m in app.bot.sent_messages if m["chat_id"] == 1100)
+
+    # 若使用者選「要」，新檔名的指紋仍與既有那張相同
+    yes_msg = DummyMessage(30, "", 1100, app.bot)
+    await upload.handle_duplicate_copy(
+        DummyUpdate(user, yes_msg, DummyCallbackQuery("dup_copy", user, yes_msg)), ctx
+    )
+    names = {f.name for f in dest_dir.glob("*.jpg")}
+    assert len(names) == 2
+    assert all(storage.extract_fingerprint(n) == fp for n in names)
+
+
+@pytest.mark.asyncio
+async def test_existing_folder_scanned_only_once_per_destination(env, monkeypatch):
+    """
+    列目錄對網芳是昂貴操作，整批只能掃一次並快取，不可以每張照片都重掃。
+    """
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+    ctx = DummyContext(app)
+    user = DummyUser(1101, "十七舅")
+
+    scans = []
+    real_scan = storage.scan_existing_fingerprints
+    def counting_scan(dest_dir):
+        scans.append(str(dest_dir))
+        return real_scan(dest_dir)
+    monkeypatch.setattr(storage, "scan_existing_fingerprints", counting_scan)
+
+    original_batch = config.BATCH_SIZE
+    try:
+        config.BATCH_SIZE = 2
+        session = await _open_session(app, ctx, user, "掃描一次", dest="兩邊都存")
+        for i in range(6):
+            await _send_photo(app, ctx, user, f"scan_{i}", 10 + i)
+        await session.pipeline.settle()
+        await upload._finalize_upload(ctx, session, timed_out=False)
+    finally:
+        config.BATCH_SIZE = original_batch
+
+    # 6 張、分 3 個小批、兩個目的地 —— 但每個目的地只該掃一次
+    assert len(scans) == 2, f"兩個目的地各掃一次就好，實際掃了 {len(scans)} 次：{scans}"
+    assert len(set(scans)) == 2
+
+
+@pytest.mark.asyncio
+async def test_start_goes_straight_to_upload_for_approved_user(env):
+    """
+    已開通的使用者點 /start（或選單）時，要**直接進入上傳流程**，
+    不要停在「歡迎回來」那個沒有作用的中繼站再叫他點一次按鈕。
+    """
+    app, *_ = env
+    ctx = DummyContext(app)
+    user = DummyUser(1200, "選單測試")
+    members: MembersStore = app.bot_data["members"]
+    members.register(1200, "選單測試")
+    members.approve(1200)
+
+    await register.handle_start(
+        DummyUpdate(user, DummyMessage(1, "/start", 1200, app.bot)), ctx
+    )
+
+    session = app.bot_data["sessions"].get(1200)
+    assert session is not None, "應該直接開好 session"
+    assert session.stage == "awaiting_folder"
+    texts = [m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1200]
+    assert not any("歡迎回來" in t for t in texts), "不該再出現沒有作用的中繼訊息"
+    assert any("資料夾" in t for t in texts), "應該直接問資料夾"
+
+
+@pytest.mark.asyncio
+async def test_start_still_registers_new_user(env):
+    """
+    /start 從選單移除，但**指令本身必須保留**——Telegram 對新使用者顯示的
+    START 按鈕送的就是 /start，註冊流程完全靠它。移掉的話新家人進不來。
+    """
+    app, *_ = env
+    ctx = DummyContext(app)
+    user = DummyUser(1201, "新來的")
+
+    await register.handle_start(
+        DummyUpdate(user, DummyMessage(1, "/start", 1201, app.bot)), ctx
+    )
+
+    texts = [m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1201]
+    assert any("登記" in t for t in texts), "新使用者要看到註冊引導"
+    assert app.bot_data["sessions"].get(1201) is None, "未註冊者不該開出 session"
+
+
+@pytest.mark.asyncio
+async def test_start_during_session_reports_status(env):
+    """session 進行中收到 /start 仍然只回報現況，不重置流程（§6.3）。"""
+    app, *_ = env
+    ctx = DummyContext(app)
+    user = DummyUser(1202, "進行中")
+    session = await _open_session(app, ctx, user, "進行中的相簿")
+    await _send_photo(app, ctx, user, "s1", 10)
+
+    n = len(app.bot.sent_messages)
+    await register.handle_start(
+        DummyUpdate(user, DummyMessage(50, "/start", 1202, app.bot)), ctx
+    )
+
+    assert app.bot_data["sessions"].get(1202) is session, "不可重置 session"
+    assert session.folder == "進行中的相簿"
+    assert any("你正在上傳中" in m["text"] for m in app.bot.sent_messages[n:])
+
+
+def test_menu_shows_upload_not_start():
+    """選單裡要是「我要上傳照片」，不是「開始使用」。"""
+    src = Path("bot.py").read_text(encoding="utf-8")
+    assert 'BotCommand("upload"' in src
+    assert "我要上傳照片" in src
+    assert 'BotCommand("start", "開始使用")' not in src, "開始使用應已從選單移除"
+    assert 'CommandHandler("start"' in src, "但 /start 指令本身必須保留（註冊流程要用）"
+    assert 'CommandHandler("upload"' in src
+
+
+@pytest.mark.asyncio
+async def test_persistent_keyboard_is_removed_on_approval(env):
+    """
+    開通通知要**主動送出清除指令**。Telegram 的常駐鍵盤是「每個對話的持續狀態」，
+    只是不再附上新的鍵盤並不會讓舊的消失——已經看得到按鈕的使用者會一直看得到。
+    """
+    from telegram import ReplyKeyboardRemove
+
+    app, *_ = env
+    ctx = DummyContext(app)
+    admin = DummyUser(999999, "Admin")
+    members: MembersStore = app.bot_data["members"]
+    members.register(1210, "待開通")
+
+    admin_msg = DummyMessage(1, "", 999999, app.bot)
+    await register.handle_approve(
+        DummyUpdate(admin, admin_msg, DummyCallbackQuery("approve:1210", admin, admin_msg)), ctx
+    )
+
+    sent = [m for m in app.bot.sent_messages if m["chat_id"] == 1210]
+    assert sent, "使用者要收到開通通知"
+    assert isinstance(sent[-1]["reply_markup"], ReplyKeyboardRemove),         "必須主動清除常駐鍵盤，否則舊按鈕會一直留著"
+    assert "選單" in sent[-1]["text"], "要告訴他改從哪裡進入"
+
+
+@pytest.mark.asyncio
+async def test_completion_offers_upload_again(env):
+    """完成訊息要附「📷 再傳一批」，連續傳好幾批時不用每次繞去選單。"""
+    app, *_ = env
+    ctx = DummyContext(app)
+    user = DummyUser(1211, "連續傳")
+    session = await _open_session(app, ctx, user, "第一批")
+    await _send_photo(app, ctx, user, "again_1", 10)
+    await session.pipeline.settle()
+    await upload._finalize_upload(ctx, session, timed_out=False)
+
+    done = [m for m in app.bot.sent_messages
+            if m["chat_id"] == 1211 and "完成" in m["text"]][-1]
+    callbacks = [b.callback_data for row in done["reply_markup"].inline_keyboard for b in row]
+    assert "upload_again" in callbacks
+    assert "correction" in callbacks, "「這批傳錯了」不可以被擠掉"
+
+
+@pytest.mark.asyncio
+async def test_upload_again_starts_new_session(env):
+    """點「📷 再傳一批」要直接開始新的一次上傳，等同從選單進入。"""
+    app, *_ = env
+    ctx = DummyContext(app)
+    user = DummyUser(1212, "再傳")
+    session = await _open_session(app, ctx, user, "上一批")
+    await _send_photo(app, ctx, user, "ag_1", 10)
+    await session.pipeline.settle()
+    await upload._finalize_upload(ctx, session, timed_out=False)
+    assert app.bot_data["sessions"].get(1212) is None
+
+    again_msg = DummyMessage(50, "", 1212, app.bot)
+    await upload.handle_upload_again_button(
+        DummyUpdate(user, again_msg, DummyCallbackQuery("upload_again", user, again_msg)), ctx
+    )
+
+    new_session = app.bot_data["sessions"].get(1212)
+    assert new_session is not None and new_session.stage == "awaiting_folder"
+
+
+def test_no_persistent_keyboard_left_in_code():
+    """常駐鍵盤應已完全移除，不可有殘留的 ReplyKeyboardMarkup。"""
+    for name in ("keyboards.py", "handlers/register.py", "handlers/upload.py", "bot.py"):
+        src = Path(name).read_text(encoding="utf-8")
+        assert "ReplyKeyboardMarkup" not in src, f"{name} 仍有常駐鍵盤殘留"
+        assert "start_upload_keyboard" not in src, f"{name} 仍在使用已移除的函式"
+
+
+@pytest.mark.asyncio
+async def test_upload_again_works_on_message_older_than_48h(env):
+    """
+    「📷 再傳一批」躺在完成訊息上，很可能隔幾天才被點。
+
+    Telegram 對超過約 48 小時的訊息不回傳完整內容，PTB 會給
+    InaccessibleMessage（**沒有 reply_text**），且 Update.effective_message
+    會是 None。直接用 reply_text 會拋 AttributeError，使用者只看到
+    「出了點狀況，已通知管理員」——完全不知道發生什麼事。
+    """
+    app, *_ = env
+    ctx = DummyContext(app)
+    user = DummyUser(1220, "隔天再傳")
+    members: MembersStore = app.bot_data["members"]
+    members.register(1220, "隔天再傳")
+    members.approve(1220)
+
+    # 模擬「很久以前那則完成訊息」上的按鈕
+    old_msg = InaccessibleDummyMessage(1, 1220)
+    upd = DummyUpdate(user, None, DummyCallbackQuery("upload_again", user, old_msg))
+    assert upd.effective_message is None, "這正是 PTB 的實際行為"
+
+    await upload.handle_upload_again_button(upd, ctx)
+
+    session = app.bot_data["sessions"].get(1220)
+    assert session is not None, "隔幾天再點也必須能正常開始上傳"
+    assert session.stage == "awaiting_folder"
+    assert any("資料夾" in m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1220)
+
+
+@pytest.mark.asyncio
+async def test_correction_button_works_on_old_message(env):
+    """「↩️ 這批傳錯了」同樣躺在完成訊息上，一樣要能撐過 48 小時。"""
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+    ctx = DummyContext(app)
+    user = DummyUser(1221, "隔天更正")
+    members: MembersStore = app.bot_data["members"]
+    members.register(1221, "隔天更正")
+    members.approve(1221)
+    members.push_recent_folder(1221, "舊夾", "家裡硬碟")
+
+    old_dir = nas_dir / "打錯的"
+    old_dir.mkdir(parents=True, exist_ok=True)
+    photo = old_dir / "20260725_120000_11112222.jpg"
+    photo.write_bytes(b"x")
+    app.bot_data["sessions"].set_last_batch(upload.CompletedBatch(
+        telegram_id=1221, folder="打錯的", destination_label="家裡硬碟", files=[],
+        written_paths={"家裡硬碟": [("fid_old", photo)]}, completed_at=datetime.now(),
+    ))
+
+    old_msg = InaccessibleDummyMessage(1, 1221)
+    await upload.handle_correction_button(
+        DummyUpdate(user, None, DummyCallbackQuery("correction", user, old_msg)), ctx
+    )
+
+    assert ctx.user_data.get(upload.AWAITING_CORRECTION_FLAG) is True
+    assert any("改放到哪個資料夾" in m["text"]
+               for m in app.bot.sent_messages if m["chat_id"] == 1221)
+
+    # 後續打字更正也要能完成
+    await upload.handle_folder_text(
+        DummyUpdate(user, DummyMessage(9, "正確的", 1221, app.bot)), ctx
+    )
+    await drain_background_tasks(app)
+    assert (nas_dir / "正確的" / photo.name).exists()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_buttons_work_on_old_message(env):
+    """重複詢問的是/否按鈕同樣可能隔很久才被點。"""
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+    ctx = DummyContext(app)
+    user = DummyUser(1222, "隔天決定")
+    dest_dir = nas_dir / "隔天決定"
+
+    for msg_id in (10, 20):
+        s = await _open_session(app, ctx, user, "隔天決定")
+        await _send_photo(app, ctx, user, "old_dup", msg_id)
+        await s.pipeline.settle()
+        await upload._finalize_upload(ctx, s, timed_out=False)
+
+    old_msg = InaccessibleDummyMessage(1, 1222)
+    await upload.handle_duplicate_skip(
+        DummyUpdate(user, None, DummyCallbackQuery("dup_skip", user, old_msg)), ctx
+    )
+
+    assert len(list(dest_dir.glob("*.jpg"))) == 1
+    assert app.bot_data["sessions"].get_pending_duplicates(1222) is None
+    assert any("完成" in m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1222)
+
+
+@pytest.mark.asyncio
+async def test_last_batch_expires_and_frees_memory(env):
+    """
+    已完成批次的紀錄（供「↩️ 這批傳錯了」用）超過 LAST_BATCH_MAX_MIN 要回收。
+    實測 3000 張約 2 MB／人，是 bot 本身記憶體的一半以上，值得回收。
+    """
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+    ctx = DummyContext(app)
+    user = DummyUser(1230, "過期測試")
+    sessions = app.bot_data["sessions"]
+
+    session = await _open_session(app, ctx, user, "會過期的批次")
+    await _send_photo(app, ctx, user, "exp_1", 10)
+    await session.pipeline.settle()
+    await upload._finalize_upload(ctx, session, timed_out=False)
+
+    batch = sessions.get_last_batch(1230)
+    assert batch is not None, "剛完成時要留著，才能用「這批傳錯了」"
+
+    # 還沒到期：不可以被清掉
+    assert sessions.purge_expired_batches(720) == 0
+    assert sessions.get_last_batch(1230) is not None
+
+    # 超過 12 小時：回收
+    batch.completed_at = datetime.now() - timedelta(hours=13)
+    assert sessions.purge_expired_batches(720) == 1
+    assert sessions.get_last_batch(1230) is None, "過期後要釋放記憶體"
+
+
+@pytest.mark.asyncio
+async def test_correction_on_expired_batch_explains_clearly(env):
+    """
+    批次紀錄被回收後（或 bot 重啟過），按鈕還在但點下去程式已不知道那批是哪些照片。
+    **必須明確說明，而且要講清楚照片沒有不見**——原本是直接 return，一句話都不回，
+    使用者會以為壞掉了。
+    """
+    app, *_ = env
+    ctx = DummyContext(app)
+    user = DummyUser(1231, "紀錄沒了")
+    members: MembersStore = app.bot_data["members"]
+    members.register(1231, "紀錄沒了")
+    members.approve(1231)
+
+    # 模擬「批次紀錄已被回收 / bot 重啟後」的狀態
+    assert app.bot_data["sessions"].get_last_batch(1231) is None
+
+    msg = DummyMessage(20, "", 1231, app.bot)
+    await upload.handle_correction_button(
+        DummyUpdate(user, msg, DummyCallbackQuery("correction", user, msg)), ctx
+    )
+
+    texts = [m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1231]
+    assert texts, "不可以無聲無息什麼都不回"
+    assert any("沒有不見" in t for t in texts), "要講清楚照片還在，否則使用者會嚇到"
+    assert ctx.user_data.get(upload.AWAITING_CORRECTION_FLAG) is not True,         "不該進入等待輸入資料夾的狀態"
+
+
+@pytest.mark.asyncio
+async def test_purge_does_not_touch_files(env):
+    """回收只碰記憶體，實體照片與 CSV 完全不受影響。"""
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+    ctx = DummyContext(app)
+    user = DummyUser(1232, "只清記憶體")
+    dest = nas_dir / "檔案還在"
+
+    session = await _open_session(app, ctx, user, "檔案還在")
+    await _send_photo(app, ctx, user, "keep_file", 10)
+    await session.pipeline.settle()
+    await upload._finalize_upload(ctx, session, timed_out=False)
+
+    files_before = sorted(f.name for f in dest.glob("*.jpg"))
+    logs: DataLogs = app.bot_data["logs"]
+    index_before = len(logs.file_index.read_all_rows())
+
+    b = app.bot_data["sessions"].get_last_batch(1232)
+    b.completed_at = datetime.now() - timedelta(hours=13)
+    app.bot_data["sessions"].purge_expired_batches(720)
+
+    assert sorted(f.name for f in dest.glob("*.jpg")) == files_before, "照片一張都不能少"
+    assert len(logs.file_index.read_all_rows()) == index_before, "CSV 紀錄不受影響"
+
+
+@pytest.mark.asyncio
+async def test_correction_done_offers_buttons_and_allows_second_correction(env):
+    """
+    「↩️ 這批傳錯了」搬完之後的完成訊息，也要有「📷 再傳一批」與「↩️ 這批傳錯了」。
+
+    關鍵：「最近一批」必須改指向**新位置**。搬到 B 之後才發現 B 也不對時要能再搬到 C；
+    若沿用舊批次，它的 corrected 已是 True，按鈕點下去會完全沒反應——比沒有按鈕更糟。
+    """
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+    ctx = DummyContext(app)
+    user = DummyUser(1240, "連續更正")
+    members: MembersStore = app.bot_data["members"]
+    members.register(1240, "連續更正")
+    members.approve(1240)
+
+    a = nas_dir / "A夾"
+    a.mkdir(parents=True, exist_ok=True)
+    photo = a / "20260725_120000_aaaa1111.jpg"
+    photo.write_bytes(b"photo-content")
+    app.bot_data["sessions"].set_last_batch(upload.CompletedBatch(
+        telegram_id=1240, folder="A夾", destination_label="家裡硬碟", files=[],
+        written_paths={"家裡硬碟": [("fid_x", photo)]}, completed_at=datetime.now(),
+    ))
+
+    # 第一次更正 A → B
+    m1 = DummyMessage(20, "", 1240, app.bot)
+    await upload.handle_correction_button(
+        DummyUpdate(user, m1, DummyCallbackQuery("correction", user, m1)), ctx
+    )
+    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(21, "B夾", 1240, app.bot)), ctx)
+    await drain_background_tasks(app)
+
+    assert (nas_dir / "B夾" / photo.name).exists()
+    done = [m for m in app.bot.sent_messages
+            if m["chat_id"] == 1240 and "改放到" in m["text"]][-1]
+    assert done["reply_markup"] is not None, "完成訊息要有按鈕"
+    cbs = [b.callback_data for r in done["reply_markup"].inline_keyboard for b in r]
+    assert "upload_again" in cbs and "correction" in cbs
+
+    # 「最近一批」要指向新位置，才能再更正一次
+    batch = app.bot_data["sessions"].get_last_batch(1240)
+    assert batch is not None and batch.folder == "B夾"
+    assert batch.corrected is False, "新批次不可帶著舊的已更正旗標"
+
+    # 第二次更正 B → C
+    m2 = DummyMessage(30, "", 1240, app.bot)
+    await upload.handle_correction_button(
+        DummyUpdate(user, m2, DummyCallbackQuery("correction", user, m2)), ctx
+    )
+    assert ctx.user_data.get(upload.AWAITING_CORRECTION_FLAG) is True, "第二次也要能進更正流程"
+    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(31, "C夾", 1240, app.bot)), ctx)
+    await drain_background_tasks(app)
+
+    assert (nas_dir / "C夾" / photo.name).exists(), "要能從 B 再搬到 C"
+    # 零刪除：A、B 的原檔都還在，由待清理清單交管理員處理
+    assert photo.exists() and (nas_dir / "B夾" / photo.name).exists()
+
+    logs: DataLogs = app.bot_data["logs"]
+    rows = [r for r in logs.upload_log.read_all_rows() if r["結果"] == "傳錯更正"]
+    assert len(rows) == 2
+    assert rows[0]["資料夾"] == "A夾 → B夾"
+    assert rows[1]["資料夾"] == "B夾 → C夾"
