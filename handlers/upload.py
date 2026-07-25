@@ -23,7 +23,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Optional  # noqa: F401 - 型別註記用
 
 from telegram import Update
 from telegram.constants import ChatAction
@@ -914,18 +914,30 @@ async def handle_continue_receiving_button(update: Update, context: ContextTypes
     await query.message.reply_text(notify.user_msg_continue_receiving(), reply_markup=in_session_keyboard(show_finish=True))
 
 
-def _onedrive_release_job_name() -> str:
-    # 每批各自獨立排程、各自釋放各自的檔案清單，不像 debounce 需要互相取消，
-    # 故不必是唯一鍵；只需要一個可辨識的名稱方便在 log／除錯時查找。
-    return f"onedrive_release:{datetime.now().timestamp()}"
+ONEDRIVE_RELEASE_JOB_PREFIX = "onedrive_release:"
+
+
+def _data_dir(context: ContextTypes.DEFAULT_TYPE) -> Path:
+    return context.application.bot_data["data_dir"]
 
 
 async def _release_onedrive_space_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    paths = context.job.data["paths"]
+    """時間到了，真正對這批檔案下 attrib +U -P，並把待辦劃掉。"""
+    data = context.job.data
+    paths = data["paths"]
+    batch_id = data.get("batch_id")
     await asyncio.to_thread(storage.free_onedrive_space, paths)
+    if batch_id:
+        try:
+            await asyncio.to_thread(storage.remove_pending_release, _data_dir(context), batch_id)
+        except Exception:
+            logger.exception("移除 OneDrive 釋放待辦失敗（batch_id=%s）", batch_id)
 
 
-async def _schedule_onedrive_release(context: ContextTypes.DEFAULT_TYPE, paths: list) -> None:
+async def _schedule_onedrive_release(
+    context: ContextTypes.DEFAULT_TYPE, paths: list,
+    delay_sec: Optional[float] = None, batch_id: Optional[str] = None, persist: bool = True,
+) -> None:
     """
     延遲執行 OneDrive「釋放本機空間」（規格書 §4.2）。
 
@@ -933,22 +945,74 @@ async def _schedule_onedrive_release(context: ContextTypes.DEFAULT_TYPE, paths: 
     雲端，雲端還沒有副本可以「僅線上」，`attrib +U` 沒有東西可以指向、不會
     生效——之後 OneDrive 自己完成上傳，預設會把剛同步好的檔案留在本機，
     使用者會誤以為「被自動下載」，但其實我們的標記從頭到尾就沒生效過。
-    延遲一段時間（預設 `ONEDRIVE_FREE_SPACE_DELAY_MIN` 分鐘，即 session 逾時
-    的同一個時間尺度），給 OneDrive 足夠時間完成上傳，標記才會真正生效。
+
+    ⚠️ 排程掛在 PTB 的 AsyncIOScheduler，那是**行程內記憶體**，bot 一關就沒了。
+    故同步落地一份待辦檔，啟動時掃描補做（見 `startup_resume_onedrive_release`），
+    否則凡是在延遲期間關掉 bot 的批次，標記就永遠不會下。
     """
     config = context.application.bot_data["config"]
-    delay_min = _cfg(config, "ONEDRIVE_FREE_SPACE_DELAY_MIN")
+    if delay_sec is None:
+        delay_sec = _cfg(config, "ONEDRIVE_FREE_SPACE_DELAY_MIN") * 60
+    if batch_id is None:
+        batch_id = f"{datetime.now().timestamp()}"
+
+    if persist:
+        due_at = (datetime.now() + timedelta(seconds=delay_sec)).strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            await asyncio.to_thread(
+                storage.add_pending_release, _data_dir(context), batch_id, due_at, paths
+            )
+        except Exception:
+            logger.exception("寫入 OneDrive 釋放待辦失敗，該批重啟後將無法補做")
+
     job_queue = context.application.job_queue
     if job_queue is None:
         # 沒有 job queue 就沒有延遲排程的能力，退回立即執行（best effort，
         # 仍優於完全不釋放空間），並記 log 說明這不是理想時機。
         logger.warning("job_queue 不存在，OneDrive 釋放空間退回立即執行（可能因太早而不生效）")
         await asyncio.to_thread(storage.free_onedrive_space, paths)
+        if persist:
+            await asyncio.to_thread(storage.remove_pending_release, _data_dir(context), batch_id)
         return
+
     job_queue.run_once(
-        _release_onedrive_space_job, when=delay_min * 60,
-        name=_onedrive_release_job_name(), data={"paths": paths},
+        _release_onedrive_space_job, when=delay_sec,
+        name=f"{ONEDRIVE_RELEASE_JOB_PREFIX}{batch_id}",
+        data={"paths": paths, "batch_id": batch_id},
     )
+
+
+async def resume_pending_onedrive_releases(context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    啟動時掃描待辦檔：已到期的立刻執行，未到期的重新排回 job queue。
+    回傳處理的批次數，供啟動日誌使用（規格書 §4.2、§17）。
+    """
+    data_dir = _data_dir(context)
+    try:
+        entries = await asyncio.to_thread(storage.read_pending_releases, data_dir)
+    except Exception:
+        logger.exception("讀取 OneDrive 釋放待辦失敗")
+        return 0
+
+    now = datetime.now()
+    for entry in entries:
+        paths = entry.get("paths") or []
+        batch_id = entry.get("batch_id")
+        if not paths or not batch_id:
+            continue
+        try:
+            due = datetime.strptime(entry.get("due_at", ""), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            due = now  # 時間欄壞掉就當作已到期，寧可早做也不要漏做
+        remaining = (due - now).total_seconds()
+        # 已到期的不要真的用 0 秒立刻跑——重新排一小段緩衝，讓 OneDrive 在
+        # 開機/重啟後有時間把同步狀態接回來。
+        await _schedule_onedrive_release(
+            context, paths, delay_sec=max(remaining, 30), batch_id=batch_id, persist=False,
+        )
+    if entries:
+        logger.info("已接回 %s 批未完成的 OneDrive 釋放空間排程", len(entries))
+    return len(entries)
 
 
 async def _debounce_fire(context: ContextTypes.DEFAULT_TYPE) -> None:

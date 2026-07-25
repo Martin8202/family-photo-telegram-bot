@@ -162,6 +162,7 @@ class DummyApplication:
             "sessions": SessionManager(),
             "notifier": notify.Notifier(self.bot, admin_id=999999),
             "config": config,
+            "data_dir": data_dir,
         }
         # 動態設定測試專用路徑
         config.TEMP_DIR = str(temp_dir)
@@ -1378,3 +1379,57 @@ async def test_onedrive_release_skipped_when_disabled(env, monkeypatch):
         assert not [j for j in app.job_queue.jobs if j.name.startswith("onedrive_release:")]
     finally:
         config.ONEDRIVE_FREE_SPACE = original
+
+
+@pytest.mark.asyncio
+async def test_onedrive_release_survives_restart(env, monkeypatch):
+    """
+    排程掛在 PTB 的 AsyncIOScheduler，那是行程內記憶體——bot 一關就消失。
+    沒有持久化的話，凡是在延遲的 10 分鐘內被關掉的批次，「僅線上」標記
+    就永遠不會下（實測期間光是改 code 就重啟了五、六次）。
+
+    故排程時必須同步落地待辦檔，啟動時掃描補做（比照 §4.3 側車檔的做法）。
+    """
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+    ctx = DummyContext(app)
+    user = DummyUser(1070, "十嬸")
+
+    called = []
+    monkeypatch.setattr(storage, "free_onedrive_space", lambda paths: called.append(list(paths)))
+
+    session = await _open_session(app, ctx, user, "重啟測試", dest="OneDrive")
+    await _send_photo(app, ctx, user, "restart_1", 10)
+    await session.pipeline.settle()
+    await upload._finalize_upload(ctx, session, timed_out=False)
+
+    # 待辦檔要落地，而且帶著到期時間與這批的實際路徑
+    pending = storage.read_pending_releases(data_dir)
+    assert len(pending) == 1, "排程時必須同步寫一份待辦檔"
+    assert pending[0]["paths"], "要記下這批寫入 OneDrive 的檔案"
+    assert pending[0]["due_at"], "要記下到期時間"
+    assert called == [], "還沒到期，不該執行"
+
+    # ── 模擬重啟：job queue 清空（記憶體裡的排程沒了），但待辦檔還在 ──
+    app.job_queue.jobs.clear()
+    resumed = await upload.resume_pending_onedrive_releases(ctx)
+    assert resumed == 1, "啟動時要把待辦接回來"
+
+    jobs = [j for j in app.job_queue.jobs if j.name.startswith(upload.ONEDRIVE_RELEASE_JOB_PREFIX)]
+    assert len(jobs) == 1, "接回來的待辦要重新排進 job queue"
+
+    # 時間到了執行，檔案被標記，待辦也要被劃掉
+    ctx.job = jobs[0]
+    await upload._release_onedrive_space_job(ctx)
+    assert len(called) == 1
+    assert storage.read_pending_releases(data_dir) == [], "執行完要把待辦移除，不可重複執行"
+
+
+@pytest.mark.asyncio
+async def test_pending_release_file_survives_corruption(env):
+    """待辦檔壞掉時只當作沒有待辦，不可讓啟動流程崩潰。"""
+    app, data_dir, *_ = env
+    (data_dir / storage.PENDING_RELEASE_FILENAME).write_text("{ 這不是合法 JSON", encoding="utf-8")
+    assert storage.read_pending_releases(data_dir) == []
+
+    ctx = DummyContext(app)
+    assert await upload.resume_pending_onedrive_releases(ctx) == 0

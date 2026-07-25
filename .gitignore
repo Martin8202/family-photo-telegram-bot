@@ -4,6 +4,7 @@ config.py
 
 # 家人清單與執行期資料
 data/
+pending_onedrive_release.json
 pending/
 
 # Log

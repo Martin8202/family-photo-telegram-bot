@@ -300,9 +300,30 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         pass  # 連錯誤通知都送不出去時，不能再往外拋而讓錯誤處理本身變成新的錯誤
 
 
+async def startup_resume_onedrive_release(app: Application) -> None:
+    """
+    接回上次關機前尚未執行的 OneDrive 釋放空間排程（規格書 §4.2）。
+
+    排程本身掛在行程內的 AsyncIOScheduler，bot 一關就消失；沒有這一步的話，
+    凡是在延遲期間被關掉的批次，「僅線上」標記就永遠不會下。
+    """
+    cfg = app.bot_data["config"]
+    if not getattr(cfg, "ONEDRIVE_FREE_SPACE", True):
+        return
+
+    class _Ctx:  # 啟動階段還沒有真正的 CallbackContext，包一個最小的替身
+        application = app
+
+    try:
+        await upload.resume_pending_onedrive_releases(_Ctx())
+    except Exception:
+        logger.exception("接回 OneDrive 釋放空間排程失敗")
+
+
 async def on_startup(app: Application) -> None:
     await startup_health_check(app)
     await startup_recover_temp(app)
+    await startup_resume_onedrive_release(app)
     await app.bot.set_my_commands([BotCommand("start", "開始使用")])
 
 
@@ -320,6 +341,7 @@ def build_application() -> Application:
     app.bot_data["sessions"] = sessions
     app.bot_data["notifier"] = notifier
     app.bot_data["config"] = config
+    app.bot_data["data_dir"] = DATA_DIR
 
     app.add_handler(CommandHandler("start", register.handle_start))
 
