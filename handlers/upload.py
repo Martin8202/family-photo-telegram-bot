@@ -50,6 +50,7 @@ from keyboards import (
     in_session_keyboard,
     restart_confirm_keyboard,
     restart_row,
+    start_upload_keyboard,
     with_restart,
 )
 from state import (
@@ -234,9 +235,11 @@ async def handle_start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def _set_folder_and_ask_destination(update_message, context: ContextTypes.DEFAULT_TYPE, session, folder_name: str):
     _, _, config, _, _ = _services(context)
-    folder_name = storage.sanitize_folder_name(folder_name)
-    if not folder_name:
-        await update_message.reply_text("資料夾名稱不能是空的或全部是特殊符號，請重新輸入")
+    try:
+        folder_name = storage.validate_folder_name(folder_name)
+    except storage.FolderNameError as exc:
+        # 明確告訴使用者哪裡不合規則、請他改名，而不是靜默改掉他取的名字
+        await update_message.reply_text(str(exc))
         return
     session.folder = folder_name
     session.enter_stage(STAGE_AWAITING_DESTINATION)
@@ -252,10 +255,11 @@ async def handle_folder_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # 上一次上傳已經完成、session 早已被清除（session is None）之後，
     # 若放在 session 檢查之後，會被下面的 early return 攔截而永遠進不來。
     if _correction_flag_active(context):
-        new_folder = storage.sanitize_folder_name(update.effective_message.text or "")
-        if not new_folder:
-            # 名稱過濾後是空的：保留待輸入狀態、明確請他重打，不可靜默無反應（§7 第 10 點）
-            await update.effective_message.reply_text("資料夾名稱不能是空的或全部是特殊符號，請重新輸入")
+        try:
+            new_folder = storage.validate_folder_name(update.effective_message.text or "")
+        except storage.FolderNameError as exc:
+            # 保留待輸入狀態、明確請他重打，不可靜默無反應（§7 第 10 點）
+            await update.effective_message.reply_text(str(exc))
             return True
         _clear_correction_flag(context)
         await _apply_correction(update, context, new_folder)
@@ -951,6 +955,7 @@ async def handle_restart_button(update: Update, context: ContextTypes.DEFAULT_TY
     session = sessions.get(update.effective_user.id)
     if session is None:
         return
+    session.stage_before_restart_confirm = session.stage
     session.enter_stage(STAGE_AWAITING_RESTART_CONFIRM)
     await query.message.reply_text(
         notify.user_msg_restart_confirm(session.received_count),
@@ -992,17 +997,49 @@ async def handle_restart_confirm(update: Update, context: ContextTypes.DEFAULT_T
         await _safe_delete_temp(session.temp_dir, Path(config.TEMP_DIR))
 
     sessions.clear(telegram_id)
-    await query.message.reply_text(notify.user_msg_restart_done())
+    # §5.1「任何狀態下畫面上永遠有可點的按鈕」：回到起點時要把「📷 我要上傳照片」
+    # 重新遞給使用者，不能只留一句話讓他不知道下一步該點哪裡。
+    await query.message.reply_text(notify.user_msg_restart_done(), reply_markup=start_upload_keyboard())
 
 
 async def handle_restart_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await _safe_answer(query)
-    _, _, _, sessions, _ = _services(context)
-    session = sessions.get(update.effective_user.id)
+    members, _, config, sessions, _ = _services(context)
+    telegram_id = update.effective_user.id
+    session = sessions.get(telegram_id)
     if session is None:
         return
-    session.enter_stage(STAGE_RECEIVING_PHOTOS)
+
+    # 回到「按下重新開始之前」所處的階段，而不是一律假設使用者原本正在傳照片。
+    # 「🔄 重新開始」在 session 全程可見（§6.5），使用者很可能是在還沒選資料夾、
+    # 或還沒選目的地時誤觸的——那時候根本還沒有「原本的上傳」可以繼續，
+    # 直接跳到收件階段會讓他卡在一個沒有資料夾、也沒有目的地的狀態。
+    previous = session.stage_before_restart_confirm or STAGE_RECEIVING_PHOTOS
+    session.stage_before_restart_confirm = None
+    session.enter_stage(previous)
+
+    if previous == STAGE_AWAITING_FOLDER:
+        recent = members.get_recent_folders(telegram_id)
+        if recent:
+            await query.message.reply_text(
+                "好的，那就繼續。請選一個最近用過的資料夾，或直接打字輸入新資料夾名稱：",
+                reply_markup=with_restart(folder_choice_keyboard(recent)),
+            )
+        else:
+            await query.message.reply_text(
+                "好的，那就繼續。請直接打字輸入資料夾名稱：",
+                reply_markup=InlineKeyboardMarkup([restart_row()]),
+            )
+        return
+
+    if previous == STAGE_AWAITING_DESTINATION:
+        await query.message.reply_text(
+            f"好的，那就繼續。\n資料夾：{session.folder}\n請選擇要存到哪裡：",
+            reply_markup=with_restart(destination_keyboard(config.ENABLE_NAS)),
+        )
+        return
+
     await query.message.reply_text("好的，繼續原本的上傳", reply_markup=in_session_keyboard())
 
 
@@ -1056,6 +1093,8 @@ async def handle_correction_folder_button(update: Update, context: ContextTypes.
     await _safe_answer(query)
     if not _correction_flag_active(context):
         return
+    # 這裡的名稱來自我們自己產生的「近期資料夾」按鈕，必然已經是合規的，
+    # 仍走一次 sanitize 當作防線即可，不需要對使用者報錯。
     folder_name = storage.sanitize_folder_name(query.data[len(CB_CORRECTION_FOLDER_PREFIX):])
     if not folder_name:
         return

@@ -122,10 +122,90 @@ def unique_destination(dest_dir: Path, filename: str) -> Path:
 
 INVALID_FOLDER_CHARS = '/\\:*?"<>|'
 
+MAX_FOLDER_NAME_LENGTH = 100
+
+# Windows 保留的裝置名稱，不能拿來當資料夾名
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+class FolderNameError(ValueError):
+    """
+    資料夾名稱不符合命名規則。
+
+    例外訊息是**要直接回覆給使用者看的中文說明**，故一律寫成長輩看得懂的句子，
+    不揭露技術細節（規格書 §2「對家人友善」）。
+    """
+
+
+def _has_control_char(text: str) -> bool:
+    return any(ord(c) < 32 or ord(c) == 127 for c in text)
+
+
+def validate_folder_name(name: str) -> str:
+    """
+    檢查使用者輸入的資料夾名稱能不能安全地當成 Windows 路徑的一段。
+    合格則回傳去掉頭尾空白的名稱；不合格則丟 `FolderNameError`，訊息可直接回覆使用者。
+
+    **刻意「檢查並退回」而不是「靜默修正」**：使用者打的名字就是他要的相簿名。
+    實測踩過的坑是使用者輸入 `2026-07-025大量測試` 時中間夾了一個換行字元
+    （手機輸入法斷行或複製貼上帶進來的），Windows 直接回 WinError 123
+    「檔案名稱、目錄名稱或磁碟區標籤語法錯誤」而讓整個流程中斷。若改成自動把
+    換行換成空白，會產生一個 `2026-07-0 25大量測試` 這種使用者沒預期的資料夾，
+    日後也對不上——明確請他改名比較不會出錯。
+    """
+    if name is None:
+        raise FolderNameError("資料夾名稱不能是空的，請重新輸入")
+
+    if _has_control_char(name):
+        raise FolderNameError(
+            "資料夾名稱裡不能有換行，請把名稱打在同一行之後再傳一次\n"
+            "（如果是複製貼上的，貼上時可能不小心帶進了換行）"
+        )
+
+    cleaned = name.strip()
+    if not cleaned:
+        raise FolderNameError("資料夾名稱不能是空的，請重新輸入")
+
+    bad = sorted({c for c in cleaned if c in INVALID_FOLDER_CHARS})
+    if bad:
+        raise FolderNameError(
+            f"資料夾名稱裡不能有這些符號：{' '.join(bad)}\n請換一個名字再傳一次"
+        )
+
+    if len(cleaned) > MAX_FOLDER_NAME_LENGTH:
+        raise FolderNameError(f"資料夾名稱太長了（最多 {MAX_FOLDER_NAME_LENGTH} 個字），請取短一點")
+
+    if cleaned.endswith("."):
+        raise FolderNameError("資料夾名稱的結尾不能是「.」，請換一個名字再傳一次")
+
+    if cleaned.upper() in _WINDOWS_RESERVED_NAMES:
+        raise FolderNameError(f"「{cleaned}」是電腦的保留名稱，不能當資料夾名，請換一個")
+
+    return cleaned
+
 
 def sanitize_folder_name(name: str) -> str:
-    """過濾資料夾名稱中的路徑非法字元，避免路徑錯誤。"""
-    cleaned = "".join(c for c in name if c not in INVALID_FOLDER_CHARS).strip()
+    """
+    把字串強制整理成安全的路徑片段，**不會失敗**。
+
+    這是給「不該因為名稱不漂亮就中斷」的內部用途使用的（例如用成員姓名組出
+    暫存資料夾名）。使用者親手輸入的資料夾名稱請改用 `validate_folder_name()`，
+    那條路要明確退回請他改名，而不是靜默改掉他取的名字。
+    """
+    if not name:
+        return ""
+    # 控制字元（換行、Tab…）一律視為空白：留著必定讓 Windows 拒絕整條路徑
+    cleaned = "".join(" " if (ord(c) < 32 or ord(c) == 127) else c for c in name)
+    cleaned = "".join(c for c in cleaned if c not in INVALID_FOLDER_CHARS)
+    cleaned = " ".join(cleaned.split())          # 連續空白收斂，並去掉頭尾
+    cleaned = cleaned[:MAX_FOLDER_NAME_LENGTH]
+    cleaned = cleaned.rstrip(". ")               # Windows 不允許結尾是點或空白
+    if cleaned.upper() in _WINDOWS_RESERVED_NAMES:
+        cleaned += "_"
     return cleaned
 
 

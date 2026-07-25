@@ -71,7 +71,7 @@ def destination_keyboard(enable_nas: bool = True) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🏠 {DEST_NAS_LABEL}", callback_data=f"{CB_DEST_PREFIX}{DEST_NAS_LABEL}")],
         [InlineKeyboardButton(f"☁️ {DEST_ONEDRIVE_LABEL}", callback_data=f"{CB_DEST_PREFIX}{DEST_ONEDRIVE_LABEL}")],
-        [InlineKeyboardButton(f"📦 {DEST_BOTH_LABEL}", callback_data=f"{CB_DEST_PREFIX}{DEST_BOTH_LABEL}")],
+        [InlineKeyboardButton(f"🏠☁️ {DEST_BOTH_LABEL}", callback_data=f"{CB_DEST_PREFIX}{DEST_BOTH_LABEL}")],
     ])
 
 

@@ -278,3 +278,59 @@ def test_read_session_info_missing_returns_none(tmp_path):
 def test_read_session_info_corrupted_returns_none(tmp_path):
     (tmp_path / storage.SESSION_INFO_FILENAME).write_text("{not valid json", encoding="utf-8")
     assert storage.read_session_info(tmp_path) is None
+
+
+# ── 資料夾名稱驗證（實測 WinError 123 的回歸測試）────────────────
+
+def test_validate_folder_name_rejects_newline():
+    """
+    實測踩到的 crash：使用者輸入「2026-07-025大量測試」時中間夾了換行
+    （手機輸入法斷行或複製貼上帶進來），舊版的過濾器不擋換行，直接把它
+    帶進路徑，Windows 回 WinError 123 讓整個上傳流程中斷。
+    """
+    with pytest.raises(storage.FolderNameError) as exc:
+        storage.validate_folder_name("2026-07-0\n25大量測試")
+    assert "換行" in str(exc.value)
+
+
+def test_validate_folder_name_rejects_other_control_chars():
+    for bad in ["a\tb", "a\rb", "a\x00b"]:
+        with pytest.raises(storage.FolderNameError):
+            storage.validate_folder_name(bad)
+
+
+def test_validate_folder_name_rejects_path_chars_and_names_them():
+    with pytest.raises(storage.FolderNameError) as exc:
+        storage.validate_folder_name("阿嬤/生日")
+    msg = str(exc.value)
+    assert "/" in msg and "換一個名字" in msg
+
+
+def test_validate_folder_name_rejects_empty_and_whitespace_only():
+    for bad in ["", "   "]:
+        with pytest.raises(storage.FolderNameError):
+            storage.validate_folder_name(bad)
+
+
+def test_validate_folder_name_rejects_trailing_dot_and_reserved_and_too_long():
+    with pytest.raises(storage.FolderNameError):
+        storage.validate_folder_name("過年聚餐.")
+    with pytest.raises(storage.FolderNameError):
+        storage.validate_folder_name("CON")
+    with pytest.raises(storage.FolderNameError):
+        storage.validate_folder_name("長" * (storage.MAX_FOLDER_NAME_LENGTH + 1))
+
+
+def test_validate_folder_name_accepts_normal_names_and_trims():
+    assert storage.validate_folder_name("  阿嬤生日  ") == "阿嬤生日"
+    assert storage.validate_folder_name("2026-07-25大量測試") == "2026-07-25大量測試"
+    assert storage.validate_folder_name("110嘉義家族旅遊") == "110嘉義家族旅遊"
+
+
+def test_sanitize_folder_name_never_produces_invalid_path():
+    """sanitize 是內部用（例如成員姓名組暫存夾），不能失敗，但也絕不能吐出非法路徑。"""
+    assert "\n" not in storage.sanitize_folder_name("元\n皓")
+    assert storage.sanitize_folder_name("元\n皓") == "元 皓"
+    assert storage.sanitize_folder_name("結尾點.") == "結尾點"
+    assert storage.sanitize_folder_name("CON") == "CON_"
+    assert len(storage.sanitize_folder_name("長" * 500)) <= storage.MAX_FOLDER_NAME_LENGTH

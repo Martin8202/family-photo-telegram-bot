@@ -22,7 +22,10 @@ DEST_BOTH_LABEL = "兩邊都存"
 DEST_ICONS = {
     DEST_NAS_LABEL: "🏠",
     DEST_ONEDRIVE_LABEL: "☁️",
-    DEST_BOTH_LABEL: "📦",
+    # 「兩邊都存」直接用「房子＋雲」的組合，而不是另一個無關的圖示（原為 📦）：
+    # 使用者在「近 3 次資料夾」清單看到 🏠☁️ 時，一眼就能意會「這個資料夾上次
+    # 兩邊都存了」，不必另外記憶第三個符號代表什麼（規格書 §6.2）。
+    DEST_BOTH_LABEL: "🏠☁️",
 }
 
 STAGE_AWAITING_FOLDER = "awaiting_folder"
@@ -101,6 +104,9 @@ class UploadSession:
     pending_media_group_ids: set = field(default_factory=set)
     finish_clicked: bool = False
     restart_clicked: bool = False
+    # 按下「🔄 重新開始」進入二次確認之前所處的階段。使用者按「取消」時要回到
+    # 這裡，而不是一律假設他原本正在傳照片（可能是在選資料夾階段誤觸的）。
+    stage_before_restart_confirm: Optional[str] = None
     compressed_warned: bool = False
     counter_message_id: Optional[int] = None  # 收件計數訊息 id，刪舊發新置底顯示（§6.3.1）
     confirm_message_id: Optional[int] = None  # 「確認中…」訊息 id，緩衝期間更新張數

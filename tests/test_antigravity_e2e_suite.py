@@ -924,3 +924,92 @@ async def test_redownload_integration(env):
 
     assert len(succeeded) == 1
     assert (target_download_dir / "photo1.jpg").exists()
+
+
+@pytest.mark.asyncio
+async def test_restart_cancel_returns_to_previous_stage_not_receiving(env):
+    """
+    §6.5：「🔄 重新開始」在 session 全程可見，使用者可能在**還沒選資料夾**時誤觸。
+    此時按「❌ 取消」應該回到選資料夾，而不是跳到「繼續原本的上傳」——那時候
+    根本還沒有原本的上傳，直接進收件階段會讓他卡在沒有資料夾也沒有目的地的狀態。
+    """
+    app, *_ = env
+    ctx = DummyContext(app)
+    user = DummyUser(1020, "小舅")
+    members: MembersStore = app.bot_data["members"]
+    members.register(1020, "小舅")
+    members.approve(1020)
+    members.push_recent_folder(1020, "上次的夾", "兩邊都存")
+
+    await upload.handle_start_upload(DummyUpdate(user, DummyMessage(1, "📷 我要上傳照片", 1020, app.bot)), ctx)
+    session = app.bot_data["sessions"].get(1020)
+    assert session.stage == "awaiting_folder"
+
+    # 在選資料夾階段誤觸「🔄 重新開始」
+    r_msg = DummyMessage(2, "", 1020, app.bot)
+    await upload.handle_restart_button(DummyUpdate(user, r_msg, DummyCallbackQuery("restart", user, r_msg)), ctx)
+    assert session.stage == "awaiting_restart_confirm"
+
+    # 按「取消」
+    c_msg = DummyMessage(3, "", 1020, app.bot)
+    await upload.handle_restart_cancel(
+        DummyUpdate(user, c_msg, DummyCallbackQuery("restart_cancel", user, c_msg)), ctx
+    )
+
+    assert session.stage == "awaiting_folder", "要回到選資料夾，不是跳到收件階段"
+    last = app.bot.sent_messages[-1]
+    assert "資料夾" in last["text"]
+    callbacks = [b.callback_data for row in last["reply_markup"].inline_keyboard for b in row]
+    assert "recent:上次的夾" in callbacks, "要重新給他近期資料夾按鈕"
+
+
+@pytest.mark.asyncio
+async def test_restart_cancel_from_receiving_stage_continues_upload(env):
+    """在收件階段誤觸重新開始並取消時，維持原本行為：繼續原本的上傳。"""
+    app, *_ = env
+    ctx = DummyContext(app)
+    user = DummyUser(1021, "小姨")
+    session = await _open_session(app, ctx, user, "繼續傳")
+    await _send_photo(app, ctx, user, "r1", 10)
+
+    r_msg = DummyMessage(20, "", 1021, app.bot)
+    await upload.handle_restart_button(DummyUpdate(user, r_msg, DummyCallbackQuery("restart", user, r_msg)), ctx)
+    c_msg = DummyMessage(21, "", 1021, app.bot)
+    await upload.handle_restart_cancel(
+        DummyUpdate(user, c_msg, DummyCallbackQuery("restart_cancel", user, c_msg)), ctx
+    )
+
+    assert session.stage == "receiving_photos"
+    assert "繼續原本的上傳" in app.bot.sent_messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_folder_name_with_newline_is_rejected_with_explanation(env):
+    """
+    實測 crash 的端對端回歸：帶換行的資料夾名稱不可以進到路徑裡，
+    要明確請使用者改名，而且 session 必須留在選資料夾階段讓他重打。
+    """
+    app, *_ = env
+    ctx = DummyContext(app)
+    user = DummyUser(1022, "阿伯")
+    members: MembersStore = app.bot_data["members"]
+    members.register(1022, "阿伯")
+    members.approve(1022)
+
+    await upload.handle_start_upload(DummyUpdate(user, DummyMessage(1, "📷 我要上傳照片", 1022, app.bot)), ctx)
+    session = app.bot_data["sessions"].get(1022)
+
+    handled = await upload.handle_folder_text(
+        DummyUpdate(user, DummyMessage(2, "2026-07-0\n25大量測試", 1022, app.bot)), ctx
+    )
+    assert handled is True
+    assert "換行" in app.bot.sent_messages[-1]["text"]
+    assert session.folder is None, "不合規則的名稱不可以被採用"
+    assert session.stage == "awaiting_folder", "要留在選資料夾階段讓他重打"
+
+    # 改成合規的名稱就能正常往下走
+    await upload.handle_folder_text(
+        DummyUpdate(user, DummyMessage(3, "2026-07-25大量測試", 1022, app.bot)), ctx
+    )
+    assert session.folder == "2026-07-25大量測試"
+    assert session.stage == "awaiting_destination"
