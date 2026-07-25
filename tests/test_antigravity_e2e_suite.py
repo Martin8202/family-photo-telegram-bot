@@ -1316,3 +1316,65 @@ async def test_finish_button_edits_status_in_place_never_deletes(env):
     assert edited["message_id"] == status_id_before
     assert "確認中" in edited["text"]
     assert "已收到 1 張" in edited["text"], "張數要留著，這則訊息從頭到尾講同一件事"
+
+
+@pytest.mark.asyncio
+async def test_onedrive_release_is_deferred_not_immediate(env, monkeypatch):
+    """
+    實測 bug 回歸：OneDrive 的「釋放本機空間」不可以在批次一結束就立刻執行。
+
+    那時 OneDrive 用戶端通常還沒把檔案傳到雲端，雲端沒有副本可以「僅線上」，
+    `attrib +U` 沒有東西可以指向、不會生效。實測結果是 24 個檔案的屬性全都
+    只有 A、完全沒有 U——標記從頭到尾就沒生效過。之後 OneDrive 自己完成上傳
+    並把檔案留在本機，使用者看起來就像「照片被自動下載回來了」。
+
+    正確行為（規格書 §4.2）：延遲到 OneDrive 有足夠時間同步完成後才執行。
+    """
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+    ctx = DummyContext(app)
+    user = DummyUser(1060, "八嬸")
+
+    called = []
+    monkeypatch.setattr(storage, "free_onedrive_space", lambda paths: called.append(list(paths)))
+
+    session = await _open_session(app, ctx, user, "雲端測試", dest="OneDrive")
+    await _send_photo(app, ctx, user, "od_1", 10)
+    await session.pipeline.settle()
+    await upload._finalize_upload(ctx, session, timed_out=False)
+
+    # 收尾當下絕對不可以已經執行——那是太早的時機
+    assert called == [], "釋放空間不可以在批次結束當下立刻執行"
+
+    # 而是排了一個延遲的工作
+    release_jobs = [j for j in app.job_queue.jobs if j.name.startswith("onedrive_release:")]
+    assert len(release_jobs) == 1, "應該排一個延遲執行的釋放空間工作"
+    assert release_jobs[0].data["paths"], "要帶著這批實際寫入 OneDrive 的檔案清單"
+
+    # 時間到了才真的執行
+    ctx.job = release_jobs[0]
+    await upload._release_onedrive_space_job(ctx)
+    assert len(called) == 1
+    assert len(called[0]) == 1, "剛剛那一張照片要被標記為僅線上"
+
+
+@pytest.mark.asyncio
+async def test_onedrive_release_skipped_when_disabled(env, monkeypatch):
+    """ONEDRIVE_FREE_SPACE = False 時，完全不排程、也不碰檔案屬性。"""
+    app, *_ = env
+    ctx = DummyContext(app)
+    user = DummyUser(1061, "九叔")
+
+    called = []
+    monkeypatch.setattr(storage, "free_onedrive_space", lambda paths: called.append(list(paths)))
+    original = config.ONEDRIVE_FREE_SPACE
+    try:
+        config.ONEDRIVE_FREE_SPACE = False
+        session = await _open_session(app, ctx, user, "不釋放", dest="OneDrive")
+        await _send_photo(app, ctx, user, "od_off", 10)
+        await session.pipeline.settle()
+        await upload._finalize_upload(ctx, session, timed_out=False)
+
+        assert called == []
+        assert not [j for j in app.job_queue.jobs if j.name.startswith("onedrive_release:")]
+    finally:
+        config.ONEDRIVE_FREE_SPACE = original

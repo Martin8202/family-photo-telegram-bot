@@ -93,6 +93,7 @@ _DEFAULTS = {
     "COUNTER_REANCHOR_SEC": 5,
     "CORRECTION_PROMPT_MAX_MIN": 10,
     "STAGE_STUCK_MAX_MIN": 30,
+    "ONEDRIVE_FREE_SPACE_DELAY_MIN": 10,
     "INACTIVITY_PROMPT_TIMEOUT_SEC": 25,
     "AUTO_APPEND_WINDOW_MIN": 3,
 }
@@ -913,6 +914,43 @@ async def handle_continue_receiving_button(update: Update, context: ContextTypes
     await query.message.reply_text(notify.user_msg_continue_receiving(), reply_markup=in_session_keyboard(show_finish=True))
 
 
+def _onedrive_release_job_name() -> str:
+    # 每批各自獨立排程、各自釋放各自的檔案清單，不像 debounce 需要互相取消，
+    # 故不必是唯一鍵；只需要一個可辨識的名稱方便在 log／除錯時查找。
+    return f"onedrive_release:{datetime.now().timestamp()}"
+
+
+async def _release_onedrive_space_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    paths = context.job.data["paths"]
+    await asyncio.to_thread(storage.free_onedrive_space, paths)
+
+
+async def _schedule_onedrive_release(context: ContextTypes.DEFAULT_TYPE, paths: list) -> None:
+    """
+    延遲執行 OneDrive「釋放本機空間」（規格書 §4.2）。
+
+    ⚠️ 不可以在批次一結束就立刻執行：那時 OneDrive 用戶端通常還沒把檔案傳到
+    雲端，雲端還沒有副本可以「僅線上」，`attrib +U` 沒有東西可以指向、不會
+    生效——之後 OneDrive 自己完成上傳，預設會把剛同步好的檔案留在本機，
+    使用者會誤以為「被自動下載」，但其實我們的標記從頭到尾就沒生效過。
+    延遲一段時間（預設 `ONEDRIVE_FREE_SPACE_DELAY_MIN` 分鐘，即 session 逾時
+    的同一個時間尺度），給 OneDrive 足夠時間完成上傳，標記才會真正生效。
+    """
+    config = context.application.bot_data["config"]
+    delay_min = _cfg(config, "ONEDRIVE_FREE_SPACE_DELAY_MIN")
+    job_queue = context.application.job_queue
+    if job_queue is None:
+        # 沒有 job queue 就沒有延遲排程的能力，退回立即執行（best effort，
+        # 仍優於完全不釋放空間），並記 log 說明這不是理想時機。
+        logger.warning("job_queue 不存在，OneDrive 釋放空間退回立即執行（可能因太早而不生效）")
+        await asyncio.to_thread(storage.free_onedrive_space, paths)
+        return
+    job_queue.run_once(
+        _release_onedrive_space_job, when=delay_min * 60,
+        name=_onedrive_release_job_name(), data={"paths": paths},
+    )
+
+
 async def _debounce_fire(context: ContextTypes.DEFAULT_TYPE) -> None:
     telegram_id = context.job.data["telegram_id"]
     _, _, _, sessions, _ = _services(context)
@@ -1103,7 +1141,8 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
 
     if config.ONEDRIVE_FREE_SPACE and DEST_ONEDRIVE_LABEL in session.destinations:
         onedrive_paths = [p for _, p in session.destinations[DEST_ONEDRIVE_LABEL].written_paths]
-        await asyncio.to_thread(storage.free_onedrive_space, onedrive_paths)
+        if onedrive_paths:
+            await _schedule_onedrive_release(context, onedrive_paths)
 
     session.pipeline = None
     sessions.clear(telegram_id)
