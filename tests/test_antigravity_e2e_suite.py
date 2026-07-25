@@ -762,7 +762,9 @@ async def test_finish_button_survives_expired_callback_query(env):
 
     assert session.stage == "debounce", "answer() 失敗不該中斷後面的結案流程"
     assert session.status_message_id is not None
-    assert any("確認中" in m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1014)
+    shown = [m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1014]
+    shown += [m["text"] for m in app.bot.edited_messages if m["chat_id"] == 1014]
+    assert any("確認中" in t for t in shown)
 
 
 @pytest.mark.asyncio
@@ -1275,3 +1277,42 @@ async def test_existing_folder_is_announced_to_user(env):
         DummyUpdate(user2, dest_msg2, DummyCallbackQuery("dest:家裡硬碟", user2, dest_msg2)), ctx
     )
     assert "已經有了" not in app.bot.sent_messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_finish_button_edits_status_in_place_never_deletes(env):
+    """
+    實測回饋：「我點選沒照片了，那個訊息就被刪除了！」
+
+    按下結束按鈕時，狀態訊息必須**原地編輯**加上「⏳ 確認中」那一行——
+    使用者剛點的按鈕就在這則訊息上，它本來就在眼前，不需要刪掉重發；
+    刪了反而會讓他看到訊息憑空消失。
+    """
+    app, *_ = env
+    ctx = DummyContext(app)
+    user = DummyUser(1050, "七叔")
+    session = await _open_session(app, ctx, user, "不要刪我")
+    await _send_photo(app, ctx, user, "keep_1", 10)
+
+    status_id_before = session.status_message_id
+    assert status_id_before is not None
+    deleted_before = len(app.bot.deleted_messages)
+    edited_before = len(app.bot.edited_messages)
+    sent_before = len(app.bot.sent_messages)
+
+    finish_msg = DummyMessage(20, "", 1050, app.bot)
+    await upload.handle_finish_button(
+        DummyUpdate(user, finish_msg, DummyCallbackQuery("finish", user, finish_msg)), ctx
+    )
+
+    assert session.stage == "debounce"
+    # 關鍵：那則訊息不可以被刪掉，id 也不可以換
+    assert len(app.bot.deleted_messages) == deleted_before, "狀態訊息不該被刪除"
+    assert session.status_message_id == status_id_before, "應該是同一則訊息，不是重發的新訊息"
+    assert len(app.bot.sent_messages) == sent_before, "不該多發一則訊息"
+    # 而是原地編輯，把「確認中」那一行長出來
+    assert len(app.bot.edited_messages) == edited_before + 1
+    edited = app.bot.edited_messages[-1]
+    assert edited["message_id"] == status_id_before
+    assert "確認中" in edited["text"]
+    assert "已收到 1 張" in edited["text"], "張數要留著，這則訊息從頭到尾講同一件事"

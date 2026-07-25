@@ -654,7 +654,7 @@ async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, sessio
 # ── 收照片（事件處理層：毫秒級）────────────────────────
 
 async def _update_status_message(
-    context: ContextTypes.DEFAULT_TYPE, session, message, now: datetime, force_resend: bool = False
+    context: ContextTypes.DEFAULT_TYPE, session, message, now: datetime, prefer_edit: bool = False
 ) -> None:
     """
     更新那**唯一一則**狀態訊息（規格書 §6.3.1）。
@@ -668,28 +668,33 @@ async def _update_status_message(
     - **確認階段**：使用者已停手，改以 `editMessageText` **原地編輯**更新數字——
       單次 API 呼叫、不閃爍、數字直接跳；只有隔了 `COUNTER_REANCHOR_SEC` 秒
       才重新刪舊發新把它拉回底部（緩衝期間仍可能有照片陸續抵達把它推上去）。
-    - `force_resend`：使用者主動點擊按鈕時用，直接重發到對話最下方，
-      確保他立刻在眼前看到回饋。
+    - `prefer_edit`：使用者主動點擊按鈕時用，**一律原地編輯**。他剛點的按鈕就在
+      這則訊息上，訊息本來就在眼前，不需要刪掉重發——刪了反而會讓他看到訊息
+      憑空消失（實測回饋：「我點選沒照片了，那個訊息就被刪除了！」）。
     """
     config = context.application.bot_data["config"]
     confirming = session.stage == STAGE_DEBOUNCE
     text = notify.user_msg_status(session.received_count, session.stored_count, confirming=confirming)
 
-    if confirming and not force_resend and session.status_message_id is not None:
+    use_edit = session.status_message_id is not None and (prefer_edit or confirming)
+    if use_edit and not prefer_edit:
+        # 自動更新時，隔了夠久還是要重新把訊息拉回對話底部（照片會把它推上去）
         reanchor_sec = _cfg(config, "COUNTER_REANCHOR_SEC")
-        need_reanchor = (
-            session.status_last_reanchor is None
-            or (now - session.status_last_reanchor).total_seconds() >= reanchor_sec
-        )
-        if not need_reanchor:
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=session.telegram_id, message_id=session.status_message_id,
-                    text=text, reply_markup=in_session_keyboard(),
-                )
-                return
-            except Exception:
-                pass  # 編輯失敗（訊息被刪、內容完全相同）就退回下面的刪舊發新
+        if (session.status_last_reanchor is None
+                or (now - session.status_last_reanchor).total_seconds() >= reanchor_sec):
+            use_edit = False
+
+    if use_edit:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=session.telegram_id, message_id=session.status_message_id,
+                text=text, reply_markup=in_session_keyboard(),
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            if "not modified" in str(exc).lower():
+                return  # 內容完全相同，本來就不需要動它
+            logger.debug("原地編輯狀態訊息失敗，改為重發：%s", exc)
 
     await _delete_message_safe(context, session.telegram_id, session.status_message_id)
     try:
@@ -873,7 +878,7 @@ async def handle_finish_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if session.stage == STAGE_DEBOUNCE:
         # 緩衝期間重複點擊：不重新計時、不重算張數（§6.3），但仍要回覆一次
         # 「確認中」讓使用者知道有被接收到，避免看起來像沒反應而一直猛戳。
-        await _update_status_message(context, session, query.message, now, force_resend=True)
+        await _update_status_message(context, session, query.message, now, prefer_edit=True)
         session.mark_confirm_updated(now)
         return
 
@@ -886,9 +891,9 @@ async def handle_finish_button(update: Update, context: ContextTypes.DEFAULT_TYP
     session.inactivity_prompt_message_id = None
 
     session.enter_stage(STAGE_DEBOUNCE, now)
-    # 同一則狀態訊息換上「⏳ 確認中」標記並重發到最下方：使用者立刻看到自己按到了，
-    # 而且畫面上不會多出一則跟原本講同樣事情的訊息（§6.3.1）。
-    await _update_status_message(context, session, query.message, now, force_resend=True)
+    # 同一則狀態訊息**原地**換上「⏳ 確認中」標記：使用者立刻看到自己按到了，
+    # 訊息不會消失也不會跳位，畫面上更不會多出一則講同樣事情的訊息（§6.3.1）。
+    await _update_status_message(context, session, query.message, now, prefer_edit=True)
     session.mark_confirm_updated(now)
     _schedule_debounce(context, telegram_id)
 
