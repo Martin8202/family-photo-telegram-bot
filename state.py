@@ -63,6 +63,7 @@ class ReceivedFile:
     is_original_quality: bool = False  # True＝以 document 傳送的原始檔
     temp_path: Optional[Path] = None   # 下載落地後才有
     filename: Optional[str] = None
+    fingerprint: Optional[str] = None  # 內容 MD5 前 8 碼，落地後算一次就好（見 storage.content_fingerprint）
     downloaded: bool = False           # 已成功落地暫存區
     download_failed: bool = False      # 重試後仍下載失敗（§6.3.2）
     download_error: Optional[str] = None

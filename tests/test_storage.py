@@ -55,17 +55,14 @@ def test_build_filename_uses_exif_when_present(tmp_path):
     _make_photo_with_exif_original(img_path, "2008:02:27 14:30:15")
 
     received = datetime(2026, 7, 23, 10, 0, 0, 999999)
-    name = storage.build_filename(received, ext=".jpg", source_path=img_path, use_exif=True, unique_identifier="a1b2c3d4e5f6")
-    # 時間戳採 EXIF 拍攝時間，字尾採 file_unique_id 後 8 碼（永久指紋）
-    assert name == "20080227_143015_c3d4e5f6.jpg"
+    name = storage.build_filename(received, ext=".jpg", source_path=img_path, use_exif=True)
+    # 時間戳採 EXIF 拍攝時間，字尾採檔案內容 MD5 前 8 碼
+    assert name.startswith("20080227_143015_")
+    assert name.endswith(storage.content_fingerprint(img_path) + ".jpg")
 
 
-def test_build_filename_falls_back_to_content_md5_not_file_id(tmp_path):
-    """
-    拿不到 file_unique_id 時，指紋必須回退為**檔案內容 MD5**。
-    絕不可回退為 file_id——Telegram 明訂 file_id 會隨 bot 與時間變動，
-    用它當「同一張照片檔名永遠相同」的依據自我矛盾。
-    """
+def test_build_filename_same_content_same_name(tmp_path):
+    """同一張照片（內容相同）無論何時傳送，都必須得到完全相同的檔名。"""
     img = tmp_path / "a.jpg"
     img.write_bytes(b"SAME-CONTENT")
     copy = tmp_path / "b.jpg"
@@ -74,8 +71,25 @@ def test_build_filename_falls_back_to_content_md5_not_file_id(tmp_path):
     received = datetime(2026, 7, 25, 12, 0, 0, 123456)
     n1 = storage.build_filename(received, ext=".jpg", source_path=img, use_exif=False)
     n2 = storage.build_filename(received, ext=".jpg", source_path=copy, use_exif=False)
-    assert n1 == n2, "同樣內容的照片必須得到同樣的指紋檔名"
+    assert n1 == n2
     assert n1.endswith(storage.calculate_md5(img)[:8] + ".jpg")
+
+
+def test_build_filename_different_photos_get_different_fingerprints(tmp_path):
+    """
+    實測 bug 回歸：同一秒收到的不同照片必須拿到**不同**的指紋。
+
+    原本的實作取 `file_unique_id[-8:]`，但那是 base64 結構的固定尾段——
+    實測 24 張照片有 23 張都算出同一個指紋 `aaifkivc`，於是同一秒的照片
+    全部撞名，一路 `_(2)`、`_(3)`、`_(4)` 疊上去。
+    """
+    received = datetime(2026, 7, 25, 15, 10, 54, 0)  # 全部同一秒，且無 EXIF
+    names = set()
+    for i in range(24):
+        p = tmp_path / f"photo_{i}.jpg"
+        p.write_bytes(f"different photo content {i}".encode())
+        names.add(storage.build_filename(received, ext=".jpg", source_path=p, use_exif=False))
+    assert len(names) == 24, f"24 張不同照片應該得到 24 個不同檔名，實際只有 {len(names)} 個"
 
 
 # ── 撞名保護：絕不覆蓋（§10、測項 E8）────────────────

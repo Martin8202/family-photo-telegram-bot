@@ -460,6 +460,9 @@ async def _download_one(pipeline: SessionPipeline, rf: ReceivedFile) -> None:
             await file_obj.download_to_drive(custom_path=str(local_path))
             rf.temp_path = local_path
             rf.filename = local_path.name
+            # 指紋在落地當下算一次就好；「兩邊都存」時兩個目的地共用同一個值，
+            # 不必對同一個檔案重複做兩次雜湊。
+            rf.fingerprint = await asyncio.to_thread(storage.content_fingerprint, local_path)
             rf.downloaded = True
             return
         except asyncio.CancelledError:
@@ -586,11 +589,9 @@ async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, sessio
 
             def _do_copy(rf=rf, dest_dir=dest_dir):
                 ext = Path(rf.temp_path).suffix or ".jpg"
-                # 指紋只認 file_unique_id（永久不變）。拿不到時 build_filename 會自動
-                # 回退為檔案內容 MD5——絕不可退回 file_id，那個值會隨時間變動。
                 filename = storage.build_filename(
                     rf.received_at, ext=ext, source_path=rf.temp_path,
-                    use_exif=config.USE_EXIF_TIME, unique_identifier=rf.file_unique_id,
+                    use_exif=config.USE_EXIF_TIME, fingerprint=rf.fingerprint,
                 )
                 result = storage.copy_file_with_retry(
                     rf.temp_path, dest_dir, filename, config.RETRY_TIMES, config.RETRY_DELAYS
@@ -1030,7 +1031,7 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
                     ext = Path(rf.temp_path).suffix or ".jpg"
                     filename = storage.build_filename(
                         rf.received_at, ext=ext, source_path=rf.temp_path,
-                        use_exif=config.USE_EXIF_TIME, unique_identifier=rf.file_unique_id,
+                        use_exif=config.USE_EXIF_TIME, fingerprint=rf.fingerprint,
                     )
                     return storage.copy_file_with_retry(
                         rf.temp_path, dest_dir, filename, config.RETRY_TIMES, config.RETRY_DELAYS

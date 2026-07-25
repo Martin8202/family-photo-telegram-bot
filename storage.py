@@ -99,23 +99,48 @@ def calculate_md5(file_path: Path) -> str:
         return ""
 
 
+FINGERPRINT_LENGTH = 8
+
+
+def content_fingerprint(file_path: Path) -> Optional[str]:
+    """
+    以檔案內容算出照片指紋（MD5 前 8 碼）。讀不到回傳 None。
+
+    ⚠️ 指紋**必須來自內容雜湊**，不可以是 Telegram 識別碼的子字串。
+    實測踩過的坑：原本取 `file_unique_id[-8:]`，結果 24 張照片裡有 23 張的
+    指紋都是 `aaifkivc`——`file_unique_id` 是 base64 編碼的結構，變動的部分
+    在**前面**，後面是固定的類型／資料中心標記，取後 8 碼幾乎等於取到常數。
+    同一秒收到的照片於是全部撞名，一路 `_(2)`、`_(3)`、`_(4)` 疊上去。
+
+    改用內容雜湊還有一個額外好處：同一張照片就算使用者重新從相簿傳一次
+    （Telegram 會發給它不同的 file_unique_id），內容相同就會得到相同的指紋，
+    「重複上傳」在檔名層次依然看得出來。
+    """
+    md5_hex = calculate_md5(file_path)
+    return md5_hex[:FINGERPRINT_LENGTH] if md5_hex else None
+
+
 def build_filename(
     received_time: datetime,
     ext: str = ".jpg",
     source_path: Optional[Path] = None,
     use_exif: bool = True,
-    unique_identifier: Optional[str] = None,
+    fingerprint: Optional[str] = None,
 ) -> str:
     """
     產生檔名：優先採 EXIF 拍攝時間，讀不到才回退為接收時間（見規格書 §10）。
-    字尾為相片的**永久指紋**：優先取 Telegram `file_unique_id` 的後 8 碼，
-    取不到才回退為檔案內容的 MD5 前 8 碼。兩者都是「同一張照片必然相同」的值，
-    所以同一張照片無論何時傳送，產生的檔名都一樣。
+    字尾為相片的**永久指紋**：檔案內容的 MD5 前 8 碼（見 `content_fingerprint`）。
+    同一張照片無論何時傳送、以什麼方式傳送，只要內容一樣就得到一樣的檔名。
     格式：YYYYMMDD_HHMMSS_指紋.jpg
 
-    ⚠️ 不可以拿 `file_id` 當指紋來源：Telegram 明訂 `file_id` **會隨 bot 與時間變動**，
-    同一張照片重傳會得到不同的 file_id，用它當「永久指紋」自我矛盾。
-    真正永久不變的是 `file_unique_id`。
+    `fingerprint` 可由呼叫端預先算好傳入（避免「兩邊都存」時對同一個檔案重複
+    計算兩次雜湊）；沒給就在這裡從 `source_path` 現算。
+
+    ⚠️ 指紋來源的兩條禁忌：
+    - **不可用 `file_id`**：Telegram 明訂它會隨 bot 與時間變動，拿會變的東西
+      當「永久指紋」自我矛盾。
+    - **不可截取 `file_unique_id` 的子字串**：實測 24 張照片有 23 張撞出同一個
+      指紋，原因見 `content_fingerprint` 的說明。
     """
     ts = None
     if use_exif and source_path is not None:
@@ -123,15 +148,14 @@ def build_filename(
     if ts is None:
         ts = received_time
 
-    if unique_identifier:
-        uid_tag = str(unique_identifier)[-8:].lower()
-    elif source_path is not None and source_path.exists():
-        md5_hex = calculate_md5(source_path)
-        uid_tag = md5_hex[:8].lower() if md5_hex else f"{received_time.microsecond:06d}"
-    else:
-        uid_tag = f"{received_time.microsecond:06d}"
+    tag = fingerprint
+    if not tag and source_path is not None and Path(source_path).exists():
+        tag = content_fingerprint(source_path)
+    if not tag:
+        # 連檔案都讀不到時的最後退路：用接收時間的微秒，至少同批不會互相覆蓋
+        tag = f"{received_time.microsecond:06d}"
 
-    return f"{ts.strftime('%Y%m%d_%H%M%S')}_{uid_tag}{ext}"
+    return f"{ts.strftime('%Y%m%d_%H%M%S')}_{tag.lower()}{ext}"
 
 
 def unique_destination(dest_dir: Path, filename: str) -> Path:
