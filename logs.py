@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger("photo-bot.logs")
 
 from writequeue import WriteQueue, append_bytes, atomic_write_text, default_write_queue
 
@@ -59,7 +62,13 @@ class CsvLog:
                 atomic_write_text(self.path, self._render([self.header]))
             append_bytes(self.path, data)
 
-        self._write_queue.submit(_write)
+        try:
+            self._write_queue.submit(_write)
+        except Exception as exc:  # noqa: BLE001
+            # 寫不進去時（最常見是管理員正用 Excel 開著這個檔案，Windows 會鎖檔），
+            # 至少把內容留在程式 log 裡，資料才不會憑空消失，事後可人工補回。
+            logger.error("寫入 %s 失敗（%s）；未能寫入的內容：%s", self.path.name, exc, rows)
+            raise
 
     def read_all_rows(self) -> list[dict]:
         if not self.path.exists():

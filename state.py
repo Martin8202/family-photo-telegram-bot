@@ -22,7 +22,10 @@ DEST_BOTH_LABEL = "兩邊都存"
 DEST_ICONS = {
     DEST_NAS_LABEL: "🏠",
     DEST_ONEDRIVE_LABEL: "☁️",
-    DEST_BOTH_LABEL: "📦",
+    # 「兩邊都存」直接用「房子＋雲」的組合，而不是另一個無關的圖示（原為 📦）：
+    # 使用者在「近 3 次資料夾」清單看到 🏠☁️ 時，一眼就能意會「這個資料夾上次
+    # 兩邊都存了」，不必另外記憶第三個符號代表什麼（規格書 §6.2）。
+    DEST_BOTH_LABEL: "🏠☁️",
 }
 
 STAGE_AWAITING_FOLDER = "awaiting_folder"
@@ -31,7 +34,9 @@ STAGE_RECEIVING_PHOTOS = "receiving_photos"
 STAGE_DEBOUNCE = "debounce"
 STAGE_PROCESSING = "processing"
 STAGE_AWAITING_RESTART_CONFIRM = "awaiting_restart_confirm"
-STAGE_AWAITING_CORRECTION_FOLDER = "awaiting_correction_folder"
+# 註：「等待輸入更正資料夾」不是 session 階段——它發生在上一次上傳已結束、
+# session 早已清除之後，狀態記在 context.user_data（見 handlers/upload.py 的
+# AWAITING_CORRECTION_FLAG 與 §7 第 10 點的失效條件）。
 
 # 唯一會累計「完全閒置」時間的階段：已選好資料夾/目的地、等待傳照片或按「我傳完了」。
 # 處理中、等待選資料夾/目的地、結案緩衝，皆不計入閒置（見規格書 §6.4）。
@@ -44,12 +49,25 @@ def recent_folder_icon(last_dest_label: str) -> str:
 
 @dataclass
 class ReceivedFile:
-    temp_path: Path
-    filename: str
+    """
+    一張照片在本次上傳中的狀態。
+
+    v3 起「登記」與「落地」是兩件事（規格書 §6.3）：收到 Telegram update 的當下
+    就先建立本物件並計數（純記憶體、毫秒級），`temp_path` 等欄位要等背景下載
+    worker 真的把檔案抓下來之後才會填上，故一律為 Optional。
+    """
     file_id: str
-    media_group_id: Optional[str]
-    received_at: datetime
-    is_original_quality: bool  # True＝以 document 傳送的原始檔
+    file_unique_id: Optional[str] = None
+    media_group_id: Optional[str] = None
+    received_at: datetime = field(default_factory=datetime.now)
+    is_original_quality: bool = False  # True＝以 document 傳送的原始檔
+    temp_path: Optional[Path] = None   # 下載落地後才有
+    filename: Optional[str] = None
+    fingerprint: Optional[str] = None  # 內容 MD5 前 8 碼，落地後算一次就好（見 storage.content_fingerprint）
+    downloaded: bool = False           # 已成功落地暫存區
+    download_failed: bool = False      # 重試後仍下載失敗（§6.3.2）
+    download_error: Optional[str] = None
+    copied: bool = False               # 已成功複製到所有目的地
 
 
 @dataclass
@@ -60,6 +78,34 @@ class DestinationOutcome:
     failed: bool = False
     error: Optional[str] = None
     written_paths: list = field(default_factory=list)  # list[(file_id, Path)]，寫入當下就配對，避免事後靠順序反推
+
+
+@dataclass
+class PendingDuplicates:
+    """
+    偵測到「相簿裡已經有了」而**尚未複製**的照片，等待使用者決定要不要還是存一份。
+
+    刻意做成獨立於 session 的物件：主批次會先正常收尾（使用者立刻看到「✅ 完成」），
+    這些重複照片的去留另外問，不阻塞整批的完成。暫存檔會保留到使用者回答或逾時。
+    """
+    telegram_id: int
+    name: str
+    folder: str
+    destination_label: str
+    files: list           # list[ReceivedFile]，暫存檔仍保留著
+    dest_targets: dict    # label -> 目的地資料夾 Path
+    created_at: datetime
+    temp_dir: object = None  # 這批的暫存子夾，決定之後才能刪
+    # 決定之後才要發的收尾（完成訊息、upload_log、last_batch、OneDrive 釋放）
+    # 需要用到整個 session 的狀態，故直接帶著它。session 本身已從 SessionManager
+    # 移除，這裡持有的只是那個物件。
+    session: object = None
+    timed_out: bool = False
+    decided: bool = False  # 只能生效一次，防重複點擊
+
+    @property
+    def count(self) -> int:
+        return len(self.files)
 
 
 @dataclass
@@ -88,14 +134,36 @@ class UploadSession:
     pending_media_group_ids: set = field(default_factory=set)
     finish_clicked: bool = False
     restart_clicked: bool = False
+    # 按下「🔄 重新開始」進入二次確認之前所處的階段。使用者按「取消」時要回到
+    # 這裡，而不是一律假設他原本正在傳照片（可能是在選資料夾階段誤觸的）。
+    stage_before_restart_confirm: Optional[str] = None
     compressed_warned: bool = False
-    counter_last_update: Optional[datetime] = None
-    counter_message_id: Optional[int] = None  # 收件計數訊息 id，靠編輯同一則訊息更新，不洗版（§6.3.1）
-    confirm_message_id: Optional[int] = None  # 「確認中…」訊息 id，緩衝期間收到新照片時更新張數
+    # 收件與確認**共用同一則狀態訊息**（§6.3.1）。v3.1 以前分成「收到照片中」與
+    # 「確認中」兩則，但兩者講的是同一件事（還在收、目前幾張），只是使用者按過
+    # 按鈕沒有的差別——合併成一則，用句尾的狀態標記表示就夠了。
+    status_message_id: Optional[int] = None
+    inactivity_prompted: bool = False  # 是否已發出過「看起來傳得差不多囉，請問傳完了嗎？」靜置提醒
+    inactivity_prompt_message_id: Optional[int] = None  # 靜置提醒訊息 id
     destinations: dict = field(default_factory=dict)  # label -> DestinationOutcome
-    last_written_count: int = 0  # 已成功複製到目的地（含所有內部小批）的張數，供「傳完了」時計算剩餘
-    flushed_count: int = 0  # session.files 中，前面已經被進度性分批處理過（複製或列入重試）的張數
-    pending_retry_files: list = field(default_factory=list)  # 進度性分批時寫入失敗、留待批次後重試的檔案
+    # label -> 該目的地資料夾裡「已存在照片」的指紋集合。整個資料夾只掃一次就快取，
+    # 網芳列目錄很貴，不可以每張照片都重掃一遍（見 storage.scan_existing_fingerprints）。
+    existing_fingerprints: dict = field(default_factory=dict)
+    # 偵測到重複、刻意沒有複製的照片：file_id -> (ReceivedFile, [目的地標籤])
+    duplicate_files: dict = field(default_factory=dict)
+    # 使用者最後決定「不用存」的重複照片；收尾宣告要據此扣掉張數
+    skipped_duplicates: list = field(default_factory=list)
+    auto_appended: bool = False  # 是否為「遲到照片自動併案」開出來的 session（§6.6）
+    flushed_count: int = 0  # 已進入過複製流程（成功或失敗）的張數
+    stored_count: int = 0   # 已成功複製到「所有」目的地的張數，即畫面上的「已存好 N 張」
+    pending_retry_files: list = field(default_factory=list)  # 分批寫入失敗、留待批次後重試的檔案
+    pipeline: object = None  # SessionPipeline（背景 worker），型別刻意不綁，維持本模組零 asyncio 依賴
+
+    # ── 畫面更新節流：時間與張數雙門檻（§6.3.1）──
+    counter_last_update: Optional[datetime] = None
+    counter_last_count: int = 0
+    confirm_last_update: Optional[datetime] = None
+    confirm_last_count: int = 0
+    status_last_reanchor: Optional[datetime] = None  # 上次用「刪舊發新」把狀態訊息拉回對話底部的時間
 
     def touch(self, now: Optional[datetime] = None) -> None:
         self.last_activity_at = now or datetime.now()
@@ -103,6 +171,14 @@ class UploadSession:
     def enter_stage(self, stage: str, now: Optional[datetime] = None) -> None:
         self.stage = stage
         self.touch(now)
+
+    def mark_counter_updated(self, now: Optional[datetime] = None) -> None:
+        self.counter_last_update = now or datetime.now()
+        self.counter_last_count = self.received_count
+
+    def mark_confirm_updated(self, now: Optional[datetime] = None) -> None:
+        self.confirm_last_update = now or datetime.now()
+        self.confirm_last_count = self.received_count
 
     def is_idle_timed_out(self, timeout_min: int, now: Optional[datetime] = None) -> bool:
         if self.stage not in IDLE_COUNTING_STAGES:
@@ -125,6 +201,23 @@ class UploadSession:
         now = now or datetime.now()
         return (now - self.started_at) >= timedelta(minutes=max_lifetime_min)
 
+    def is_stage_stuck(self, max_stuck_min: int, now: Optional[datetime] = None) -> bool:
+        """
+        任何階段的兜底逾時（規格書 §6.4，v3 新增）。
+
+        §6.4 的 10 分鐘閒置只在收件階段累計，但 session 也可能停在其他階段回不來：
+        例如按了「🔄 重新開始」卻始終不回答二次確認、或緩衝計時因異常未被觸發。
+        這些狀態下 session 既不逾時、也不符合「絕對存活上限」的條件（因為已收到過
+        照片），會永久佔用記憶體且暫存區的照片無人收尾。
+
+        `STAGE_PROCESSING` 例外不計：收尾流程正在跑（大批次可能耗時數十分鐘），
+        它自己會清掉 session，不需要也不應該被這個安全網打斷。
+        """
+        if self.stage == STAGE_PROCESSING:
+            return False
+        now = now or datetime.now()
+        return (now - self.last_activity_at) >= timedelta(minutes=max_stuck_min)
+
     def add_file(self, rf: ReceivedFile) -> None:
         self.files.append(rf)
 
@@ -139,6 +232,7 @@ class SessionManager:
     def __init__(self) -> None:
         self._sessions: dict[int, UploadSession] = {}
         self._last_batches: dict[int, CompletedBatch] = {}
+        self._pending_duplicates: dict[int, PendingDuplicates] = {}
 
     # ── session ──
     def get(self, telegram_id: int) -> Optional[UploadSession]:
@@ -166,6 +260,38 @@ class SessionManager:
 
     def get_last_batch(self, telegram_id: int) -> Optional[CompletedBatch]:
         return self._last_batches.get(telegram_id)
+
+    def purge_expired_batches(self, max_age_min: int, now: Optional[datetime] = None) -> int:
+        """
+        清掉太久以前的已完成批次，回收記憶體。回傳清掉幾筆。
+
+        這份資料只為「↩️ 這批傳錯了」而保留，內容是該批每張照片的完整清單——
+        實測 3000 張約 2 MB／人。原本永不過期，要等該使用者下次上傳才被取代，
+        對長期常駐的服務而言是隻不會自己縮回去的手。
+
+        注意：**這裡只回收記憶體，不影響任何實體檔案**，也不會讓按鈕消失
+        （inline 按鈕存在 Telegram 伺服器上）。批次資料沒了之後點按鈕，
+        呼叫端會回覆明確說明。
+        """
+        now = now or datetime.now()
+        cutoff = now - timedelta(minutes=max_age_min)
+        expired = [tid for tid, b in self._last_batches.items() if b.completed_at < cutoff]
+        for tid in expired:
+            del self._last_batches[tid]
+        return len(expired)
+
+    # ── 待決的重複照片（等使用者回答要不要還是存） ──
+    def set_pending_duplicates(self, pending: "PendingDuplicates") -> None:
+        self._pending_duplicates[pending.telegram_id] = pending
+
+    def get_pending_duplicates(self, telegram_id: int) -> Optional["PendingDuplicates"]:
+        return self._pending_duplicates.get(telegram_id)
+
+    def clear_pending_duplicates(self, telegram_id: int) -> Optional["PendingDuplicates"]:
+        return self._pending_duplicates.pop(telegram_id, None)
+
+    def all_pending_duplicates(self) -> list:
+        return list(self._pending_duplicates.values())
 
 
 # ── 批次切分（內部小批，對使用者透明，§6.3）──────────
@@ -195,9 +321,60 @@ def progress_bar(done: int, total: int, width: int = 10) -> str:
     return f"{bar} {pct}%（{done}/{total} 張）"
 
 
-def should_update_counter(session: UploadSession, now: Optional[datetime], throttle_sec: float) -> bool:
-    """收件計數節流：固定每 N 秒彙整更新一次，避免頻繁 editMessageText 遭限流（§6.3.1）。"""
-    now = now or datetime.now()
-    if session.counter_last_update is None:
+def _throttle_passed(
+    last_update: Optional[datetime],
+    last_count: int,
+    current_count: int,
+    now: datetime,
+    throttle_sec: float,
+    throttle_count: Optional[int],
+) -> bool:
+    """
+    雙門檻節流（規格書 §6.3.1）：「距上次更新已達 N 秒」**或**「已新增 M 張」，
+    滿足其一即放行。
+
+    為何不能只看時間：若一批照片在節流秒數內就全部抵達（張數不多、手機網路快時
+    很常見），畫面會停在第 1 張的數字完全不動，直到使用者按「我傳完了」才第一次
+    看到正確總數，造成「感覺卡住」的錯覺——這是 v2 實測回報的問題之一。
+    """
+    if last_update is None:
         return True
-    return (now - session.counter_last_update).total_seconds() >= throttle_sec
+    if (now - last_update).total_seconds() >= throttle_sec:
+        return True
+    if throttle_count is not None and (current_count - last_count) >= throttle_count:
+        return True
+    return False
+
+
+def should_update_counter(
+    session: UploadSession,
+    now: Optional[datetime],
+    throttle_sec: float,
+    throttle_count: Optional[int] = None,
+) -> bool:
+    """收件階段「📥 收到照片中…」的畫面更新節流（§6.3.1）。"""
+    now = now or datetime.now()
+    return _throttle_passed(
+        session.counter_last_update, session.counter_last_count,
+        session.received_count, now, throttle_sec, throttle_count,
+    )
+
+
+def should_update_confirm(
+    session: UploadSession,
+    now: Optional[datetime],
+    throttle_sec: float,
+    throttle_count: Optional[int] = None,
+) -> bool:
+    """
+    緩衝期間「⏳ 確認中…」的張數更新節流（§6.3.1）。
+
+    刻意與收件階段分開計時、且門檻更靈敏：v2 讓兩者共用 `COUNTER_UPDATE_SEC`（5 秒），
+    而結案緩衝也是 5 秒，兩個窗一樣長，結果「確認中」的張數幾乎不可能更新到哪怕
+    一次就被刪掉換成進度條——這正是使用者回報「數字不會跳」的直接原因。
+    """
+    now = now or datetime.now()
+    return _throttle_passed(
+        session.confirm_last_update, session.confirm_last_count,
+        session.received_count, now, throttle_sec, throttle_count,
+    )

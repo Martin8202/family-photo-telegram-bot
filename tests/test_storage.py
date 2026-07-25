@@ -56,9 +56,40 @@ def test_build_filename_uses_exif_when_present(tmp_path):
 
     received = datetime(2026, 7, 23, 10, 0, 0, 999999)
     name = storage.build_filename(received, ext=".jpg", source_path=img_path, use_exif=True)
-    # 時間戳採 EXIF 拍攝時間，非今天；微秒仍採接收時間避免同批撞名
+    # 時間戳採 EXIF 拍攝時間，字尾採檔案內容 MD5 前 8 碼
     assert name.startswith("20080227_143015_")
-    assert name.endswith("999999.jpg")
+    assert name.endswith(storage.content_fingerprint(img_path) + ".jpg")
+
+
+def test_build_filename_same_content_same_name(tmp_path):
+    """同一張照片（內容相同）無論何時傳送，都必須得到完全相同的檔名。"""
+    img = tmp_path / "a.jpg"
+    img.write_bytes(b"SAME-CONTENT")
+    copy = tmp_path / "b.jpg"
+    copy.write_bytes(b"SAME-CONTENT")
+
+    received = datetime(2026, 7, 25, 12, 0, 0, 123456)
+    n1 = storage.build_filename(received, ext=".jpg", source_path=img, use_exif=False)
+    n2 = storage.build_filename(received, ext=".jpg", source_path=copy, use_exif=False)
+    assert n1 == n2
+    assert n1.endswith(storage.calculate_md5(img)[:8] + ".jpg")
+
+
+def test_build_filename_different_photos_get_different_fingerprints(tmp_path):
+    """
+    實測 bug 回歸：同一秒收到的不同照片必須拿到**不同**的指紋。
+
+    原本的實作取 `file_unique_id[-8:]`，但那是 base64 結構的固定尾段——
+    實測 24 張照片有 23 張都算出同一個指紋 `aaifkivc`，於是同一秒的照片
+    全部撞名，一路 `_(2)`、`_(3)`、`_(4)` 疊上去。
+    """
+    received = datetime(2026, 7, 25, 15, 10, 54, 0)  # 全部同一秒，且無 EXIF
+    names = set()
+    for i in range(24):
+        p = tmp_path / f"photo_{i}.jpg"
+        p.write_bytes(f"different photo content {i}".encode())
+        names.add(storage.build_filename(received, ext=".jpg", source_path=p, use_exif=False))
+    assert len(names) == 24, f"24 張不同照片應該得到 24 個不同檔名，實際只有 {len(names)} 個"
 
 
 # ── 撞名保護：絕不覆蓋（§10、測項 E8）────────────────
@@ -100,6 +131,11 @@ def test_copy_file_creates_dest_dir_and_copies(tmp_path):
 
 
 def test_copy_file_never_overwrites_same_name(tmp_path):
+    """
+    §2／§8／§10 的硬性保證：目的地已有同名檔案時一律另存，絕不覆蓋。
+    覆蓋是破壞性寫入（copy2 底層 open(dst,'wb') 開檔當下原檔就歸零），
+    途中斷線會同時失去原檔與新檔——這條測試就是守這個的，不可以反過來寫。
+    """
     src1 = tmp_path / "src1.jpg"
     src1.write_bytes(b"AAA")
     src2 = tmp_path / "src2.jpg"
@@ -109,8 +145,8 @@ def test_copy_file_never_overwrites_same_name(tmp_path):
     p1 = storage.copy_file(src1, dest_dir, "same.jpg")
     p2 = storage.copy_file(src2, dest_dir, "same.jpg")
 
-    assert p1 != p2
-    assert p1.read_bytes() == b"AAA"
+    assert p1 != p2, "撞名必須另存新檔，不可指向同一個路徑"
+    assert p1.read_bytes() == b"AAA", "原本那張照片必須完好無損"
     assert p2.read_bytes() == b"BBB"
 
 
@@ -278,3 +314,126 @@ def test_read_session_info_missing_returns_none(tmp_path):
 def test_read_session_info_corrupted_returns_none(tmp_path):
     (tmp_path / storage.SESSION_INFO_FILENAME).write_text("{not valid json", encoding="utf-8")
     assert storage.read_session_info(tmp_path) is None
+
+
+# ── 資料夾名稱驗證（實測 WinError 123 的回歸測試）────────────────
+
+def test_validate_folder_name_rejects_newline():
+    """
+    實測踩到的 crash：使用者輸入「2026-07-025大量測試」時中間夾了換行
+    （手機輸入法斷行或複製貼上帶進來），舊版的過濾器不擋換行，直接把它
+    帶進路徑，Windows 回 WinError 123 讓整個上傳流程中斷。
+    """
+    with pytest.raises(storage.FolderNameError) as exc:
+        storage.validate_folder_name("2026-07-0\n25大量測試")
+    assert "換行" in str(exc.value)
+
+
+def test_validate_folder_name_rejects_other_control_chars():
+    for bad in ["a\tb", "a\rb", "a\x00b"]:
+        with pytest.raises(storage.FolderNameError):
+            storage.validate_folder_name(bad)
+
+
+def test_validate_folder_name_rejects_path_chars_and_names_them():
+    with pytest.raises(storage.FolderNameError) as exc:
+        storage.validate_folder_name("阿嬤/生日")
+    msg = str(exc.value)
+    assert "/" in msg and "換一個名字" in msg
+
+
+def test_validate_folder_name_rejects_empty_and_whitespace_only():
+    for bad in ["", "   "]:
+        with pytest.raises(storage.FolderNameError):
+            storage.validate_folder_name(bad)
+
+
+def test_validate_folder_name_rejects_trailing_dot_and_reserved_and_too_long():
+    with pytest.raises(storage.FolderNameError):
+        storage.validate_folder_name("過年聚餐.")
+    with pytest.raises(storage.FolderNameError):
+        storage.validate_folder_name("CON")
+    with pytest.raises(storage.FolderNameError):
+        storage.validate_folder_name("長" * (storage.MAX_FOLDER_NAME_LENGTH + 1))
+
+
+def test_validate_folder_name_accepts_normal_names_and_trims():
+    assert storage.validate_folder_name("  阿嬤生日  ") == "阿嬤生日"
+    assert storage.validate_folder_name("2026-07-25大量測試") == "2026-07-25大量測試"
+    assert storage.validate_folder_name("110嘉義家族旅遊") == "110嘉義家族旅遊"
+
+
+def test_sanitize_folder_name_never_produces_invalid_path():
+    """sanitize 是內部用（例如成員姓名組暫存夾），不能失敗，但也絕不能吐出非法路徑。"""
+    assert "\n" not in storage.sanitize_folder_name("元\n皓")
+    assert storage.sanitize_folder_name("元\n皓") == "元 皓"
+    assert storage.sanitize_folder_name("結尾點.") == "結尾點"
+    assert storage.sanitize_folder_name("CON") == "CON_"
+    assert len(storage.sanitize_folder_name("長" * 500)) <= storage.MAX_FOLDER_NAME_LENGTH
+
+
+# ── 指紋反查與重複偵測（實測 bug 回歸）────────────────────────
+
+def test_extract_fingerprint_from_filename():
+    assert storage.extract_fingerprint("20260725_151054_892e347b.JPG") == "892e347b"
+    assert storage.extract_fingerprint("20260725_151054_892e347b_(2).JPG") == "892e347b"
+    assert storage.extract_fingerprint("20260725_151054_892e347b_(13).HEIC") == "892e347b"
+    # 認不出格式的（使用者自己放進去的檔案）要回傳 None，不可誤判
+    assert storage.extract_fingerprint("我的照片.jpg") is None
+    assert storage.extract_fingerprint("IMG_1234.JPG") is None
+    assert storage.extract_fingerprint("20260725_151054_XYZ.jpg") is None
+
+
+def test_scan_existing_fingerprints(tmp_path):
+    d = tmp_path / "相簿"
+    d.mkdir()
+    (d / "20260725_151054_892e347b.JPG").write_bytes(b"a")
+    (d / "20260101_090000_deadbeef.PNG").write_bytes(b"b")
+    (d / "20260725_151054_892e347b_(2).JPG").write_bytes(b"c")  # 同指紋的副本
+    (d / "使用者自己放的.jpg").write_bytes(b"d")
+
+    found = storage.scan_existing_fingerprints(d)
+    assert set(found) == {"892e347b", "deadbeef"}
+    # 一併帶回檔案大小，用來排除指紋碰撞造成的誤判
+    assert found["892e347b"] == {1}   # 兩個同指紋的檔案都是 1 byte
+    assert found["deadbeef"] == {1}
+    assert storage.scan_existing_fingerprints(tmp_path / "不存在") == {}
+
+
+def test_looks_like_duplicate_requires_size_match():
+    """
+    指紋只有 32 bits，理論上有極小機率碰撞。若因此誤判成重複而略過複製，
+    那張全新的照片就不會被存——違反「照片不遺失」。故必須大小也吻合。
+    """
+    known = {"892e347b": {1024}}
+    assert storage.looks_like_duplicate(known, "892e347b", 1024) is True
+    # 指紋一樣但大小不同 → 是碰撞，不是重複，必須照常複製
+    assert storage.looks_like_duplicate(known, "892e347b", 2048) is False
+    assert storage.looks_like_duplicate(known, "deadbeef", 1024) is False
+    # 資訊不齊時一律當作「不是重複」，寧可多存也不要漏存
+    assert storage.looks_like_duplicate(known, None, 1024) is False
+    assert storage.looks_like_duplicate(known, "892e347b", None) is False
+
+
+def test_same_photo_different_receive_time_has_different_name_but_same_fingerprint(tmp_path):
+    """
+    這就是重複偵測不能只看檔名的原因：讀不到 EXIF 時（Telegram 壓縮版的 EXIF
+    會被剝掉），時間戳退回接收時間，同一張照片分兩次上傳檔名就不同了。
+    但**指紋必須相同**——重複偵測要靠它。
+    """
+    img = tmp_path / "photo.jpg"
+    img.write_bytes(b"IDENTICAL-PHOTO-CONTENT")
+
+    n1 = storage.build_filename(datetime(2026, 7, 25, 15, 10, 54, 1), ext=".jpg",
+                                source_path=img, use_exif=True)
+    n2 = storage.build_filename(datetime(2026, 8, 1, 9, 30, 0, 2), ext=".jpg",
+                                source_path=img, use_exif=True)
+
+    assert n1 != n2, "沒有 EXIF 時，兩次上傳的檔名本來就會不同"
+    assert storage.extract_fingerprint(n1) == storage.extract_fingerprint(n2), \
+        "但指紋必須相同，重複偵測才抓得到"
+
+
+def test_heic_support_registered():
+    """iPhone 原檔是 HEIC，需要 pillow-heif 才讀得到 EXIF 拍攝時間（§10）。"""
+    assert storage.HEIC_SUPPORTED, "pillow-heif 應該已安裝並註冊"

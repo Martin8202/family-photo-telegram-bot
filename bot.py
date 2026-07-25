@@ -30,8 +30,13 @@ from handlers import register, upload
 from keyboards import (
     CB_APPROVE_PREFIX,
     CB_CORRECTION,
+    CB_CORRECTION_FOLDER_PREFIX,
     CB_DEST_PREFIX,
+    CB_DUP_COPY,
+    CB_DUP_SKIP,
+    CB_UPLOAD_AGAIN,
     CB_FINISH,
+    CB_CONTINUE_RECEIVING,
     CB_RECENT_FOLDER_PREFIX,
     CB_REGISTER,
     CB_REJECT_PREFIX,
@@ -87,6 +92,8 @@ async def route_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     text = (update.effective_message.text or "").strip()
+    # 常駐按鈕雖已移除，仍要認得它送出的文字：清除指令要等下一則訊息才會送達，
+    # 在那之前使用者還是點得到舊按鈕。
     if text == UPLOAD_BUTTON_TEXT:
         await upload.handle_start_upload(update, context)
         return
@@ -217,6 +224,8 @@ async def startup_recover_temp(app: Application) -> None:
             fail_count = 0
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
             index_rows = []
+            # 補送進 OneDrive 的照片同樣要排釋放空間，否則永遠留在本機（§4.2）
+            onedrive_written: list = []
             for label, dest_dir in dest_targets.items():
                 for f in files:
                     # 復原時同樣套用檔名規則（EXIF 拍攝時間優先），與正常流程一致，
@@ -232,11 +241,24 @@ async def startup_recover_temp(app: Application) -> None:
                     index_rows.append((now_str, name, telegram_id, folder_name, label, actual_name, file_id))
                     if result.success:
                         success_count += 1
+                        if label == "OneDrive" and result.dest_path:
+                            onedrive_written.append(result.dest_path)
                     else:
                         fail_count += 1
 
             if index_rows:
-                logs.log_file_index_batch(index_rows)
+                try:
+                    logs.log_file_index_batch(index_rows)
+                except Exception:
+                    logger.exception("復原批次寫入 file_index 失敗，繼續處理其餘批次")
+
+            if getattr(cfg, "ONEDRIVE_FREE_SPACE", True) and onedrive_written:
+                class _Ctx:  # 啟動階段還沒有真正的 CallbackContext，包一個最小的替身
+                    application = app
+                try:
+                    await upload._schedule_onedrive_release(_Ctx(), onedrive_written)
+                except Exception:
+                    logger.exception("復原批次排程 OneDrive 釋放空間失敗")
 
             all_ok = fail_count == 0
             guess_note = "（未找到目的地紀錄，已預設補送到區網硬碟，請確認是否正確）" if destination_guessed else ""
@@ -250,10 +272,16 @@ async def startup_recover_temp(app: Application) -> None:
                     storage.safe_delete_in_temp(session_dir, temp_root)
                 except storage.TempFenceViolation:
                     pass
-                logs.log_upload(now_str, name, telegram_id, folder_name, destination, len(files), "成功(復原)")
+                try:
+                    logs.log_upload(now_str, name, telegram_id, folder_name, destination, len(files), "成功(復原)")
+                except Exception:
+                    logger.exception("復原批次寫入 upload_log 失敗")
                 report_lines.append(f"{name}／{folder_name}：{len(files)} 張已補送成功{guess_note}")
             else:
-                logs.log_upload(now_str, name, telegram_id, folder_name, destination, len(files), "部分失敗(復原)")
+                try:
+                    logs.log_upload(now_str, name, telegram_id, folder_name, destination, len(files), "部分失敗(復原)")
+                except Exception:
+                    logger.exception("復原批次寫入 upload_log 失敗")
                 report_lines.append(
                     f"{name}／{folder_name}：{success_count} 成功／{fail_count} 失敗（保留暫存待人工處理）{guess_note}"
                 )
@@ -267,10 +295,56 @@ async def periodic_timeout_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     await upload.check_session_timeouts(context)
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    全域錯誤處理（規格書 §17）：接住所有沒被個別 handler 攔下的例外。
+
+    v2 完全沒有註冊 error handler，於是「✅ 我傳完了」因 callback query 逾時而
+    整個處理函式爆掉時，例外只是被框架靜默記掉——使用者沒反應、管理員沒通知、
+    也沒有任何線索可循。這裡一律記 log ＋ 通知管理員，並對使用者回一句不揭露
+    技術細節的訊息。
+    """
+    err = context.error
+    logger.error("未處理的例外", exc_info=err)
+    notifier: Notifier = context.application.bot_data.get("notifier")
+    if notifier is not None:
+        where = type(update).__name__ if update is not None else "unknown"
+        await notifier.notify_admin(notify.msg_unhandled_error(where, type(err).__name__, str(err)))
+    try:
+        if isinstance(update, Update) and update.effective_message is not None:
+            await update.effective_message.reply_text(notify.user_msg_error_generic())
+    except Exception:
+        pass  # 連錯誤通知都送不出去時，不能再往外拋而讓錯誤處理本身變成新的錯誤
+
+
+async def startup_resume_onedrive_release(app: Application) -> None:
+    """
+    接回上次關機前尚未執行的 OneDrive 釋放空間排程（規格書 §4.2）。
+
+    排程本身掛在行程內的 AsyncIOScheduler，bot 一關就消失；沒有這一步的話，
+    凡是在延遲期間被關掉的批次，「僅線上」標記就永遠不會下。
+    """
+    cfg = app.bot_data["config"]
+    if not getattr(cfg, "ONEDRIVE_FREE_SPACE", True):
+        return
+
+    class _Ctx:  # 啟動階段還沒有真正的 CallbackContext，包一個最小的替身
+        application = app
+
+    try:
+        await upload.resume_pending_onedrive_releases(_Ctx())
+    except Exception:
+        logger.exception("接回 OneDrive 釋放空間排程失敗")
+
+
 async def on_startup(app: Application) -> None:
     await startup_health_check(app)
     await startup_recover_temp(app)
-    await app.bot.set_my_commands([BotCommand("start", "開始使用")])
+    await startup_resume_onedrive_release(app)
+    # 選單只放「我要上傳照片」：使用者最常做的就是這件事，一點就直接進流程。
+    # /start 仍然保留為可用指令（Telegram 對新使用者顯示的 START 按鈕就是送 /start，
+    # 註冊流程靠它），只是不再出現在選單裡佔位置。
+    await app.bot.set_my_commands([BotCommand("upload", "📷 我要上傳照片")])
 
 
 def build_application() -> Application:
@@ -287,8 +361,11 @@ def build_application() -> Application:
     app.bot_data["sessions"] = sessions
     app.bot_data["notifier"] = notifier
     app.bot_data["config"] = config
+    app.bot_data["data_dir"] = DATA_DIR
 
     app.add_handler(CommandHandler("start", register.handle_start))
+    # 選單裡那一項。未開通者會被 handle_start_upload 擋下並提示，不必另外判斷。
+    app.add_handler(CommandHandler("upload", upload.handle_start_upload))
 
     app.add_handler(CallbackQueryHandler(register.handle_register_button, pattern=f"^{CB_REGISTER}$"))
     app.add_handler(CallbackQueryHandler(register.handle_approve, pattern=f"^{CB_APPROVE_PREFIX}"))
@@ -297,10 +374,19 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(upload.handle_recent_folder_button, pattern=f"^{CB_RECENT_FOLDER_PREFIX}"))
     app.add_handler(CallbackQueryHandler(upload.handle_destination_button, pattern=f"^{CB_DEST_PREFIX}"))
     app.add_handler(CallbackQueryHandler(upload.handle_finish_button, pattern=f"^{CB_FINISH}$"))
+    app.add_handler(CallbackQueryHandler(
+        upload.handle_continue_receiving_button, pattern=f"^{CB_CONTINUE_RECEIVING}$"
+    ))
     app.add_handler(CallbackQueryHandler(upload.handle_restart_button, pattern=f"^{CB_RESTART}$"))
     app.add_handler(CallbackQueryHandler(upload.handle_restart_confirm, pattern=f"^{CB_RESTART_CONFIRM}$"))
     app.add_handler(CallbackQueryHandler(upload.handle_restart_cancel, pattern=f"^{CB_RESTART_CANCEL}$"))
     app.add_handler(CallbackQueryHandler(upload.handle_correction_button, pattern=f"^{CB_CORRECTION}$"))
+    app.add_handler(CallbackQueryHandler(upload.handle_upload_again_button, pattern=f"^{CB_UPLOAD_AGAIN}$"))
+    app.add_handler(CallbackQueryHandler(
+        upload.handle_correction_folder_button, pattern=f"^{CB_CORRECTION_FOLDER_PREFIX}"
+    ))
+    app.add_handler(CallbackQueryHandler(upload.handle_duplicate_copy, pattern=f"^{CB_DUP_COPY}$"))
+    app.add_handler(CallbackQueryHandler(upload.handle_duplicate_skip, pattern=f"^{CB_DUP_SKIP}$"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, route_text))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, route_photo))
@@ -310,6 +396,9 @@ def build_application() -> Application:
         | filters.Sticker.ALL | (filters.Document.ALL & ~filters.Document.IMAGE),
         route_unsupported_media,
     ))
+
+    # 全域錯誤處理必須註冊（規格書 §17），否則未攔下的例外會靜默消失
+    app.add_error_handler(on_error)
 
     if app.job_queue is not None:
         app.job_queue.run_repeating(periodic_timeout_check, interval=30, first=30)

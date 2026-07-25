@@ -12,7 +12,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
+import os
+import re
 import shutil
 import subprocess
 import time
@@ -21,12 +25,24 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+logger = logging.getLogger("photo-bot.storage")
+
 try:
     from PIL import Image
     from PIL.ExifTags import TAGS
 except ImportError:  # Pillow 未安裝時仍可 import 本模組（EXIF 功能退化）
     Image = None
     TAGS = None
+
+# iPhone「以檔案傳送」的原檔是 HEIC，Pillow 本身打不開，必須註冊 pillow-heif
+# 才讀得到裡面的 EXIF 拍攝時間。沒裝也不影響程式運作，只是 HEIC 會退回用
+# 接收時間命名（規格書 §10 的時間來源優先序會少一層）。
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    HEIC_SUPPORTED = True
+except Exception:  # noqa: BLE001 - 套件缺失或註冊失敗都只是功能退化
+    HEIC_SUPPORTED = False
 
 
 # ── 檔名 ────────────────────────────────────────────
@@ -83,23 +99,138 @@ def read_exif_datetime(file_path: Path) -> Optional[datetime]:
         return None
 
 
+def calculate_md5(file_path: Path) -> str:
+    """計算檔案內容的 MD5 雜湊值 (DNA)，用於精準去重。"""
+    md5 = hashlib.md5()
+    try:
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                md5.update(chunk)
+        return md5.hexdigest()
+    except Exception:
+        return ""
+
+
+FINGERPRINT_LENGTH = 8
+
+
+def content_fingerprint(file_path: Path) -> Optional[str]:
+    """
+    以檔案內容算出照片指紋（MD5 前 8 碼）。讀不到回傳 None。
+
+    ⚠️ 指紋**必須來自內容雜湊**，不可以是 Telegram 識別碼的子字串。
+    實測踩過的坑：原本取 `file_unique_id[-8:]`，結果 24 張照片裡有 23 張的
+    指紋都是 `aaifkivc`——`file_unique_id` 是 base64 編碼的結構，變動的部分
+    在**前面**，後面是固定的類型／資料中心標記，取後 8 碼幾乎等於取到常數。
+    同一秒收到的照片於是全部撞名，一路 `_(2)`、`_(3)`、`_(4)` 疊上去。
+
+    改用內容雜湊還有一個額外好處：同一張照片就算使用者重新從相簿傳一次
+    （Telegram 會發給它不同的 file_unique_id），內容相同就會得到相同的指紋，
+    「重複上傳」在檔名層次依然看得出來。
+    """
+    md5_hex = calculate_md5(file_path)
+    return md5_hex[:FINGERPRINT_LENGTH] if md5_hex else None
+
+
+# 檔名格式：YYYYMMDD_HHMMSS_{8碼指紋}[_(2)].副檔名
+_FINGERPRINT_IN_NAME = re.compile(r"_([0-9a-f]{%d})(?:_\(\d+\))?$" % FINGERPRINT_LENGTH)
+
+
+def extract_fingerprint(filename: str) -> Optional[str]:
+    """從既有檔名反查出指紋。認不出格式（例如使用者自己放進去的檔案）回傳 None。"""
+    m = _FINGERPRINT_IN_NAME.search(Path(filename).stem)
+    return m.group(1) if m else None
+
+
+def scan_existing_fingerprints(dest_dir: Path) -> dict:
+    """
+    掃描目的地資料夾，取出所有已存在照片的「指紋 → 檔案大小集合」。
+
+    用途：判斷「這張照片相簿裡是不是已經有了」。**不能只靠檔名相同來判斷**——
+    檔名的時間戳部分在讀不到 EXIF 時會退回接收時間，同一張照片分兩次上傳
+    會得到不同的時間戳（實測 69 張裡有 62 張如此，因為 Telegram 壓縮版的
+    EXIF 會被剝掉），檔名自然不同，重複就漏掉了。指紋才是穩定的那一半。
+
+    **為何要一併記檔案大小**：指紋只取 MD5 前 8 個十六進位字元＝32 bits，
+    理論上兩張不同的照片有極小機率撞到同一個指紋。若因此誤判為重複而略過
+    複製，那張**全新的照片就不會被存**，違反「照片不遺失」的第一原則。
+    加上「大小也要完全相同」這個條件後，誤判機率趨近於零，而檔案大小在
+    列目錄時本來就拿得到（`os.scandir` 會一併帶回），不需要額外的 I/O。
+
+    整個資料夾只掃一次、結果快取起來重複使用；對網芳而言列目錄是昂貴操作，
+    不可以每張照片都掃一遍。
+    """
+    dest_dir = Path(dest_dir)
+    found: dict = {}
+    if not dest_dir.exists():
+        return found
+    try:
+        with os.scandir(dest_dir) as it:
+            for entry in it:
+                if not entry.is_file():
+                    continue
+                fp = extract_fingerprint(entry.name)
+                if fp:
+                    try:
+                        found.setdefault(fp, set()).add(entry.stat().st_size)
+                    except OSError:
+                        found.setdefault(fp, set())
+    except OSError:
+        pass  # 列目錄失敗（權限、網芳斷線）就當作沒有既有檔案，不影響上傳
+    return found
+
+
+def looks_like_duplicate(known: dict, fingerprint: Optional[str], size: Optional[int]) -> bool:
+    """
+    這張照片是否已經在目的地資料夾裡了。
+
+    必須**指紋與檔案大小都吻合**才算重複——只比指紋有極小的誤判機率，
+    而誤判會導致一張全新的照片被略過不存（見 `scan_existing_fingerprints`）。
+    """
+    if not fingerprint or fingerprint not in known:
+        return False
+    sizes = known[fingerprint]
+    if not sizes or size is None:
+        return False  # 大小資訊不齊時寧可當作「不是重複」，照常複製
+    return size in sizes
+
+
 def build_filename(
     received_time: datetime,
     ext: str = ".jpg",
     source_path: Optional[Path] = None,
     use_exif: bool = True,
+    fingerprint: Optional[str] = None,
 ) -> str:
     """
     產生檔名：優先採 EXIF 拍攝時間，讀不到才回退為接收時間（見規格書 §10）。
-    格式：YYYYMMDD_HHMMSS_微秒.jpg
+    字尾為相片的**永久指紋**：檔案內容的 MD5 前 8 碼（見 `content_fingerprint`）。
+    同一張照片無論何時傳送、以什麼方式傳送，只要內容一樣就得到一樣的檔名。
+    格式：YYYYMMDD_HHMMSS_指紋.jpg
+
+    `fingerprint` 可由呼叫端預先算好傳入（避免「兩邊都存」時對同一個檔案重複
+    計算兩次雜湊）；沒給就在這裡從 `source_path` 現算。
+
+    ⚠️ 指紋來源的兩條禁忌：
+    - **不可用 `file_id`**：Telegram 明訂它會隨 bot 與時間變動，拿會變的東西
+      當「永久指紋」自我矛盾。
+    - **不可截取 `file_unique_id` 的子字串**：實測 24 張照片有 23 張撞出同一個
+      指紋，原因見 `content_fingerprint` 的說明。
     """
     ts = None
     if use_exif and source_path is not None:
         ts = read_exif_datetime(source_path)
     if ts is None:
         ts = received_time
-    micro = received_time.microsecond  # 微秒一律用接收時間，確保同批不同檔不撞名
-    return f"{ts.strftime('%Y%m%d_%H%M%S')}_{micro:06d}{ext}"
+
+    tag = fingerprint
+    if not tag and source_path is not None and Path(source_path).exists():
+        tag = content_fingerprint(source_path)
+    if not tag:
+        # 連檔案都讀不到時的最後退路：用接收時間的微秒，至少同批不會互相覆蓋
+        tag = f"{received_time.microsecond:06d}"
+
+    return f"{ts.strftime('%Y%m%d_%H%M%S')}_{tag.lower()}{ext}"
 
 
 def unique_destination(dest_dir: Path, filename: str) -> Path:
@@ -122,10 +253,90 @@ def unique_destination(dest_dir: Path, filename: str) -> Path:
 
 INVALID_FOLDER_CHARS = '/\\:*?"<>|'
 
+MAX_FOLDER_NAME_LENGTH = 100
+
+# Windows 保留的裝置名稱，不能拿來當資料夾名
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+class FolderNameError(ValueError):
+    """
+    資料夾名稱不符合命名規則。
+
+    例外訊息是**要直接回覆給使用者看的中文說明**，故一律寫成長輩看得懂的句子，
+    不揭露技術細節（規格書 §2「對家人友善」）。
+    """
+
+
+def _has_control_char(text: str) -> bool:
+    return any(ord(c) < 32 or ord(c) == 127 for c in text)
+
+
+def validate_folder_name(name: str) -> str:
+    """
+    檢查使用者輸入的資料夾名稱能不能安全地當成 Windows 路徑的一段。
+    合格則回傳去掉頭尾空白的名稱；不合格則丟 `FolderNameError`，訊息可直接回覆使用者。
+
+    **刻意「檢查並退回」而不是「靜默修正」**：使用者打的名字就是他要的相簿名。
+    實測踩過的坑是使用者輸入 `2026-07-025大量測試` 時中間夾了一個換行字元
+    （手機輸入法斷行或複製貼上帶進來的），Windows 直接回 WinError 123
+    「檔案名稱、目錄名稱或磁碟區標籤語法錯誤」而讓整個流程中斷。若改成自動把
+    換行換成空白，會產生一個 `2026-07-0 25大量測試` 這種使用者沒預期的資料夾，
+    日後也對不上——明確請他改名比較不會出錯。
+    """
+    if name is None:
+        raise FolderNameError("資料夾名稱不能是空的，請重新輸入")
+
+    if _has_control_char(name):
+        raise FolderNameError(
+            "資料夾名稱裡不能有換行，請把名稱打在同一行之後再傳一次\n"
+            "（如果是複製貼上的，貼上時可能不小心帶進了換行）"
+        )
+
+    cleaned = name.strip()
+    if not cleaned:
+        raise FolderNameError("資料夾名稱不能是空的，請重新輸入")
+
+    bad = sorted({c for c in cleaned if c in INVALID_FOLDER_CHARS})
+    if bad:
+        raise FolderNameError(
+            f"資料夾名稱裡不能有這些符號：{' '.join(bad)}\n請換一個名字再傳一次"
+        )
+
+    if len(cleaned) > MAX_FOLDER_NAME_LENGTH:
+        raise FolderNameError(f"資料夾名稱太長了（最多 {MAX_FOLDER_NAME_LENGTH} 個字），請取短一點")
+
+    if cleaned.endswith("."):
+        raise FolderNameError("資料夾名稱的結尾不能是「.」，請換一個名字再傳一次")
+
+    if cleaned.upper() in _WINDOWS_RESERVED_NAMES:
+        raise FolderNameError(f"「{cleaned}」是電腦的保留名稱，不能當資料夾名，請換一個")
+
+    return cleaned
+
 
 def sanitize_folder_name(name: str) -> str:
-    """過濾資料夾名稱中的路徑非法字元，避免路徑錯誤。"""
-    cleaned = "".join(c for c in name if c not in INVALID_FOLDER_CHARS).strip()
+    """
+    把字串強制整理成安全的路徑片段，**不會失敗**。
+
+    這是給「不該因為名稱不漂亮就中斷」的內部用途使用的（例如用成員姓名組出
+    暫存資料夾名）。使用者親手輸入的資料夾名稱請改用 `validate_folder_name()`，
+    那條路要明確退回請他改名，而不是靜默改掉他取的名字。
+    """
+    if not name:
+        return ""
+    # 控制字元（換行、Tab…）一律視為空白：留著必定讓 Windows 拒絕整條路徑
+    cleaned = "".join(" " if (ord(c) < 32 or ord(c) == 127) else c for c in name)
+    cleaned = "".join(c for c in cleaned if c not in INVALID_FOLDER_CHARS)
+    cleaned = " ".join(cleaned.split())          # 連續空白收斂，並去掉頭尾
+    cleaned = cleaned[:MAX_FOLDER_NAME_LENGTH]
+    cleaned = cleaned.rstrip(". ")               # Windows 不允許結尾是點或空白
+    if cleaned.upper() in _WINDOWS_RESERVED_NAMES:
+        cleaned += "_"
     return cleaned
 
 
@@ -181,10 +392,21 @@ class CopyResult:
 
 
 def copy_file(src: Path, dest_dir: Path, filename: str) -> Path:
-    """單次複製：建目的地夾（如不存在）+ copy2，撞名自動改名。同步函式。"""
+    """
+    單次複製：建目的地夾（如不存在）+ copy2，**撞名自動改名，絕不覆蓋**。同步函式。
+
+    ⚠️ 這裡絕對不可以改成「同名直接覆蓋」（規格書 §2、§8、§10、§11.3）。
+    `shutil.copy2` 對已存在的目的地是**破壞性寫入**——底層是 `open(dst, 'wb')`，
+    開檔當下原檔就歸零。若複製途中網芳斷線（本專案實際遇過 WinError 50，
+    見 §4.1），結果會是「原本那張照片沒了、新的那張又不完整」，兩張都救不回來。
+    改名另存最壞情況只是多一個 `_(2)` 檔案，由管理員照「待清理清單」刪掉即可
+    ——漏存可以補救，覆蓋掉的照片救不回來。
+    """
     dest_dir = Path(dest_dir)
     ensure_dir(dest_dir)
     dest_path = unique_destination(dest_dir, filename)
+    if dest_path.name != filename:
+        logger.info("目的地已有同名照片 [%s]，另存為 [%s]（絕不覆蓋）", filename, dest_path.name)
     shutil.copy2(src, dest_path)
     return dest_path
 
@@ -263,6 +485,54 @@ def health_check(dest_dir: Path) -> tuple[bool, Optional[str]]:
 
 
 # ── OneDrive 釋放本機空間 ─────────────────────────────
+
+PENDING_RELEASE_FILENAME = "pending_onedrive_release.json"
+
+
+def _pending_release_path(data_dir: Path) -> Path:
+    return Path(data_dir) / PENDING_RELEASE_FILENAME
+
+
+def read_pending_releases(data_dir: Path) -> list[dict]:
+    """讀出尚未執行的釋放空間待辦。檔案不存在或損毀一律回傳空清單。"""
+    p = _pending_release_path(data_dir)
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def write_pending_releases(data_dir: Path, entries: list[dict]) -> None:
+    """整份覆寫待辦檔。內容極小（只有到期時間與路徑清單），不需要 append 最佳化。"""
+    p = _pending_release_path(data_dir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def add_pending_release(data_dir: Path, batch_id: str, due_at: str, paths: list) -> None:
+    """
+    登記一筆「稍後要釋放本機空間」的待辦（規格書 §4.2）。
+
+    排程本身掛在 PTB 的 AsyncIOScheduler，那是**行程內記憶體**——bot 一關就
+    消失，那批照片的「僅線上」標記永遠不會下。比照 §4.3 `_session_info.json`
+    側車檔的做法，同步落地一份待辦，啟動時才能掃描補做。
+    """
+    entries = [e for e in read_pending_releases(data_dir) if e.get("batch_id") != batch_id]
+    entries.append({"batch_id": batch_id, "due_at": due_at, "paths": [str(p) for p in paths]})
+    write_pending_releases(data_dir, entries)
+
+
+def remove_pending_release(data_dir: Path, batch_id: str) -> None:
+    """釋放完成後把該筆待辦移除。"""
+    entries = read_pending_releases(data_dir)
+    remaining = [e for e in entries if e.get("batch_id") != batch_id]
+    if len(remaining) != len(entries):
+        write_pending_releases(data_dir, remaining)
+
+
 
 def free_onedrive_space(paths: list[Path]) -> None:
     """

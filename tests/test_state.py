@@ -162,4 +162,4 @@ def test_progress_bar_zero_total_no_crash():
 def test_recent_folder_icon_mapping():
     assert recent_folder_icon("家裡硬碟") == "🏠"
     assert recent_folder_icon("OneDrive") == "☁️"
-    assert recent_folder_icon("兩邊都存") == "📦"
+    assert recent_folder_icon("兩邊都存") == "🏠☁️"
