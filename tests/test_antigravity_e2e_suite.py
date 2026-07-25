@@ -1013,3 +1013,154 @@ async def test_folder_name_with_newline_is_rejected_with_explanation(env):
     )
     assert session.folder == "2026-07-25大量測試"
     assert session.stage == "awaiting_destination"
+
+
+@pytest.mark.asyncio
+async def test_finish_button_with_zero_photos_blocked(env):
+    """防誤觸測試：當尚未收到任何照片時按『我傳完了』，必須提示並拒絕關閉 session。"""
+    app, *_ = env
+    ctx = DummyContext(app)
+    user = DummyUser(1030, "小明")
+    session = await _open_session(app, ctx, user, "空測試相簿")
+    assert session.received_count == 0
+
+    finish_msg = DummyMessage(5, "", 1030, app.bot)
+    finish_cb = DummyCallbackQuery("finish", user, finish_msg)
+    await upload.handle_finish_button(DummyUpdate(user, finish_msg, finish_cb), ctx)
+
+    # 驗證 session 仍然維持在 receiving_photos 階段，未進入 debounce，且提示「尚未收到任何照片」
+    assert session.stage == "receiving_photos"
+    assert "尚未收到任何照片" in app.bot.sent_messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_inactivity_prompt_workflow(env):
+    """靜置提醒測試：傳照片後靜置 25 秒主動跳出確認選單，點『我還要繼續傳』恢復接收狀態。"""
+    from datetime import timedelta
+    app, *_ = env
+    ctx = DummyContext(app)
+    user = DummyUser(1031, "大姊")
+    session = await _open_session(app, ctx, user, "靜置測試相簿")
+    await _send_photo(app, ctx, user, "photo_idle_1", 1)
+    assert session.received_count == 1
+
+    # 模擬靜置 30 秒
+    session.last_activity_at = datetime.now() - timedelta(seconds=30)
+    await upload.check_session_timeouts(ctx)
+
+    # 驗證主動跳出「看起來照片傳得差不多囉」詢問訊息
+    assert session.inactivity_prompted is True
+    assert "看起來照片傳得差不多囉" in app.bot.sent_messages[-1]["text"]
+
+    # 使用者點擊 [📷 我還有照片沒傳完]
+    cont_msg = DummyMessage(10, "", 1031, app.bot)
+    cont_cb = DummyCallbackQuery("continue_receiving", user, cont_msg)
+    await upload.handle_continue_receiving_button(DummyUpdate(user, cont_msg, cont_cb), ctx)
+
+    assert session.inactivity_prompted is False
+    assert "繼續傳送照片" in app.bot.sent_messages[-1]["text"]
+
+    # 再次模擬靜置 30 秒，驗證仍可二次觸發詢問
+    session.last_activity_at = datetime.now() - timedelta(seconds=30)
+    await upload.check_session_timeouts(ctx)
+    assert session.inactivity_prompted is True
+
+
+@pytest.mark.asyncio
+async def test_auto_append_late_photos(env):
+    """遲到照片測試：3 分鐘內完工的批次，若傳來遲到的照片，自動補存入同個資料夾。"""
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+    ctx = DummyContext(app)
+    user = DummyUser(1032, "二哥")
+
+    # 1. 正常完成一次上傳
+    session = await _open_session(app, ctx, user, "家庭聚餐")
+    await _send_photo(app, ctx, user, "p1", 1)
+    await session.pipeline.settle()
+    await upload._finalize_upload(ctx, session, timed_out=False)
+
+    # 驗證 session 已結束，且紀錄留在 last_batch
+    assert app.bot_data["sessions"].get(1032) is None
+    last_batch = app.bot_data["sessions"].get_last_batch(1032)
+    assert last_batch is not None
+    assert last_batch.folder == "家庭聚餐"
+
+    # 2. 3 分鐘窗口內丟入一張遲到的照片
+    gate = asyncio.Event()
+    app.bot.get_file_gate = gate
+    dummy_photo_item = MagicMock()
+    dummy_photo_item.file_id = "late_p2"
+    dummy_photo_item.file_unique_id = "uniq_late_p2"
+    late_msg = DummyMessage(50, "", 1032, app.bot, photo=[dummy_photo_item])
+    await asyncio.wait_for(upload.handle_photo_message(DummyUpdate(user, late_msg), ctx), timeout=2)
+
+    # 自動開了一個指向同一個相簿的 session，且照樣是「登記完就返回」不等下載（§3.1）
+    late_session = app.bot_data["sessions"].get(1032)
+    assert late_session is not None
+    assert late_session.auto_appended is True
+    assert late_session.folder == "家庭聚餐"
+    assert late_session.destination == last_batch.destination_label
+    assert late_session.stage == "debounce", "直接進緩衝，收齊後自動結案，使用者不必按我傳完了"
+    assert late_session.received_count == 1
+    assert late_session.files[0].downloaded is False, "下載還被擋著，代表沒有在事件處理裡同步等它"
+    assert any("自動幫你存進剛剛的「家庭聚餐」" in m["text"] for m in app.bot.sent_messages)
+
+    # 3. 放行下載，讓緩衝結束收尾——走的是正常流程，不是另一條土炮路徑
+    gate.set()
+    app.bot.get_file_gate = None
+    await upload._debounce_fire(ctx_with_job(ctx, 1032))
+
+    assert len(list((nas_dir / "家庭聚餐").glob("*.jpg"))) == 2
+    logs: DataLogs = app.bot_data["logs"]
+    rows = logs.upload_log.read_all_rows()
+    assert len(rows) == 2, "補存批次要照常寫入 upload_log"
+    assert rows[-1]["上傳者"] == "二哥", "上傳者要用註冊的稱呼，不是 Telegram 暱稱"
+    # file_index 也要有補存那張，日後才找得回來
+    assert any(r["file_id"] == "late_p2" for r in logs.file_index.read_all_rows())
+
+
+@pytest.mark.asyncio
+async def test_duplicate_photo_never_overwrites_and_is_listed_for_cleanup(env):
+    """
+    同一張照片重複上傳時（指紋檔名相同）：
+    - **絕不覆蓋**既有檔案，另存一份（§2、§8、§10）
+    - 重複的那份逐筆寫進待清理清單，讓管理員有依據可以刪（§10B）
+    - 完成訊息要說明有幾張重複，避免使用者以為漏傳
+    """
+    app, data_dir, temp_dir, nas_dir, od_dir = env
+    ctx = DummyContext(app)
+    user = DummyUser(1033, "三姊")
+    dest_dir = nas_dir / "重複測試"
+
+    # 第一次上傳
+    session = await _open_session(app, ctx, user, "重複測試")
+    await _send_photo(app, ctx, user, "dup_1", 10)
+    await session.pipeline.settle()
+    await upload._finalize_upload(ctx, session, timed_out=False)
+    assert len(list(dest_dir.glob("*.jpg"))) == 1
+    first = list(dest_dir.glob("*.jpg"))[0]
+    first_bytes = first.read_bytes()
+
+    # 第二次傳同一張（同樣的 file_id → 同樣的指紋 → 同樣的檔名）
+    session2 = await _open_session(app, ctx, user, "重複測試")
+    await _send_photo(app, ctx, user, "dup_1", 20)
+    await session2.pipeline.settle()
+    await upload._finalize_upload(ctx, session2, timed_out=False)
+
+    files = sorted(dest_dir.glob("*.jpg"))
+    assert len(files) == 2, "撞名要另存一份，不可覆蓋"
+    assert first.exists() and first.read_bytes() == first_bytes, "原本那張必須完好無損"
+    assert any("_(2)" in f.name for f in files)
+
+    # 待清理清單要有這筆重複，且欄位對得上
+    logs: DataLogs = app.bot_data["logs"]
+    dup_rows = [r for r in logs.cleanup_list.read_all_rows() if r["類型"] == "重複檔案"]
+    assert len(dup_rows) == 1
+    assert dup_rows[0]["上傳者"] == "三姊"
+    assert "_(2)" in dup_rows[0]["檔名"]
+
+    # 使用者訊息要講清楚有幾張重複；管理員要另外收到清理通知
+    user_texts = [m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1033]
+    assert any("1 張跟相簿裡已經有的照片是同一張" in t for t in user_texts)
+    admin_texts = [m["text"] for m in app.bot.sent_messages if m["chat_id"] == 999999]
+    assert any("待清理清單" in t and "重複" in t for t in admin_texts)

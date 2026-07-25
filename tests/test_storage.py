@@ -55,10 +55,27 @@ def test_build_filename_uses_exif_when_present(tmp_path):
     _make_photo_with_exif_original(img_path, "2008:02:27 14:30:15")
 
     received = datetime(2026, 7, 23, 10, 0, 0, 999999)
-    name = storage.build_filename(received, ext=".jpg", source_path=img_path, use_exif=True)
-    # 時間戳採 EXIF 拍攝時間，非今天；微秒仍採接收時間避免同批撞名
-    assert name.startswith("20080227_143015_")
-    assert name.endswith("999999.jpg")
+    name = storage.build_filename(received, ext=".jpg", source_path=img_path, use_exif=True, unique_identifier="a1b2c3d4e5f6")
+    # 時間戳採 EXIF 拍攝時間，字尾採 file_unique_id 後 8 碼（永久指紋）
+    assert name == "20080227_143015_c3d4e5f6.jpg"
+
+
+def test_build_filename_falls_back_to_content_md5_not_file_id(tmp_path):
+    """
+    拿不到 file_unique_id 時，指紋必須回退為**檔案內容 MD5**。
+    絕不可回退為 file_id——Telegram 明訂 file_id 會隨 bot 與時間變動，
+    用它當「同一張照片檔名永遠相同」的依據自我矛盾。
+    """
+    img = tmp_path / "a.jpg"
+    img.write_bytes(b"SAME-CONTENT")
+    copy = tmp_path / "b.jpg"
+    copy.write_bytes(b"SAME-CONTENT")
+
+    received = datetime(2026, 7, 25, 12, 0, 0, 123456)
+    n1 = storage.build_filename(received, ext=".jpg", source_path=img, use_exif=False)
+    n2 = storage.build_filename(received, ext=".jpg", source_path=copy, use_exif=False)
+    assert n1 == n2, "同樣內容的照片必須得到同樣的指紋檔名"
+    assert n1.endswith(storage.calculate_md5(img)[:8] + ".jpg")
 
 
 # ── 撞名保護：絕不覆蓋（§10、測項 E8）────────────────
@@ -100,6 +117,11 @@ def test_copy_file_creates_dest_dir_and_copies(tmp_path):
 
 
 def test_copy_file_never_overwrites_same_name(tmp_path):
+    """
+    §2／§8／§10 的硬性保證：目的地已有同名檔案時一律另存，絕不覆蓋。
+    覆蓋是破壞性寫入（copy2 底層 open(dst,'wb') 開檔當下原檔就歸零），
+    途中斷線會同時失去原檔與新檔——這條測試就是守這個的，不可以反過來寫。
+    """
     src1 = tmp_path / "src1.jpg"
     src1.write_bytes(b"AAA")
     src2 = tmp_path / "src2.jpg"
@@ -109,8 +131,8 @@ def test_copy_file_never_overwrites_same_name(tmp_path):
     p1 = storage.copy_file(src1, dest_dir, "same.jpg")
     p2 = storage.copy_file(src2, dest_dir, "same.jpg")
 
-    assert p1 != p2
-    assert p1.read_bytes() == b"AAA"
+    assert p1 != p2, "撞名必須另存新檔，不可指向同一個路徑"
+    assert p1.read_bytes() == b"AAA", "原本那張照片必須完好無損"
     assert p2.read_bytes() == b"BBB"
 
 

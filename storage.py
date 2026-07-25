@@ -12,7 +12,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import shutil
 import subprocess
 import time
@@ -20,6 +22,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger("photo-bot.storage")
 
 try:
     from PIL import Image
@@ -83,23 +87,51 @@ def read_exif_datetime(file_path: Path) -> Optional[datetime]:
         return None
 
 
+def calculate_md5(file_path: Path) -> str:
+    """計算檔案內容的 MD5 雜湊值 (DNA)，用於精準去重。"""
+    md5 = hashlib.md5()
+    try:
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                md5.update(chunk)
+        return md5.hexdigest()
+    except Exception:
+        return ""
+
+
 def build_filename(
     received_time: datetime,
     ext: str = ".jpg",
     source_path: Optional[Path] = None,
     use_exif: bool = True,
+    unique_identifier: Optional[str] = None,
 ) -> str:
     """
     產生檔名：優先採 EXIF 拍攝時間，讀不到才回退為接收時間（見規格書 §10）。
-    格式：YYYYMMDD_HHMMSS_微秒.jpg
+    字尾為相片的**永久指紋**：優先取 Telegram `file_unique_id` 的後 8 碼，
+    取不到才回退為檔案內容的 MD5 前 8 碼。兩者都是「同一張照片必然相同」的值，
+    所以同一張照片無論何時傳送，產生的檔名都一樣。
+    格式：YYYYMMDD_HHMMSS_指紋.jpg
+
+    ⚠️ 不可以拿 `file_id` 當指紋來源：Telegram 明訂 `file_id` **會隨 bot 與時間變動**，
+    同一張照片重傳會得到不同的 file_id，用它當「永久指紋」自我矛盾。
+    真正永久不變的是 `file_unique_id`。
     """
     ts = None
     if use_exif and source_path is not None:
         ts = read_exif_datetime(source_path)
     if ts is None:
         ts = received_time
-    micro = received_time.microsecond  # 微秒一律用接收時間，確保同批不同檔不撞名
-    return f"{ts.strftime('%Y%m%d_%H%M%S')}_{micro:06d}{ext}"
+
+    if unique_identifier:
+        uid_tag = str(unique_identifier)[-8:].lower()
+    elif source_path is not None and source_path.exists():
+        md5_hex = calculate_md5(source_path)
+        uid_tag = md5_hex[:8].lower() if md5_hex else f"{received_time.microsecond:06d}"
+    else:
+        uid_tag = f"{received_time.microsecond:06d}"
+
+    return f"{ts.strftime('%Y%m%d_%H%M%S')}_{uid_tag}{ext}"
 
 
 def unique_destination(dest_dir: Path, filename: str) -> Path:
@@ -261,10 +293,21 @@ class CopyResult:
 
 
 def copy_file(src: Path, dest_dir: Path, filename: str) -> Path:
-    """單次複製：建目的地夾（如不存在）+ copy2，撞名自動改名。同步函式。"""
+    """
+    單次複製：建目的地夾（如不存在）+ copy2，**撞名自動改名，絕不覆蓋**。同步函式。
+
+    ⚠️ 這裡絕對不可以改成「同名直接覆蓋」（規格書 §2、§8、§10、§11.3）。
+    `shutil.copy2` 對已存在的目的地是**破壞性寫入**——底層是 `open(dst, 'wb')`，
+    開檔當下原檔就歸零。若複製途中網芳斷線（本專案實際遇過 WinError 50，
+    見 §4.1），結果會是「原本那張照片沒了、新的那張又不完整」，兩張都救不回來。
+    改名另存最壞情況只是多一個 `_(2)` 檔案，由管理員照「待清理清單」刪掉即可
+    ——漏存可以補救，覆蓋掉的照片救不回來。
+    """
     dest_dir = Path(dest_dir)
     ensure_dir(dest_dir)
     dest_path = unique_destination(dest_dir, filename)
+    if dest_path.name != filename:
+        logger.info("目的地已有同名照片 [%s]，另存為 [%s]（絕不覆蓋）", filename, dest_path.name)
     shutil.copy2(src, dest_path)
     return dest_path
 

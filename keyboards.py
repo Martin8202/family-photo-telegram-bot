@@ -14,6 +14,7 @@ CB_RESTART = "restart"
 CB_RESTART_CONFIRM = "restart_confirm"
 CB_RESTART_CANCEL = "restart_cancel"
 CB_FINISH = "finish"
+CB_CONTINUE_RECEIVING = "continue_receiving"
 CB_CORRECTION = "correction"
 CB_DEST_PREFIX = "dest:"
 CB_RECENT_FOLDER_PREFIX = "recent:"
@@ -78,7 +79,8 @@ def destination_keyboard(enable_nas: bool = True) -> InlineKeyboardMarkup:
 def in_session_keyboard(show_finish: bool = True) -> InlineKeyboardMarkup:
     rows = []
     if show_finish:
-        rows.append([InlineKeyboardButton("✅ 我傳完了", callback_data=CB_FINISH)])
+        rows.append([InlineKeyboardButton("⚡ 沒照片了，發送並寫入", callback_data=CB_FINISH)])
+        rows.append([InlineKeyboardButton("📷 我還有照片沒傳完", callback_data=CB_CONTINUE_RECEIVING)])
     rows.append([InlineKeyboardButton("🔄 重新開始", callback_data=CB_RESTART)])
     return InlineKeyboardMarkup(rows)
 
@@ -106,3 +108,11 @@ def restart_confirm_keyboard() -> InlineKeyboardMarkup:
 
 def correction_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("↩️ 這批傳錯了", callback_data=CB_CORRECTION)]])
+
+
+def inactivity_prompt_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ 確定傳完了，開始上傳", callback_data=CB_FINISH)],
+        [InlineKeyboardButton("📷 我還有照片沒傳完", callback_data=CB_CONTINUE_RECEIVING)],
+        restart_row(),
+    ])

@@ -57,6 +57,7 @@ class ReceivedFile:
     worker 真的把檔案抓下來之後才會填上，故一律為 Optional。
     """
     file_id: str
+    file_unique_id: Optional[str] = None
     media_group_id: Optional[str] = None
     received_at: datetime = field(default_factory=datetime.now)
     is_original_quality: bool = False  # True＝以 document 傳送的原始檔
@@ -110,7 +111,11 @@ class UploadSession:
     compressed_warned: bool = False
     counter_message_id: Optional[int] = None  # 收件計數訊息 id，刪舊發新置底顯示（§6.3.1）
     confirm_message_id: Optional[int] = None  # 「確認中…」訊息 id，緩衝期間更新張數
+    inactivity_prompted: bool = False  # 是否已發出過「看起來傳得差不多囉，請問傳完了嗎？」靜置提醒
+    inactivity_prompt_message_id: Optional[int] = None  # 靜置提醒訊息 id
     destinations: dict = field(default_factory=dict)  # label -> DestinationOutcome
+    auto_appended: bool = False  # 是否為「遲到照片自動併案」開出來的 session（§6.6）
+    duplicate_count: int = 0  # 本次撞名另存的次數（跨所有目的地累計，回報前需除以目的地數）
     flushed_count: int = 0  # 已進入過複製流程（成功或失敗）的張數
     stored_count: int = 0   # 已成功複製到「所有」目的地的張數，即畫面上的「已存好 N 張」
     pending_retry_files: list = field(default_factory=list)  # 分批寫入失敗、留待批次後重試的檔案

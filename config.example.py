@@ -29,7 +29,8 @@ WRITE_THROTTLE_SEC = 0.3      # 每張寫入間隔
 RETRY_AFTER_BATCH = True      # 本次結束後自動重試失敗檔
 ONEDRIVE_FREE_SPACE = True    # session 結束後釋放 OneDrive 本機空間
 RECENT_FOLDERS_COUNT = 3      # 記憶最近幾個資料夾
-FINISH_DEBOUNCE_SEC = 5       # 按「我傳完了」後的結案緩衝秒數
+FINISH_DEBOUNCE_SEC = 4       # 靜置自動結案倒數秒數（4 秒自適應倒數）
+AUTO_APPEND_WINDOW_MIN = 3    # 遲到照片自動併案窗口（分鐘）
 
 # ── 背景 worker（見規格書 §3.1、§6.3.3）──────────
 # 並行度固定、不隨照片數量增加：一次傳 10 張與一次傳 3000 張，對磁碟與網芳的
@@ -42,6 +43,7 @@ DOWNLOAD_RETRY_TIMES = 3      # 從 Telegram 下載單張照片的重試次數
 # 加上張數門檻，小批量快速傳送時畫面同樣會明顯跳動。
 COUNTER_UPDATE_SEC = 5        # 收件計數：時間門檻（秒）
 COUNTER_UPDATE_COUNT = 8      # 收件計數：張數門檻（新增滿幾張就更新一次）
+INACTIVITY_PROMPT_TIMEOUT_SEC = 25 # 靜置無新照片時主動詢問的沉寂秒數
 # ⚠️ CONFIRM_UPDATE_SEC 必須明顯小於 FINISH_DEBOUNCE_SEC，否則「確認中」的張數
 #    根本來不及更新就結案了（v2 兩者都是 5 秒，正是「數字不會跳」的成因）。
 CONFIRM_UPDATE_SEC = 2        # 「確認中」張數：時間門檻（秒）

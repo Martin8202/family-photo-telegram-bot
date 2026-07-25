@@ -33,6 +33,7 @@ from keyboards import (
     CB_CORRECTION_FOLDER_PREFIX,
     CB_DEST_PREFIX,
     CB_FINISH,
+    CB_CONTINUE_RECEIVING,
     CB_RECENT_FOLDER_PREFIX,
     CB_REGISTER,
     CB_REJECT_PREFIX,
@@ -320,6 +321,9 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(upload.handle_recent_folder_button, pattern=f"^{CB_RECENT_FOLDER_PREFIX}"))
     app.add_handler(CallbackQueryHandler(upload.handle_destination_button, pattern=f"^{CB_DEST_PREFIX}"))
     app.add_handler(CallbackQueryHandler(upload.handle_finish_button, pattern=f"^{CB_FINISH}$"))
+    app.add_handler(CallbackQueryHandler(
+        upload.handle_continue_receiving_button, pattern=f"^{CB_CONTINUE_RECEIVING}$"
+    ))
     app.add_handler(CallbackQueryHandler(upload.handle_restart_button, pattern=f"^{CB_RESTART}$"))
     app.add_handler(CallbackQueryHandler(upload.handle_restart_confirm, pattern=f"^{CB_RESTART_CONFIRM}$"))
     app.add_handler(CallbackQueryHandler(upload.handle_restart_cancel, pattern=f"^{CB_RESTART_CANCEL}$"))

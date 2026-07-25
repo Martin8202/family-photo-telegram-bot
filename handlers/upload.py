@@ -39,6 +39,7 @@ from keyboards import (
     CB_CORRECTION_FOLDER_PREFIX,
     CB_DEST_PREFIX,
     CB_FINISH,
+    CB_CONTINUE_RECEIVING,
     CB_RECENT_FOLDER_PREFIX,
     CB_RESTART,
     CB_RESTART_CANCEL,
@@ -48,6 +49,7 @@ from keyboards import (
     destination_keyboard,
     folder_choice_keyboard,
     in_session_keyboard,
+    inactivity_prompt_keyboard,
     restart_confirm_keyboard,
     restart_row,
     start_upload_keyboard,
@@ -66,6 +68,7 @@ from state import (
     CompletedBatch,
     DestinationOutcome,
     ReceivedFile,
+    UploadSession,
     chunk_files,
     progress_bar,
     should_update_confirm,
@@ -90,6 +93,8 @@ _DEFAULTS = {
     "COUNTER_REANCHOR_SEC": 5,
     "CORRECTION_PROMPT_MAX_MIN": 10,
     "STAGE_STUCK_MAX_MIN": 30,
+    "INACTIVITY_PROMPT_TIMEOUT_SEC": 25,
+    "AUTO_APPEND_WINDOW_MIN": 3,
 }
 
 
@@ -314,7 +319,7 @@ async def handle_destination_button(update: Update, context: ContextTypes.DEFAUL
 
     await query.message.reply_text(
         notify.user_msg_upload_ready(session.folder, destination),
-        reply_markup=in_session_keyboard(),
+        reply_markup=in_session_keyboard(show_finish=False),
     )
 
 
@@ -530,6 +535,8 @@ async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, sessio
     telegram_id = session.telegram_id
     chunk_ok_labels = {}
     index_rows_by_label: dict[str, list[tuple]] = {}
+    duplicate_rows: list[tuple] = []
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     for label, dest_dir in dest_targets.items():
         outcome = session.destinations.setdefault(label, DestinationOutcome(label=label))
@@ -543,8 +550,11 @@ async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, sessio
 
             def _do_copy(rf=rf, dest_dir=dest_dir):
                 ext = Path(rf.temp_path).suffix or ".jpg"
+                # 指紋只認 file_unique_id（永久不變）。拿不到時 build_filename 會自動
+                # 回退為檔案內容 MD5——絕不可退回 file_id，那個值會隨時間變動。
                 filename = storage.build_filename(
-                    rf.received_at, ext=ext, source_path=rf.temp_path, use_exif=config.USE_EXIF_TIME
+                    rf.received_at, ext=ext, source_path=rf.temp_path,
+                    use_exif=config.USE_EXIF_TIME, unique_identifier=rf.file_unique_id,
                 )
                 result = storage.copy_file_with_retry(
                     rf.temp_path, dest_dir, filename, config.RETRY_TIMES, config.RETRY_DELAYS
@@ -556,6 +566,15 @@ async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, sessio
             # 實際落地的檔名以 dest_path 為準（撞名時會被改成 _(2) 等），
             # 失敗則退而求其次記錄本來要用的檔名，方便追查。
             actual_filenames.append(result.dest_path.name if result.success and result.dest_path else attempted_filename)
+            # 撞名代表「這張照片相簿裡已經有了」（指紋檔名相同＝同一張）。
+            # 依零刪除原則另存一份，並逐筆寫進待清理清單交給管理員判斷後刪除（§10B）。
+            if result.success and result.dest_path and result.dest_path.name != attempted_filename:
+                session.duplicate_count += 1
+                duplicate_rows.append((
+                    now_str, session.name, telegram_id, "重複檔案",
+                    str(result.dest_path.parent), result.dest_path.name,
+                    f"與相簿既有的「{attempted_filename}」是同一張，確認後可刪除這份副本",
+                ))
             # 大批次的複製可能持續數十分鐘；沿路 touch 才不會被 §6.4 的閒置逾時誤殺。
             session.touch()
             if config.WRITE_THROTTLE_SEC:
@@ -576,8 +595,11 @@ async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, sessio
 
         index_rows_by_label[label] = list(zip(chunk, actual_filenames))
 
+    # 重複檔案清單先落地，管理員才有依據可以精準刪除（§10B）
+    if duplicate_rows:
+        await asyncio.to_thread(logs.log_cleanup_batch, duplicate_rows)
+
     # file_index：成功或失敗一律記錄（§16.1），檔名一律是實際寫入目的地的檔名
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     index_rows = []
     for label, pairs in index_rows_by_label.items():
         for rf, actual_filename in pairs:
@@ -650,6 +672,52 @@ async def _update_confirm_message(context: ContextTypes.DEFAULT_TYPE, session, m
         logger.warning("更新確認中訊息失敗：%s", exc)
 
 
+async def _start_auto_append_session(update: Update, context: ContextTypes.DEFAULT_TYPE, last_batch, message):
+    """
+    遲到照片自動併案（規格書 §6.6）：上一批剛完成沒多久又收到照片時，自動開一個
+    指向同一個資料夾／目的地的 session，讓照片直接歸案，使用者不必重選一次。
+
+    刻意**不另外寫一條搬檔案的路徑**，而是重用正常流程：背景下載 worker、下載重試、
+    失敗通知、file_index、upload_log、written_paths（供「這批傳錯了」使用）
+    全部自動繼承，不需要把同一套容易出錯的邏輯再寫一遍。
+
+    直接進入 STAGE_DEBOUNCE：遲到照片可能不只一張，靠既有的結案緩衝收齊後
+    一次寫入，使用者連「我傳完了」都不必按。
+    """
+    members, _, config, sessions, _ = _services(context)
+    telegram_id = update.effective_user.id
+    member = members.get(telegram_id)
+    if member is None:
+        return None
+
+    now = datetime.now()
+    session = sessions.start(telegram_id, member.name, now)
+    session.folder = last_batch.folder
+    session.destination = last_batch.destination_label
+    session.auto_appended = True
+    for label in _destination_targets(session.destination, config, session.folder):
+        session.destinations[label] = DestinationOutcome(label=label)
+
+    session.temp_dir = storage.session_temp_dir(
+        storage.user_temp_dir(Path(config.TEMP_DIR), telegram_id, session.name), now, session.folder
+    )
+    # 側車檔照寫，程式中斷後這批遲到照片同樣能被復原（§4.3）
+    await asyncio.to_thread(
+        storage.write_session_info, session.temp_dir,
+        {"destination": session.destination, "folder": session.folder,
+         "telegram_id": telegram_id, "name": session.name},
+    )
+    session.enter_stage(STAGE_DEBOUNCE, now)
+    session.confirm_last_reanchor = now
+    session.mark_confirm_updated(now)
+
+    try:
+        await message.reply_text(notify.user_msg_auto_appended(last_batch.folder))
+    except Exception:
+        pass
+    return session
+
+
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     收到照片：**只做登記與畫面更新，毫秒級返回**（規格書 §3.1、§6.3）。
@@ -658,15 +726,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     members, notifier, config, sessions, logs = _services(context)
     telegram_id = update.effective_user.id
     session = sessions.get(telegram_id)
-    if session is None:
-        await remind_not_started(update, context)
-        return
-    if session.stage not in (STAGE_RECEIVING_PHOTOS, STAGE_DEBOUNCE):
-        # 緩衝（STAGE_DEBOUNCE）期間仍要正常收照片、計入本批（§6.3）；
-        # 其餘非收件階段（選資料夾/目的地中）才提示「請先選資料夾」。
-        if session.stage in (STAGE_AWAITING_FOLDER, STAGE_AWAITING_DESTINATION):
-            await update.effective_message.reply_text(notify.user_msg_choose_folder_first())
-        return
+    now = datetime.now()
 
     message = update.effective_message
     is_document = message.document is not None and (message.document.mime_type or "").startswith("image/")
@@ -679,10 +739,30 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         return  # 非圖片訊息，交由其他 handler（若有）處理
 
-    # ── 登記：純記憶體、不碰磁碟、不等網路（§6.3「登記與落地是兩件事」）──
-    now = datetime.now()
+    if session is None:
+        # 上一批才剛完成沒多久 → 視為遲到照片，自動歸案到同一個相簿（§6.6）
+        last_batch = sessions.get_last_batch(telegram_id)
+        auto_append_min = _cfg(config, "AUTO_APPEND_WINDOW_MIN")
+        if (
+            last_batch is not None
+            and not last_batch.corrected
+            and (now - last_batch.completed_at).total_seconds() <= auto_append_min * 60
+        ):
+            session = await _start_auto_append_session(update, context, last_batch, message)
+        if session is None:
+            await remind_not_started(update, context)
+            return
+
+    if session.stage not in (STAGE_RECEIVING_PHOTOS, STAGE_DEBOUNCE):
+        if session.stage in (STAGE_AWAITING_FOLDER, STAGE_AWAITING_DESTINATION):
+            await update.effective_message.reply_text(notify.user_msg_choose_folder_first())
+        return
+
+    raw_uid = getattr(tg_file, "file_unique_id", None)
+    file_unique_id = raw_uid if isinstance(raw_uid, str) else None
     rf = ReceivedFile(
         file_id=tg_file.file_id,
+        file_unique_id=file_unique_id,
         media_group_id=getattr(message, "media_group_id", None),
         received_at=now,
         is_original_quality=is_original,
@@ -690,6 +770,9 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     session.add_file(rf)
     session.touch(now)
     _ensure_pipeline(context, session).submit(rf)
+
+    if session.inactivity_prompted:
+        session.inactivity_prompted = False  # 不刪除訊息，僅重置旗標以備後續若再次靜置可重新提醒
 
     if not is_original and not session.compressed_warned:
         session.compressed_warned = True
@@ -705,8 +788,6 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     # ── 緩衝期間（STAGE_DEBOUNCE）──
-    # 重新計時「不可節流」：只要登記到一張新照片就立刻重新起算，這是不漏收的核心
-    # 保證。畫面更新則走獨立且更靈敏的雙門檻節流（§6.3.1）。
     if should_update_confirm(session, now, _cfg(config, "CONFIRM_UPDATE_SEC"), _cfg(config, "CONFIRM_UPDATE_COUNT")):
         session.mark_confirm_updated(now)
         await _update_confirm_message(context, session, message, now)
@@ -752,6 +833,14 @@ async def handle_finish_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if session is None:
         return
 
+    # 防誤觸一：照片數為 0 時按了「我傳完了」，回覆提示並硬性攔截（不關閉 session）
+    if session.received_count == 0:
+        try:
+            await query.message.reply_text(notify.user_msg_no_photos_received())
+        except Exception:
+            pass
+        return
+
     now = datetime.now()
     if session.stage == STAGE_DEBOUNCE:
         # 緩衝期間重複點擊：不重新計時、不重算張數（§6.3），但仍要回覆一次
@@ -767,10 +856,11 @@ async def handle_finish_button(update: Update, context: ContextTypes.DEFAULT_TYP
         return  # 其餘階段沒有這顆按鈕可點
 
     session.finish_clicked = True
-    # 收件階段的「📥 收到照片中…」訊息在此結束任務，一律改由「⏳ 確認中…」接手，
-    # 避免兩則訊息同時留在畫面上。
+    # 收件階段的「📥 收到照片中…」與靜置提醒訊息在此結束任務
     await _delete_message_safe(context, telegram_id, session.counter_message_id)
     session.counter_message_id = None
+    await _delete_message_safe(context, telegram_id, session.inactivity_prompt_message_id)
+    session.inactivity_prompt_message_id = None
 
     session.enter_stage(STAGE_DEBOUNCE, now)
     sent = await query.message.reply_text(notify.user_msg_confirming(session.received_count))
@@ -778,6 +868,20 @@ async def handle_finish_button(update: Update, context: ContextTypes.DEFAULT_TYP
     session.confirm_last_reanchor = now
     session.mark_confirm_updated(now)
     _schedule_debounce(context, telegram_id)
+
+
+async def handle_continue_receiving_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """使用者在靜置提醒點擊 [📷 我還有照片沒傳完]：重置提醒並保留上傳 Session。"""
+    query = update.callback_query
+    await _safe_answer(query)
+    _, _, _, sessions, _ = _services(context)
+    telegram_id = update.effective_user.id
+    session = sessions.get(telegram_id)
+    if session is None or session.stage != STAGE_RECEIVING_PHOTOS:
+        return
+    session.inactivity_prompted = False
+    session.touch()
+    await query.message.reply_text(notify.user_msg_continue_receiving(), reply_markup=in_session_keyboard(show_finish=True))
 
 
 async def _debounce_fire(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -792,12 +896,31 @@ async def _debounce_fire(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ── 逾時保險（忘記按「我傳完了」）─────────────────────
 
 async def check_session_timeouts(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """由 job_queue 定期呼叫，掃描 session 逾時與遺棄清理（§6.4）。"""
+    """由 job_queue 定期呼叫，掃描 session 逾時、靜置提醒與遺棄清理（§6.4）。"""
     _, _, config, sessions, _ = _services(context)
     now = datetime.now()
     abandoned_max_min = getattr(config, "ABANDONED_SESSION_MAX_MIN", 60)
     stuck_max_min = _cfg(config, "STAGE_STUCK_MAX_MIN")
+    inactivity_sec = _cfg(config, "INACTIVITY_PROMPT_TIMEOUT_SEC")
+
     for session in list(sessions.all_sessions()):
+        # 主動巡邏提醒：收件階段、已收到照片、連續 25 秒無新照片、且尚未提醒過
+        if (
+            session.stage == STAGE_RECEIVING_PHOTOS
+            and session.received_count > 0
+            and not session.inactivity_prompted
+            and (now - session.last_activity_at).total_seconds() >= inactivity_sec
+        ):
+            session.inactivity_prompted = True
+            sent = await _safe_send(
+                context,
+                session.telegram_id,
+                notify.user_msg_inactivity_prompt(session.received_count, session.stored_count),
+                reply_markup=inactivity_prompt_keyboard(),
+            )
+            if sent:
+                session.inactivity_prompt_message_id = sent.message_id
+
         if session.is_idle_timed_out(config.SESSION_TIMEOUT_MIN, now):
             # 收件階段閒置逾時：有照片就自動當一批收尾，沒照片就清掉（§6.3 保險機制）
             if session.received_count > 0:
@@ -826,12 +949,12 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
     if session.stage == STAGE_PROCESSING:
         return  # 已在收尾中（debounce 與逾時掃描可能同時觸發），不重入
 
-    # 「⏳ 確認中…」與「📥 收到照片中…」的任務到此結束，改由「📤 上傳中」接手，
-    # 避免多則狀態訊息同時留在畫面上。
-    await _delete_message_safe(context, telegram_id, session.confirm_message_id)
+    # 「⏳ 確認中…」訊息保留在對話紀錄中不刪除（方便對照查看歷史張數）
     session.confirm_message_id = None
     await _delete_message_safe(context, telegram_id, session.counter_message_id)
     session.counter_message_id = None
+    await _delete_message_safe(context, telegram_id, session.inactivity_prompt_message_id)
+    session.inactivity_prompt_message_id = None
 
     session.enter_stage(STAGE_PROCESSING)
 
@@ -880,7 +1003,8 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
                 def _do_copy(rf=rf, dest_dir=dest_dir):
                     ext = Path(rf.temp_path).suffix or ".jpg"
                     filename = storage.build_filename(
-                        rf.received_at, ext=ext, source_path=rf.temp_path, use_exif=config.USE_EXIF_TIME
+                        rf.received_at, ext=ext, source_path=rf.temp_path,
+                        use_exif=config.USE_EXIF_TIME, unique_identifier=rf.file_unique_id,
                     )
                     return storage.copy_file_with_retry(
                         rf.temp_path, dest_dir, filename, config.RETRY_TIMES, config.RETRY_DELAYS
@@ -907,14 +1031,22 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
     )
     await asyncio.to_thread(members.push_recent_folder, telegram_id, session.folder, dest_label_text)
 
+    # 「兩邊都存」時同一張照片會在兩個目的地各記一次重複，換算回實際照片數才不會加倍
+    dest_count = max(1, len(session.destinations))
+    duplicate_photos = session.duplicate_count // dest_count
+
     if overall_ok:
-        text = notify.user_msg_done(total, session.folder, dest_label_text)
+        text = notify.user_msg_done(total, session.folder, dest_label_text, duplicate_count=duplicate_photos)
         if DEST_ONEDRIVE_LABEL in session.destinations:
             text += "\n" + notify.user_msg_onedrive_cloud_note()
         if failed_downloads:
             text += "\n" + notify.user_msg_download_failed_summary(len(failed_downloads))
         await _safe_send(context, telegram_id, text, reply_markup=correction_keyboard())
         await notifier.notify_admin(notify.msg_upload_success(session.name, session.folder, total, dest_label_text))
+        if duplicate_photos > 0:
+            await notifier.notify_admin(
+                notify.msg_duplicates_for_admin(session.name, session.folder, duplicate_photos)
+            )
 
         completed = CompletedBatch(
             telegram_id=telegram_id,

@@ -134,6 +134,26 @@ def user_msg_health_check_failed() -> str:
     return "現在暫時無法上傳，請稍後再試"
 
 
+def user_msg_no_photos_received() -> str:
+    return "尚未收到任何照片喔！請先在手機上選擇照片傳送給我，傳完再按此按鈕。"
+
+
+def user_msg_inactivity_prompt(received_count: int, stored_count: int) -> str:
+    return (
+        f"📥 看起來照片傳得差不多囉！目前共收到 {received_count} 張照片"
+        f"（已備份好 {stored_count} 張）。\n請問照片都傳完了嗎？"
+    )
+
+
+def user_msg_continue_receiving() -> str:
+    return "好的，請繼續傳送照片，傳完後隨時點下方按鈕："
+
+
+def user_msg_auto_appended(folder: str) -> str:
+    """遲到照片自動併案的開場提示（§6.6）。實際張數等收齊後由完成訊息宣告。"""
+    return f"💡 收到補傳的照片，會自動幫你存進剛剛的「{folder}」相簿"
+
+
 def user_msg_upload_ready(folder: str, dest_label: str) -> str:
     return f"✅ 準備好了！資料夾：{folder} ／ 存到：{dest_label}\n請開始傳照片，傳完後點下方按鈕"
 
@@ -162,8 +182,23 @@ def user_msg_uploading(progress_bar_text: str) -> str:
     return f"📤 上傳中 {progress_bar_text}"
 
 
-def user_msg_done(count: int, folder: str, dest_label: str) -> str:
-    return f"✅ 完成！{count} 張 → {folder}（{dest_label}）"
+def user_msg_done(count: int, folder: str, dest_label: str, duplicate_count: int = 0) -> str:
+    """
+    完成宣告。若本次有照片與相簿裡既有的重複，一併說明——這是使用者實測時
+    「傳 15 張但相簿裡其實只有 6 張不同」的困惑來源，講清楚才不會以為漏傳。
+    程式依零刪除原則不會覆蓋既有檔案，重複的那幾張會另存一份並記入待清理清單。
+    """
+    base = f"✅ 完成！{count} 張 → {folder}（{dest_label}）"
+    if duplicate_count > 0:
+        base += f"\n💡 其中 {duplicate_count} 張跟相簿裡已經有的照片是同一張，已另外存一份（不會覆蓋原本的）"
+    return base
+
+
+def msg_duplicates_for_admin(uploader: str, folder: str, count: int) -> str:
+    return (
+        f"⚠️ {uploader}「{folder}」本次有 {count} 張與相簿既有照片重複，"
+        f"已依零刪除原則另存副本，檔名逐筆記於待清理清單，請確認後手動刪除"
+    )
 
 
 def user_msg_onedrive_cloud_note() -> str:
