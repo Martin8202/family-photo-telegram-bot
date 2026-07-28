@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 from telegram import BotCommand, Update
@@ -54,17 +55,66 @@ LOG_DIR = Path(__file__).parent / "logs"
 
 UPLOAD_BUTTON_TEXT = "📷 我要上傳照片"
 
+# long polling 的等待秒數（PTB 預設 10）。
+#
+# 這不是「每 N 秒去問一次有沒有訊息」的空轉輪詢——getUpdates 送出後會**掛在
+# 那裡等**，Telegram 一有訊息就立刻回應。所以拉長等待時間**不會讓訊息變慢**，
+# 只是讓沒人使用時的請求數變少：10 秒改 50 秒，閒置時的請求量直接降為 1/5。
+#
+# PTB 會自動把 HTTP 的 read timeout 加上這個秒數（`Bot.get_updates` 內
+# `read_timeout = arg_read_timeout + timeout`），所以不必另外調整連線逾時。
+POLL_TIMEOUT_SEC = 50
+
+# log 保留天數：每天午夜換一支新檔，最多留這麼多支舊檔（約一週）。
+LOG_RETENTION_DAYS = 7
+
+# 平常只有例行 INFO、出事才需要看的第三方 logger（見 setup_logging 說明）。
+NOISY_LOGGERS = ("httpx", "apscheduler.executors.default")
+
 
 def setup_logging() -> None:
+    """
+    設定 log（規格書 §17）。
+
+    這裡有兩個刻意的取捨：
+
+    **① 每日輪替、只留近一週**
+
+    原本用 `logging.FileHandler`，檔案只增不減，而且是 append 模式——重開機
+    也不會重來。實測連續跑 5 天就長到 8.8 MB，長期下去真正的錯誤會被埋在
+    雜訊裡（查一次 502 得動用 grep 才挖得出來）。改成每天午夜換檔、保留 7 份。
+
+    **② 壓掉第三方套件的例行 INFO**
+
+    那 8.8 MB 的 54,534 行裡有 49,289 行（90%）是雜訊：httpx 每次 getUpdates
+    的 `200 OK`，以及 apscheduler 每 30 秒固定兩行的排程紀錄。真正屬於本程式
+    的只有 144 行。兩者都降到 WARNING——**出事時照樣會叫，平常不佔版面**。
+
+    > 網路異常不會因此漏掉：httpx 那行 `502 Bad Gateway` 雖然被壓掉了，但
+    > `on_error` 仍會完整記下 traceback（含 `NetworkError: Bad Gateway`
+    > 這個原因），診斷資訊一點都沒少。
+
+    `force=True` 不是可有可無的：`basicConfig` 在 root logger 已經有 handler 時
+    會**靜默地什麼都不做**——只要有任何模組在這之前先碰過 logging，這裡的設定
+    就會整個失效，而且不會有任何錯誤訊息。加上它才能保證輪替與雜訊壓制真的生效。
+    """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        force=True,
         handlers=[
-            logging.FileHandler(LOG_DIR / "photo-bot.log", encoding="utf-8"),
+            TimedRotatingFileHandler(
+                LOG_DIR / "photo-bot.log",
+                when="midnight",
+                backupCount=LOG_RETENTION_DAYS,
+                encoding="utf-8",
+            ),
             logging.StreamHandler(),
         ],
     )
+    for name in NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 logger = logging.getLogger("photo-bot")
@@ -410,7 +460,7 @@ def main() -> None:
     setup_logging()
     app = build_application()
     logger.info("photo-bot 啟動中…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, timeout=POLL_TIMEOUT_SEC)
 
 
 if __name__ == "__main__":
