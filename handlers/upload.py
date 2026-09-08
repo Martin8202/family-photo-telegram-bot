@@ -86,6 +86,9 @@ AWAITING_CORRECTION_FLAG = "awaiting_correction_folder"
 CORRECTION_FLAG_AT = "awaiting_correction_folder_at"
 
 NOT_STARTED_REMINDER_KEY = "last_not_started_reminder_at"
+# 開 session 當下健檢通過的目的地標籤清單。存在 user_data 是因為選目的地、
+# 以及「🔄 重新開始」後回到選目的地那一步，都要拿同一份結果來畫按鈕。
+HEALTHY_DESTS_KEY = "healthy_destinations"
 NOT_STARTED_REMINDER_COOLDOWN_SEC = 30
 
 # v3 新增參數的預設值，容許尚未同步更新的 config.py 也能運作（見規格書 §12.1）
@@ -244,6 +247,41 @@ def _destination_targets(destination: str, config, folder: str) -> dict:
     return {label: roots[label] / folder for label in labels}
 
 
+async def _health_check_destinations(config) -> tuple[set, dict]:
+    """
+    逐一健檢每個目的地，回傳 (可用標籤集合, {失敗標籤: 錯誤訊息})。
+
+    刻意**分開判斷**，而不是舊版的「任一失敗就整個不給上傳」：家裡硬碟壞掉的
+    時候 OneDrive 通常好端端的，把雲端備份也一起停掉，等於硬碟故障期間所有
+    照片都沒地方存——這與「照片不遺失」的第一原則正好相反。壞的那個不動，
+    好的那個照常走。
+
+    健檢會對網芳寫測試檔，SMB 卡住可能耗時數十秒；必須以 to_thread 執行，
+    否則會阻塞事件迴圈、害其他家人同時被卡住（規格書 §3）。
+    """
+    roots = _destination_roots(config)
+    labels = [DEST_ONEDRIVE_LABEL]
+    if config.ENABLE_NAS:
+        labels.insert(0, DEST_NAS_LABEL)
+    healthy: set = set()
+    failed: dict = {}
+    for label in labels:
+        ok, err = await asyncio.to_thread(storage.health_check, roots[label])
+        if ok:
+            healthy.add(label)
+        else:
+            failed[label] = err or "未知錯誤"
+    return healthy, failed
+
+
+def _available_destinations(context: ContextTypes.DEFAULT_TYPE, config) -> set:
+    """這次上傳可選的目的地。沒有健檢結果（健檢關閉）就退回 config 的設定。"""
+    stored = context.user_data.get(HEALTHY_DESTS_KEY)
+    if stored:
+        return set(stored)
+    return {DEST_NAS_LABEL, DEST_ONEDRIVE_LABEL} if config.ENABLE_NAS else {DEST_ONEDRIVE_LABEL}
+
+
 # ── 啟動上傳 ─────────────────────────────────────────
 
 async def handle_start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -270,18 +308,20 @@ async def handle_start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     # 待會輸入的新資料夾名稱，會被誤判成上一批的更正目標。
     _clear_correction_flag(context)
 
+    context.user_data.pop(HEALTHY_DESTS_KEY, None)
     if config.HEALTH_CHECK_ON_SESSION:
-        # 健檢寫測試檔到網芳，SMB 卡住可能耗時數十秒；以 to_thread 執行避免
-        # 阻塞事件迴圈、害其他家人同時也被卡住（規格書 §3）。
-        ok_nas, err_nas = (True, None)
-        if config.ENABLE_NAS:
-            ok_nas, err_nas = await asyncio.to_thread(storage.health_check, Path(config.DEST_NAS))
-        ok_od, err_od = await asyncio.to_thread(storage.health_check, Path(config.DEST_ONEDRIVE))
-        if not (ok_nas and ok_od):
-            err = err_nas or err_od
-            await notifier.notify_admin(notify.msg_health_check_failed("開 session 健檢", err or "未知錯誤"))
+        healthy, failed = await _health_check_destinations(config)
+        for label, err in failed.items():
+            await notifier.notify_admin(notify.msg_health_check_failed(f"開 session 健檢／{label}", err))
+        # 只有「一個都寫不進去」才真的擋下來；還有一個活著就照常上傳到那一個。
+        if not healthy:
             await _safe_send(context, telegram_id, notify.user_msg_health_check_failed())
             return
+        if failed:
+            await _safe_send(
+                context, telegram_id, notify.user_msg_destination_unavailable(sorted(failed))
+            )
+        context.user_data[HEALTHY_DESTS_KEY] = sorted(healthy)
 
     session = sessions.start(telegram_id, member.name)
     recent = members.get_recent_folders(telegram_id)
@@ -311,7 +351,7 @@ async def _set_folder_and_ask_destination(update_message, context: ContextTypes.
     session.enter_stage(STAGE_AWAITING_DESTINATION)
     await update_message.reply_text(
         f"資料夾：{folder_name}\n請選擇要存到哪裡：",
-        reply_markup=with_restart(destination_keyboard(config.ENABLE_NAS)),
+        reply_markup=with_restart(destination_keyboard(_available_destinations(context, config))),
     )
 
 
@@ -363,6 +403,18 @@ async def handle_destination_button(update: Update, context: ContextTypes.DEFAUL
     if session is None or session.stage != STAGE_AWAITING_DESTINATION:
         return
     destination = query.data[len(CB_DEST_PREFIX):]
+    # 按鈕可能是健檢之前發出的舊訊息（使用者往上捲去點到），此時選到的目的地
+    # 也許已經連不上了。重新確認一次再放行，並把還能用的選項重新給他。
+    available = _available_destinations(context, config)
+    needed = {DEST_NAS_LABEL, DEST_ONEDRIVE_LABEL} if destination == DEST_BOTH_LABEL else {destination}
+    if not needed.issubset(available):
+        await _reply_to_query(
+            query, context,
+            notify.user_msg_destination_unavailable(sorted(needed - available))
+            + "\n請重新選擇要存到哪裡：",
+            reply_markup=with_restart(destination_keyboard(available)),
+        )
+        return
     session.destination = destination
     dest_targets = _destination_targets(destination, config, session.folder)
     for label in dest_targets:
@@ -1548,7 +1600,7 @@ async def handle_restart_cancel(update: Update, context: ContextTypes.DEFAULT_TY
     if previous == STAGE_AWAITING_DESTINATION:
         await query.message.reply_text(
             f"好的，那就繼續。\n資料夾：{session.folder}\n請選擇要存到哪裡：",
-            reply_markup=with_restart(destination_keyboard(config.ENABLE_NAS)),
+            reply_markup=with_restart(destination_keyboard(_available_destinations(context, config))),
         )
         return
 

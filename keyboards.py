@@ -76,20 +76,25 @@ def correction_folder_keyboard(recent_folders: list[dict]) -> InlineKeyboardMark
     return InlineKeyboardMarkup(rows)
 
 
-def destination_keyboard(enable_nas: bool = True) -> InlineKeyboardMarkup:
+def destination_keyboard(available=None) -> InlineKeyboardMarkup:
     """
-    區網硬碟可透過 config.ENABLE_NAS 整個關閉（例如硬碟暫時故障期間）：
-    關閉時只留 OneDrive，「兩邊都存」也一併隱藏，避免使用者選到用不了的選項。
+    只列出**此刻真的寫得進去**的目的地（`available` 是標籤集合，None 代表兩邊都能用）。
+
+    來源有兩個：config.ENABLE_NAS（長期關閉，例如硬碟拆掉了），以及開 session 當下
+    的即時健檢結果（家裡硬碟壞掉／網芳斷線）。任一目的地不可用就把它連同
+    「兩邊都存」一起藏起來——留著會讓使用者選到一個註定失敗的選項，
+    但**不可以因此連好的那個也不給選**：家裡硬碟壞掉時 OneDrive 照常運作。
     """
-    if not enable_nas:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"☁️ {DEST_ONEDRIVE_LABEL}", callback_data=f"{CB_DEST_PREFIX}{DEST_ONEDRIVE_LABEL}")],
-        ])
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🏠 {DEST_NAS_LABEL}", callback_data=f"{CB_DEST_PREFIX}{DEST_NAS_LABEL}")],
-        [InlineKeyboardButton(f"☁️ {DEST_ONEDRIVE_LABEL}", callback_data=f"{CB_DEST_PREFIX}{DEST_ONEDRIVE_LABEL}")],
-        [InlineKeyboardButton(f"🏠☁️ {DEST_BOTH_LABEL}", callback_data=f"{CB_DEST_PREFIX}{DEST_BOTH_LABEL}")],
-    ])
+    if available is None:
+        available = {DEST_NAS_LABEL, DEST_ONEDRIVE_LABEL}
+    rows = []
+    if DEST_NAS_LABEL in available:
+        rows.append([InlineKeyboardButton(f"🏠 {DEST_NAS_LABEL}", callback_data=f"{CB_DEST_PREFIX}{DEST_NAS_LABEL}")])
+    if DEST_ONEDRIVE_LABEL in available:
+        rows.append([InlineKeyboardButton(f"☁️ {DEST_ONEDRIVE_LABEL}", callback_data=f"{CB_DEST_PREFIX}{DEST_ONEDRIVE_LABEL}")])
+    if len(rows) > 1:
+        rows.append([InlineKeyboardButton(f"🏠☁️ {DEST_BOTH_LABEL}", callback_data=f"{CB_DEST_PREFIX}{DEST_BOTH_LABEL}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def in_session_keyboard(show_finish: bool = True) -> InlineKeyboardMarkup:

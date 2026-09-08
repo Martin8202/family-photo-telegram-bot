@@ -173,6 +173,17 @@ def user_msg_health_check_failed() -> str:
     return "現在暫時無法上傳，請稍後再試"
 
 
+def user_msg_destination_unavailable(labels) -> str:
+    """
+    部分目的地壞掉時給使用者的說明。
+
+    刻意寫成「其他地方照常」而不是「無法上傳」：這則訊息之後流程會繼續，
+    使用者仍然可以把照片存進還活著的目的地（規格書 §2 對家人友善）。
+    """
+    names = "、".join(labels)
+    return f"⚠️ 目前「{names}」暫時連不上（已通知管理員），先存到其他地方，照片一樣不會不見。"
+
+
 def user_msg_no_photos_received() -> str:
     return "尚未收到任何照片喔！請先在手機上選擇照片傳送給我，傳完再按此按鈕。"
 
