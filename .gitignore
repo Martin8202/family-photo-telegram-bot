@@ -2,6 +2,12 @@
 config.py
 .env
 
+# Google Drive 授權（等同家人帳號雲端的鑰匙，絕不進版控）
+drive_token.json
+client_secret*.json
+s1_report.json
+MAINTENANCE.flag
+
 # 家人清單與執行期資料
 data/
 pending_onedrive_release.json
