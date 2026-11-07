@@ -1,9 +1,11 @@
 """
 主程式：收發 Telegram 訊息、路由到各 handler（規格書 §12）。
 
-啟動時自動執行兩件事（§17）：
-1. SMB / OneDrive 寫入健檢（§4.1、§4.2）
-2. 掃描暫存區、復原未完成批次（§4.3）
+啟動時自動執行（§17、V2 §3.6、§3.8）：
+1. 檢查 config.py 有沒有缺設定項（缺了就直接列出來、不啟動）
+2. Google Drive 資料夾健檢（`G:` 還沒掛上就等一下再試）
+3. 「最近資料夾」V1 舊紀錄轉換
+4. 掃描暫存區、復原未完成批次（§4.3）
 """
 
 from __future__ import annotations
@@ -32,7 +34,6 @@ from keyboards import (
     CB_APPROVE_PREFIX,
     CB_CORRECTION,
     CB_CORRECTION_FOLDER_PREFIX,
-    CB_DEST_PREFIX,
     CB_DUP_COPY,
     CB_DUP_SKIP,
     CB_UPLOAD_AGAIN,
@@ -48,7 +49,7 @@ from keyboards import (
 from logs import DataLogs
 from members import MembersStore, STATUS_APPROVED, STATUS_PENDING
 from notify import Notifier
-from state import SessionManager
+from state import DEST_DRIVE_LABEL, SessionManager
 
 DATA_DIR = Path(__file__).parent / "data"
 LOG_DIR = Path(__file__).parent / "logs"
@@ -64,6 +65,11 @@ UPLOAD_BUTTON_TEXT = "📷 我要上傳照片"
 # PTB 會自動把 HTTP 的 read timeout 加上這個秒數（`Bot.get_updates` 內
 # `read_timeout = arg_read_timeout + timeout`），所以不必另外調整連線逾時。
 POLL_TIMEOUT_SEC = 50
+
+# 開機後 Google Drive 電腦版可能還沒把 G: 掛上：健檢失敗時每 30 秒重試，最多 5 分鐘（V2 §3.6）。
+# 等待期間不收訊息，Telegram 會先保留，等好了照常處理。
+STARTUP_DRIVE_RETRY_SEC = 30
+STARTUP_DRIVE_MAX_WAIT_SEC = 300
 
 # log 保留天數：每天午夜換一支新檔，最多留這麼多支舊檔（約一週）。
 LOG_RETENTION_DAYS = 7
@@ -196,23 +202,56 @@ async def route_unsupported_media(update: Update, context: ContextTypes.DEFAULT_
 
 # ── 啟動流程：健檢 + 暫存區復原（§4.1、§4.3、§17）─────
 
-async def startup_health_check(app: Application) -> None:
+def missing_config_keys(cfg) -> list[str]:
+    """
+    config.py 比 config.example.py 少了哪些設定項（V2 §3.8）。
+
+    `git pull` 更新後常會多出新的設定項，舊的 config.py 沒有就會在執行到一半才出錯。
+    以 config.example.py 為準逐項比對，啟動前就把缺的全部列出來。
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("config_example", Path(__file__).parent / "config.example.py")
+    example = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(example)
+    return [k for k in vars(example) if k.isupper() and not hasattr(cfg, k)]
+
+
+async def startup_health_check(app: Application, sleep=asyncio.sleep) -> bool:
+    """
+    確認 Google Drive 的 `照片` 資料夾可用。回傳是否可用。
+
+    開機後 Drive 電腦版可能還沒把 G: 掛上，失敗時先等一下再試，不要直接放棄；
+    等到上限仍失敗才通知管理員（照片照樣收進暫存區，之後由復原補送）。
+    健檢碰的是 G:，可能卡住，以 to_thread 執行（規格書 §3）。
+    """
     cfg = app.bot_data["config"]
     notifier: Notifier = app.bot_data["notifier"]
     if not cfg.HEALTH_CHECK_ON_START:
-        return
-    targets = [("OneDrive", cfg.DEST_ONEDRIVE)]
-    if cfg.ENABLE_NAS:
-        targets.insert(0, ("家裡硬碟", cfg.DEST_NAS))
-    for label, path in targets:
-        # 健檢會對網芳寫入測試檔，SMB 卡住時可能耗時數十秒；必須以 to_thread 執行，
-        # 否則會阻塞整個 asyncio 事件迴圈、讓 bot 對所有人失去回應（規格書 §3）。
-        ok, err = await asyncio.to_thread(storage.health_check, Path(path))
-        if not ok:
-            logger.error("啟動健檢失敗：%s %s", label, err)
-            await notifier.notify_admin(notify.msg_health_check_failed(label, err or "未知錯誤"))
-        else:
-            logger.info("啟動健檢通過：%s", label)
+        return True
+    root = upload.drive_root(cfg)
+    waited = 0
+    while True:
+        ok, err = await asyncio.to_thread(storage.health_check, root)
+        if ok:
+            logger.info("啟動健檢通過：%s", root)
+            return True
+        if waited >= STARTUP_DRIVE_MAX_WAIT_SEC:
+            logger.error("啟動健檢失敗：%s", err)
+            await notifier.notify_admin(notify.msg_health_check_failed("Google Drive", err or "未知錯誤"))
+            return False
+        logger.warning("Google Drive 資料夾還不能用，%s 秒後再試：%s", STARTUP_DRIVE_RETRY_SEC, err)
+        await sleep(STARTUP_DRIVE_RETRY_SEC)
+        waited += STARTUP_DRIVE_RETRY_SEC
+
+
+async def startup_migrate_recent_folders(app: Application) -> None:
+    """V1 的「最近資料夾」舊紀錄轉換（V2 §3.2）。只能在 Drive 健檢通過後呼叫。"""
+    members: MembersStore = app.bot_data["members"]
+    root = upload.drive_root(app.bot_data["config"])
+    dropped = await asyncio.to_thread(members.migrate_recent_folders, lambda name: (root / name).is_dir())
+    if dropped:
+        logger.info("最近資料夾舊紀錄在 Google Drive 找不到，已移除：%s", "、".join(dropped))
 
 
 async def startup_recover_temp(app: Application) -> None:
@@ -220,10 +259,9 @@ async def startup_recover_temp(app: Application) -> None:
     掃描 TEMP_DIR，尋找所有未完成的暫存子夾，嘗試自動補送（規格書 §4.3 中斷復原策略）。
     暫存結構：TEMP_DIR / {telegram_id}_{name} / {時間戳}_{folder} / *.jpg + _session_info.json
 
-    目的地資訊優先讀取 `storage.read_session_info()` 側車檔（記錄實際選擇的目的地，
-    支援「兩邊都存」）；沒有側車檔（例如更早期留下的暫存、或選目的地前就中斷）
-    才退回只補送到區網硬碟的舊行為，並在報告中註明是用猜的。
-    補送結果一律寫回 upload_log.csv 與 file_index.csv，與正常上傳流程記錄一致。
+    V2 只有 Google Drive 一個目的地；資料夾名稱優先讀側車檔（`storage.read_session_info()`），
+    沒有側車檔才從暫存子夾名稱推回來。補送結果一律寫回 upload_log.csv 與 file_index.csv，
+    與正常上傳流程記錄一致。呼叫端要先確認 Drive 健檢通過。
     """
     cfg = app.bot_data["config"]
     if not cfg.RECOVER_ON_START:
@@ -255,27 +293,19 @@ async def startup_recover_temp(app: Application) -> None:
             parts = session_dir.name.split("_", 2)
             folder_name = parts[2] if len(parts) >= 3 else session_dir.name
             name = dir_name
-            destination_guessed = False
 
             info = storage.read_session_info(session_dir)
             if info:
                 folder_name = info.get("folder", folder_name)
                 name = info.get("name", name)
-                destination = info.get("destination")
-            else:
-                destination = None
-            if not destination:
-                destination = "家裡硬碟"
-                destination_guessed = True
+            destination = DEST_DRIVE_LABEL
 
-            dest_targets = upload._destination_targets(destination, cfg, folder_name)
+            dest_targets = upload._destination_targets(cfg, folder_name)
 
             success_count = 0
             fail_count = 0
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
             index_rows = []
-            # 補送進 OneDrive 的照片同樣要排釋放空間，否則永遠留在本機（§4.2）
-            onedrive_written: list = []
             for label, dest_dir in dest_targets.items():
                 for f in files:
                     # 復原時同樣套用檔名規則（EXIF 拍攝時間優先），與正常流程一致，
@@ -291,8 +321,6 @@ async def startup_recover_temp(app: Application) -> None:
                     index_rows.append((now_str, name, telegram_id, folder_name, label, actual_name, file_id))
                     if result.success:
                         success_count += 1
-                        if label == "OneDrive" and result.dest_path:
-                            onedrive_written.append(result.dest_path)
                     else:
                         fail_count += 1
 
@@ -302,16 +330,7 @@ async def startup_recover_temp(app: Application) -> None:
                 except Exception:
                     logger.exception("復原批次寫入 file_index 失敗，繼續處理其餘批次")
 
-            if getattr(cfg, "ONEDRIVE_FREE_SPACE", True) and onedrive_written:
-                class _Ctx:  # 啟動階段還沒有真正的 CallbackContext，包一個最小的替身
-                    application = app
-                try:
-                    await upload._schedule_onedrive_release(_Ctx(), onedrive_written)
-                except Exception:
-                    logger.exception("復原批次排程 OneDrive 釋放空間失敗")
-
             all_ok = fail_count == 0
-            guess_note = "（未找到目的地紀錄，已預設補送到區網硬碟，請確認是否正確）" if destination_guessed else ""
             if all_ok:
                 for f in files:
                     try:
@@ -326,14 +345,14 @@ async def startup_recover_temp(app: Application) -> None:
                     logs.log_upload(now_str, name, telegram_id, folder_name, destination, len(files), "成功(復原)")
                 except Exception:
                     logger.exception("復原批次寫入 upload_log 失敗")
-                report_lines.append(f"{name}／{folder_name}：{len(files)} 張已補送成功{guess_note}")
+                report_lines.append(f"{name}／{folder_name}：{len(files)} 張已補送成功")
             else:
                 try:
                     logs.log_upload(now_str, name, telegram_id, folder_name, destination, len(files), "部分失敗(復原)")
                 except Exception:
                     logger.exception("復原批次寫入 upload_log 失敗")
                 report_lines.append(
-                    f"{name}／{folder_name}：{success_count} 成功／{fail_count} 失敗（保留暫存待人工處理）{guess_note}"
+                    f"{name}／{folder_name}：{success_count} 成功／{fail_count} 失敗（保留暫存待人工處理）"
                 )
 
     if report_lines:
@@ -367,30 +386,11 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         pass  # 連錯誤通知都送不出去時，不能再往外拋而讓錯誤處理本身變成新的錯誤
 
 
-async def startup_resume_onedrive_release(app: Application) -> None:
-    """
-    接回上次關機前尚未執行的 OneDrive 釋放空間排程（規格書 §4.2）。
-
-    排程本身掛在行程內的 AsyncIOScheduler，bot 一關就消失；沒有這一步的話，
-    凡是在延遲期間被關掉的批次，「僅線上」標記就永遠不會下。
-    """
-    cfg = app.bot_data["config"]
-    if not getattr(cfg, "ONEDRIVE_FREE_SPACE", True):
-        return
-
-    class _Ctx:  # 啟動階段還沒有真正的 CallbackContext，包一個最小的替身
-        application = app
-
-    try:
-        await upload.resume_pending_onedrive_releases(_Ctx())
-    except Exception:
-        logger.exception("接回 OneDrive 釋放空間排程失敗")
-
-
 async def on_startup(app: Application) -> None:
-    await startup_health_check(app)
-    await startup_recover_temp(app)
-    await startup_resume_onedrive_release(app)
+    # Drive 不能用時不轉換舊紀錄（會全部被當成找不到）、也不補送（照片留在暫存區，下次啟動再補）
+    if await startup_health_check(app):
+        await startup_migrate_recent_folders(app)
+        await startup_recover_temp(app)
     # 選單只放「我要上傳照片」：使用者最常做的就是這件事，一點就直接進流程。
     # /start 仍然保留為可用指令（Telegram 對新使用者顯示的 START 按鈕就是送 /start，
     # 註冊流程靠它），只是不再出現在選單裡佔位置。
@@ -398,6 +398,11 @@ async def on_startup(app: Application) -> None:
 
 
 def build_application() -> Application:
+    missing = missing_config_keys(config)
+    if missing:
+        raise SystemExit(
+            "config.py 少了這些設定項，請參考 config.example.py 補上後再啟動：\n  " + "\n  ".join(missing)
+        )
     app = Application.builder().token(config.BOT_TOKEN).post_init(on_startup).build()
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -422,7 +427,6 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(register.handle_reject, pattern=f"^{CB_REJECT_PREFIX}"))
 
     app.add_handler(CallbackQueryHandler(upload.handle_recent_folder_button, pattern=f"^{CB_RECENT_FOLDER_PREFIX}"))
-    app.add_handler(CallbackQueryHandler(upload.handle_destination_button, pattern=f"^{CB_DEST_PREFIX}"))
     app.add_handler(CallbackQueryHandler(upload.handle_finish_button, pattern=f"^{CB_FINISH}$"))
     app.add_handler(CallbackQueryHandler(
         upload.handle_continue_receiving_button, pattern=f"^{CB_CONTINUE_RECEIVING}$"

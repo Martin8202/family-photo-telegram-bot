@@ -4,8 +4,9 @@
 - data/upload_log.csv      上傳紀錄表（誰、何時、哪個資料夾、幾張、結果）
 - data/待清理清單.csv        中止殘留 / 傳錯更正需人工清理的檔名
 - data/file_index.csv      逐張照片索引（含 Telegram file_id），供 redownload.py 使用
+- data/步驟紀錄.csv          每個人走到哪一步、在哪一步放棄（不記內容；V2 O14）
 
-三者職責獨立、各自成檔，程式只會新增列，不會清空或刪除既有內容。
+各自職責獨立、各自成檔，程式只會新增列，不會清空或刪除既有內容。
 寫入一律經由 writequeue 的單一背景執行緒序列化 + 原子寫入，
 併發安全（見 §10C、測試案例 F7）。
 """
@@ -25,6 +26,7 @@ from writequeue import WriteQueue, append_bytes, atomic_write_text, default_writ
 UPLOAD_LOG_HEADER = ["時間", "上傳者", "Telegram ID", "資料夾", "目的地", "張數", "結果"]
 CLEANUP_LIST_HEADER = ["時間", "上傳者", "Telegram ID", "類型", "待刪位置", "檔名", "備註"]
 FILE_INDEX_HEADER = ["時間", "上傳者", "Telegram ID", "目標資料夾", "目的地", "檔名", "file_id"]
+STEP_LOG_HEADER = ["時間", "上傳者", "Telegram ID", "步驟"]
 
 
 class CsvLog:
@@ -87,6 +89,7 @@ class DataLogs:
         self.upload_log = CsvLog(data_dir / "upload_log.csv", UPLOAD_LOG_HEADER, wq)
         self.cleanup_list = CsvLog(data_dir / "待清理清單.csv", CLEANUP_LIST_HEADER, wq)
         self.file_index = CsvLog(data_dir / "file_index.csv", FILE_INDEX_HEADER, wq)
+        self.step_log = CsvLog(data_dir / "步驟紀錄.csv", STEP_LOG_HEADER, wq)
 
     def log_upload(self, time_str, uploader, telegram_id, folder, dest_label, count, result):
         self.upload_log.append_row([time_str, uploader, telegram_id, folder, dest_label, count, result])
@@ -103,3 +106,6 @@ class DataLogs:
 
     def log_file_index_batch(self, rows: list[tuple]):
         self.file_index.append_rows([list(r) for r in rows])
+
+    def log_step(self, time_str, uploader, telegram_id, step):
+        self.step_log.append_row([time_str, uploader, telegram_id, step])

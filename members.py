@@ -8,8 +8,8 @@ members.json 結構：
     "telegram_id": 123456789,
     "joined_at": "2026-07-22 10:30",
     "status": "待審核",              # 待審核 / 已開通 / 已拒絕
-    "recent_folders": [               # 見 §6.2「近 3 次資料夾」，各使用者獨立
-      {"name": "阿嬤生日", "last_dest": "家裡硬碟", "used_at": "..."}
+    "recent_folders": [               # 這個人最近用過的資料夾；畫面上合併全家顯示（V2 D19）
+      {"name": "阿嬤生日", "used_at": "2026-07-22 10:30"}   # name＝相對 `照片` 的路徑
     ],
     "warned_compressed_this_session": false
   },
@@ -33,13 +33,6 @@ from writequeue import WriteQueue, atomic_write_text, default_write_queue
 STATUS_PENDING = "待審核"
 STATUS_APPROVED = "已開通"
 STATUS_REJECTED = "已拒絕"
-
-
-@dataclass
-class RecentFolder:
-    name: str
-    last_dest: str
-    used_at: str
 
 
 @dataclass
@@ -145,12 +138,10 @@ class MembersStore:
         return self.set_status(telegram_id, STATUS_REJECTED)
 
     def push_recent_folder(
-        self, telegram_id: int, folder_name: str, dest_label: str, used_at: Optional[datetime] = None,
-        keep: int = 3,
+        self, telegram_id: int, folder_name: str, used_at: Optional[datetime] = None, keep: int = 5,
     ) -> None:
         """
-        更新「近 N 次資料夾」（各使用者獨立，不綁定目的地，僅記錄名稱 + 上次目的地供顯示，見 §6.2）。
-        同名資料夾再次使用時移到最前面，不重複列出。
+        把資料夾記進這個人的最近紀錄（V2 D19）。同名資料夾再次使用時移到最前面，不重複列出。
         """
         used_at = used_at or datetime.now()
         with self._lock:
@@ -158,14 +149,48 @@ class MembersStore:
             if row is None:
                 return
             folders = [f for f in row.get("recent_folders", []) if f["name"] != folder_name]
-            folders.insert(0, {
-                "name": folder_name,
-                "last_dest": dest_label,
-                "used_at": used_at.strftime("%Y-%m-%d %H:%M"),
-            })
+            folders.insert(0, {"name": folder_name, "used_at": used_at.strftime("%Y-%m-%d %H:%M")})
             row["recent_folders"] = folders[:keep]
             self._persist()
 
-    def get_recent_folders(self, telegram_id: int) -> list[dict]:
-        m = self.get(telegram_id)
-        return m.recent_folders if m else []
+    def family_recent_folders(self, n: int = 5) -> list[dict]:
+        """
+        全家最近用過的 n 個資料夾（V2 D19）：合併每個人的紀錄，同一個資料夾只留最新一筆。
+        媽媽剛傳過的資料夾，爸爸打開就排在最上面。
+        """
+        latest: dict[str, str] = {}
+        with self._lock:
+            for row in self._data.values():
+                for f in row.get("recent_folders", []):
+                    name, used_at = f.get("name"), f.get("used_at", "")
+                    if name and used_at > latest.get(name, ""):
+                        latest[name] = used_at
+        ordered = sorted(latest.items(), key=lambda kv: kv[1], reverse=True)[:n]
+        return [{"name": name, "used_at": used_at} for name, used_at in ordered]
+
+    def migrate_recent_folders(self, folder_exists) -> list[str]:
+        """
+        V1 舊紀錄轉換（V2 規格 §3.2）：帶 `last_dest` 的是 V1 的紀錄，名稱在 `照片`
+        底下找得到才保留（拿掉 `last_dest`），找不到的移除。回傳被移除的名稱，供寫 log。
+
+        只處理舊格式，新紀錄一律不動，所以重跑幾次都一樣。呼叫端必須先確認
+        `照片` 資料夾可用——`G:` 沒掛上時每個都會「找不到」而被誤刪。
+        """
+        dropped: list[str] = []
+        with self._lock:
+            changed = False
+            for row in self._data.values():
+                kept = []
+                for f in row.get("recent_folders", []):
+                    if "last_dest" not in f:
+                        kept.append(f)
+                        continue
+                    changed = True
+                    if folder_exists(f["name"]):
+                        kept.append({"name": f["name"], "used_at": f.get("used_at", "")})
+                    else:
+                        dropped.append(f["name"])
+                row["recent_folders"] = kept
+            if changed:
+                self._persist()
+        return dropped

@@ -8,8 +8,6 @@ from telegram import (
     ReplyKeyboardRemove,
 )
 
-from state import DEST_BOTH_LABEL, DEST_NAS_LABEL, DEST_ONEDRIVE_LABEL, recent_folder_icon
-
 CB_REGISTER = "register"
 CB_APPROVE_PREFIX = "approve:"
 CB_REJECT_PREFIX = "reject:"
@@ -23,7 +21,6 @@ CB_CORRECTION = "correction"
 CB_UPLOAD_AGAIN = "upload_again"
 CB_DUP_COPY = "dup_copy"
 CB_DUP_SKIP = "dup_skip"
-CB_DEST_PREFIX = "dest:"
 CB_RECENT_FOLDER_PREFIX = "recent:"
 # 更正流程的資料夾按鈕另用一組 prefix：它發生在 session 已結束之後，
 # 不可與 session 內的選資料夾按鈕（CB_RECENT_FOLDER_PREFIX）混用。
@@ -55,45 +52,23 @@ def clear_persistent_keyboard() -> ReplyKeyboardRemove:
 
 
 def folder_choice_keyboard(recent_folders: list[dict]) -> InlineKeyboardMarkup:
+    """全家最近用過的資料夾（V2 規格 D19）。`name` 是相對 `照片` 的路徑。"""
     rows = []
     for f in recent_folders:
-        icon = recent_folder_icon(f["last_dest"])
-        rows.append([InlineKeyboardButton(f"{icon} {f['name']}", callback_data=f"{CB_RECENT_FOLDER_PREFIX}{f['name']}")])
+        rows.append([InlineKeyboardButton(f"📁 {f['name']}", callback_data=f"{CB_RECENT_FOLDER_PREFIX}{f['name']}")])
     return InlineKeyboardMarkup(rows) if rows else InlineKeyboardMarkup([])
 
 
 def correction_folder_keyboard(recent_folders: list[dict]) -> InlineKeyboardMarkup:
     """
     「↩️ 這批傳錯了」要改放到哪個資料夾（規格書 §7 第 1 點）。
-    規格明訂須同時提供「近 3 次資料夾」按鈕與打字輸入兩種方式，不可只接受打字。
+    規格明訂須同時提供「最近資料夾」按鈕與打字輸入兩種方式，不可只接受打字。
     """
     rows = []
     for f in recent_folders:
-        icon = recent_folder_icon(f["last_dest"])
         rows.append([InlineKeyboardButton(
-            f"{icon} {f['name']}", callback_data=f"{CB_CORRECTION_FOLDER_PREFIX}{f['name']}"
+            f"📁 {f['name']}", callback_data=f"{CB_CORRECTION_FOLDER_PREFIX}{f['name']}"
         )])
-    return InlineKeyboardMarkup(rows)
-
-
-def destination_keyboard(available=None) -> InlineKeyboardMarkup:
-    """
-    只列出**此刻真的寫得進去**的目的地（`available` 是標籤集合，None 代表兩邊都能用）。
-
-    來源有兩個：config.ENABLE_NAS（長期關閉，例如硬碟拆掉了），以及開 session 當下
-    的即時健檢結果（家裡硬碟壞掉／網芳斷線）。任一目的地不可用就把它連同
-    「兩邊都存」一起藏起來——留著會讓使用者選到一個註定失敗的選項，
-    但**不可以因此連好的那個也不給選**：家裡硬碟壞掉時 OneDrive 照常運作。
-    """
-    if available is None:
-        available = {DEST_NAS_LABEL, DEST_ONEDRIVE_LABEL}
-    rows = []
-    if DEST_NAS_LABEL in available:
-        rows.append([InlineKeyboardButton(f"🏠 {DEST_NAS_LABEL}", callback_data=f"{CB_DEST_PREFIX}{DEST_NAS_LABEL}")])
-    if DEST_ONEDRIVE_LABEL in available:
-        rows.append([InlineKeyboardButton(f"☁️ {DEST_ONEDRIVE_LABEL}", callback_data=f"{CB_DEST_PREFIX}{DEST_ONEDRIVE_LABEL}")])
-    if len(rows) > 1:
-        rows.append([InlineKeyboardButton(f"🏠☁️ {DEST_BOTH_LABEL}", callback_data=f"{CB_DEST_PREFIX}{DEST_BOTH_LABEL}")])
     return InlineKeyboardMarkup(rows)
 
 

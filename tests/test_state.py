@@ -2,7 +2,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from state import (
-    STAGE_AWAITING_DESTINATION,
     STAGE_AWAITING_FOLDER,
     STAGE_DEBOUNCE,
     STAGE_PROCESSING,
@@ -11,7 +10,6 @@ from state import (
     SessionManager,
     chunk_files,
     progress_bar,
-    recent_folder_icon,
     should_update_counter,
 )
 
@@ -39,14 +37,13 @@ def test_processing_stage_never_times_out_even_after_long_time():
     assert not s.is_idle_timed_out(10, now=much_later)
 
 
-def test_awaiting_folder_or_destination_never_times_out():
-    """等待使用者選資料夾/目的地不計入閒置（§6.4）。"""
+def test_awaiting_folder_never_times_out():
+    """等待使用者選資料夾不計入閒置（§6.4）。"""
     mgr = SessionManager()
     s = mgr.start(1, "秀琴", now=datetime(2026, 1, 1, 12, 0, 0))
-    for stage in (STAGE_AWAITING_FOLDER, STAGE_AWAITING_DESTINATION):
-        s.enter_stage(stage, now=datetime(2026, 1, 1, 12, 0, 0))
-        much_later = datetime(2026, 1, 1, 12, 30, 0)
-        assert not s.is_idle_timed_out(10, now=much_later)
+    s.enter_stage(STAGE_AWAITING_FOLDER, now=datetime(2026, 1, 1, 12, 0, 0))
+    much_later = datetime(2026, 1, 1, 12, 30, 0)
+    assert not s.is_idle_timed_out(10, now=much_later)
 
 
 def test_debounce_stage_never_times_out():
@@ -83,7 +80,7 @@ def test_last_batch_tracked_separately_from_active_session():
     mgr.start(1, "秀琴")
     mgr.clear(1)
     assert mgr.get_last_batch(1) is None
-    batch = CompletedBatch(telegram_id=1, folder="阿嬤生日", destination_label="家裡硬碟",
+    batch = CompletedBatch(telegram_id=1, folder="阿嬤生日", destination_label="Google Drive",
                             files=[], written_paths={}, completed_at=datetime.now())
     mgr.set_last_batch(batch)
     assert mgr.get_last_batch(1) is batch
@@ -155,11 +152,3 @@ def test_progress_bar_complete():
 
 def test_progress_bar_zero_total_no_crash():
     progress_bar(0, 0)  # 不應拋除以零錯誤
-
-
-# ── 近期資料夾圖示（§6.2）────────────────────────────
-
-def test_recent_folder_icon_mapping():
-    assert recent_folder_icon("家裡硬碟") == "🏠"
-    assert recent_folder_icon("OneDrive") == "☁️"
-    assert recent_folder_icon("兩邊都存") == "🏠☁️"

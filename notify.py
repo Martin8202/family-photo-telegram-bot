@@ -28,13 +28,6 @@ def msg_write_failure(uploader: str, folder: str, dest_label: str, error: str) -
     return f"🔴 寫入失敗：{uploader}／{folder}／{dest_label}\n原因：{error}\n已保留於暫存區，將自動重試"
 
 
-def msg_both_partial_failure(uploader: str, folder: str, nas_status: str, onedrive_status: str) -> str:
-    return (
-        f"⚠️ {uploader}「{folder}」兩邊都存，部分失敗：\n"
-        f"家裡硬碟 {nas_status}／OneDrive {onedrive_status}"
-    )
-
-
 def msg_new_registration(name: str, telegram_id: int) -> str:
     return f"🆕 新成員註冊：{name}（ID: {telegram_id}），請審核"
 
@@ -173,17 +166,6 @@ def user_msg_health_check_failed() -> str:
     return "現在暫時無法上傳，請稍後再試"
 
 
-def user_msg_destination_unavailable(labels) -> str:
-    """
-    部分目的地壞掉時給使用者的說明。
-
-    刻意寫成「其他地方照常」而不是「無法上傳」：這則訊息之後流程會繼續，
-    使用者仍然可以把照片存進還活著的目的地（規格書 §2 對家人友善）。
-    """
-    names = "、".join(labels)
-    return f"⚠️ 目前「{names}」暫時連不上（已通知管理員），先存到其他地方，照片一樣不會不見。"
-
-
 def user_msg_no_photos_received() -> str:
     return "尚未收到任何照片喔！請先在手機上選擇照片傳送給我，傳完再按此按鈕。"
 
@@ -197,11 +179,6 @@ def user_msg_inactivity_prompt(received_count: int, stored_count: int) -> str:
 
 def user_msg_continue_receiving() -> str:
     return "好的，請繼續傳送照片，傳完後隨時點下方按鈕："
-
-
-def user_msg_auto_appended(folder: str) -> str:
-    """遲到照片自動併案的開場提示（§6.6）。實際張數等收齊後由完成訊息宣告。"""
-    return f"💡 收到補傳的照片，會自動幫你存進剛剛的「{folder}」相簿"
 
 
 def user_msg_upload_ready(folder: str, dest_label: str) -> str:
@@ -296,8 +273,8 @@ def msg_duplicates_for_admin(uploader: str, folder: str, count: int) -> str:
     )
 
 
-def user_msg_onedrive_cloud_note() -> str:
-    return "☁️ 雲端同步需要一點時間，稍後再到 OneDrive 查看"
+def user_msg_cloud_note() -> str:
+    return "☁️ 幾分鐘後在 Google Drive 上看得到"
 
 
 class Notifier:

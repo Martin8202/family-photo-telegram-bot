@@ -182,9 +182,7 @@ class DummyApplication:
         self.background_tasks = []
         # 動態設定測試專用路徑
         config.TEMP_DIR = str(temp_dir)
-        config.DEST_NAS = str(nas_dir)
-        config.DEST_ONEDRIVE = str(od_dir)
-        config.ENABLE_NAS = True
+        config.DRIVE_PHOTO_ROOT = str(nas_dir)  # V2：唯一目的地＝Google Drive 的「照片」
         config.HEALTH_CHECK_ON_SESSION = False
         config.HEALTH_CHECK_ON_START = False
         config.FINISH_DEBOUNCE_SEC = 0
@@ -287,8 +285,8 @@ async def test_full_user_registration_and_approval_flow(env):
 
 
 @pytest.mark.asyncio
-async def test_complete_upload_session_both_destinations(env):
-    """測試完整照片上傳流程 (選資料夾 -> 選兩邊都存 -> 傳照片 + 傳非圖片 -> 我傳完了)。"""
+async def test_complete_upload_session_to_drive(env):
+    """測試完整照片上傳流程 (選資料夾 -> 傳照片 + 傳非圖片 -> 我傳完了)，存進 Google Drive。"""
     app, data_dir, temp_dir, nas_dir, od_dir = env
     ctx = DummyContext(app)
     user = DummyUser(1001, "媽媽")
@@ -310,12 +308,9 @@ async def test_complete_upload_session_both_destinations(env):
     await upload.handle_folder_text(folder_upd, ctx)
     session = app.bot_data["sessions"].get(1001)
     assert session.folder == "2026阿嬤八十大壽"
-
-    # 3. 點選目的地 [📦 兩邊都存]
-    dest_cb = DummyCallbackQuery("dest:兩邊都存", user, folder_msg)
-    dest_upd = DummyUpdate(user, folder_msg, dest_cb)
-    await upload.handle_destination_button(dest_upd, ctx)
-    assert session.destination == "兩邊都存"
+    # 3. V2 不用再選存哪裡：選好資料夾就直接開始收照片
+    assert session.destination == "Google Drive"
+    assert session.stage == "receiving_photos"
 
     # 4. 傳送照片 (一張照片 photo，一張檔案原圖 document.image)
     dummy_photo_item = MagicMock()
@@ -346,11 +341,9 @@ async def test_complete_upload_session_both_destinations(env):
 
     # 7. 驗證產生的檔案與 CSV 紀錄
     nas_target = nas_dir / "2026阿嬤八十大壽"
-    od_target = od_dir / "2026阿嬤八十大壽"
     assert nas_target.exists()
-    assert od_target.exists()
     assert len(list(nas_target.glob("*.jpg"))) == 2
-    assert len(list(od_target.glob("*.jpg"))) == 2
+    assert not list(od_dir.iterdir()), "V2 不再寫 OneDrive"
 
     # 驗證 CSV log
     logs: DataLogs = app.bot_data["logs"]
@@ -361,7 +354,15 @@ async def test_complete_upload_session_both_destinations(env):
     assert upload_rows[0]["結果"] == "成功"
 
     file_index_rows = logs.file_index.read_all_rows()
-    assert len(file_index_rows) == 4  # 兩張照片 x 兩個目的地 = 4 列
+    assert len(file_index_rows) == 2  # 兩張照片 x 一個目的地
+    assert {r["目的地"] for r in file_index_rows} == {"Google Drive"}
+
+    # 步驟紀錄（V2 O14）：誰走到哪一步，不記內容
+    steps = [r["步驟"] for r in logs.step_log.read_all_rows() if r["Telegram ID"] == "1001"]
+    assert steps == ["開始上傳", "選好資料夾", "傳完了", "完成"]
+
+    # 最近資料夾記進去了，而且全家看得到
+    assert members.family_recent_folders()[0]["name"] == "2026阿嬤八十大壽"
 
 
 @pytest.mark.asyncio
@@ -383,10 +384,6 @@ async def test_debounce_confirm_message_dual_layer_update(env):
 
     await upload.handle_start_upload(DummyUpdate(user, DummyMessage(1, "📷 我要上傳照片", 1002, app.bot)), ctx)
     await upload.handle_folder_text(DummyUpdate(user, DummyMessage(2, "測試相簿", 1002, app.bot)), ctx)
-    dest_msg = DummyMessage(3, "", 1002, app.bot)
-    await upload.handle_destination_button(
-        DummyUpdate(user, dest_msg, DummyCallbackQuery("dest:家裡硬碟", user, dest_msg)), ctx
-    )
     session = app.bot_data["sessions"].get(1002)
 
     photo1 = MagicMock(); photo1.file_id = "p1"
@@ -457,10 +454,6 @@ async def test_debounce_defers_flush_until_finalize(env):
 
         await upload.handle_start_upload(DummyUpdate(user, DummyMessage(1, "📷 我要上傳照片", 1003, app.bot)), ctx)
         await upload.handle_folder_text(DummyUpdate(user, DummyMessage(2, "烤肉", 1003, app.bot)), ctx)
-        dest_msg = DummyMessage(3, "", 1003, app.bot)
-        await upload.handle_destination_button(
-            DummyUpdate(user, dest_msg, DummyCallbackQuery("dest:家裡硬碟", user, dest_msg)), ctx
-        )
         session = app.bot_data["sessions"].get(1003)
         dest_dir = nas_dir / "烤肉"
 
@@ -533,9 +526,9 @@ async def test_correction_flow_and_cleanup_csv(env):
     batch = upload.CompletedBatch(
         telegram_id=1001,
         folder="舊相簿",
-        destination_label="家裡硬碟",
+        destination_label="Google Drive",
         files=[],
-        written_paths={"家裡硬碟": [("fake_file_id_001", fake_photo)]},
+        written_paths={"Google Drive": [("fake_file_id_001", fake_photo)]},
         completed_at=datetime.now(),
     )
     sessions.set_last_batch(batch)
@@ -563,7 +556,7 @@ async def test_correction_flow_and_cleanup_csv(env):
     logs: DataLogs = app.bot_data["logs"]
     cleanup_rows = logs.cleanup_list.read_all_rows()
     assert len(cleanup_rows) == 1
-    # 「上傳者」欄必須是姓名——v2 誤填成目的地標籤（"家裡硬碟"），害管理員無法依人篩選（§10B）
+    # 「上傳者」欄必須是姓名——v2 誤填成目的地標籤（"Google Drive"），害管理員無法依人篩選（§10B）
     assert cleanup_rows[0]["上傳者"] == "秀琴"
     assert cleanup_rows[0]["類型"] == "傳錯更正"
     assert cleanup_rows[0]["檔名"] == "20260724_100000_123456.jpg"
@@ -600,7 +593,7 @@ async def test_startup_recover_temp_orphan_files(env):
 
     # 寫入側車檔
     storage.write_session_info(session_temp, {
-        "destination": "OneDrive",
+        "destination": "Google Drive",
         "folder": "過年聚會",
         "telegram_id": 1001,
         "name": "秀琴",
@@ -609,8 +602,8 @@ async def test_startup_recover_temp_orphan_files(env):
     # 執行復原
     await startup_recover_temp(app)
 
-    # 驗證照片已被自動補送到 OneDrive / 過年聚會
-    od_target = od_dir / "過年聚會"
+    # 驗證照片已被自動補送到 Google Drive / 過年聚會
+    od_target = nas_dir / "過年聚會"
     assert od_target.exists()
     recovered_files = list(od_target.glob("*.jpg"))
     assert len(recovered_files) == 1
@@ -629,18 +622,14 @@ async def test_startup_recover_temp_orphan_files(env):
 
 # ── v3：事件處理與背景工作分離（規格書 §3.1、§6.3、§6.3.1、§6.3.2、§7）────
 
-async def _open_session(app, ctx, user, folder: str, dest: str = "家裡硬碟"):
-    """把某使用者帶到「已選好資料夾與目的地、可以開始傳照片」的狀態。"""
+async def _open_session(app, ctx, user, folder: str):
+    """把某使用者帶到「已選好資料夾、可以開始傳照片」的狀態。"""
     members: MembersStore = app.bot_data["members"]
     if members.get(user.id) is None:
         members.register(user.id, user.first_name)
         members.approve(user.id)
     await upload.handle_start_upload(DummyUpdate(user, DummyMessage(1, "📷 我要上傳照片", user.id, app.bot)), ctx)
     await upload.handle_folder_text(DummyUpdate(user, DummyMessage(2, folder, user.id, app.bot)), ctx)
-    dest_msg = DummyMessage(3, "", user.id, app.bot)
-    await upload.handle_destination_button(
-        DummyUpdate(user, dest_msg, DummyCallbackQuery(f"dest:{dest}", user, dest_msg)), ctx
-    )
     return app.bot_data["sessions"].get(user.id)
 
 
@@ -820,8 +809,8 @@ async def test_correction_flag_cleared_when_new_upload_starts(env):
     old_photo = old_dir / "20260724_100000_000001.jpg"
     old_photo.write_bytes(b"x")
     batch = upload.CompletedBatch(
-        telegram_id=1015, folder="舊的一批", destination_label="家裡硬碟", files=[],
-        written_paths={"家裡硬碟": [("fid_1", old_photo)]}, completed_at=datetime.now(),
+        telegram_id=1015, folder="舊的一批", destination_label="Google Drive", files=[],
+        written_paths={"Google Drive": [("fid_1", old_photo)]}, completed_at=datetime.now(),
     )
     app.bot_data["sessions"].set_last_batch(batch)
 
@@ -872,15 +861,15 @@ async def test_correction_offers_recent_folder_buttons(env):
     members: MembersStore = app.bot_data["members"]
     members.register(1017, "姑姑")
     members.approve(1017)
-    members.push_recent_folder(1017, "去年過年", "家裡硬碟")
+    members.push_recent_folder(1017, "去年過年")
 
     old_dir = nas_dir / "打錯的夾"
     old_dir.mkdir(parents=True, exist_ok=True)
     old_photo = old_dir / "20260724_110000_000002.jpg"
     old_photo.write_bytes(b"y")
     batch = upload.CompletedBatch(
-        telegram_id=1017, folder="打錯的夾", destination_label="家裡硬碟", files=[],
-        written_paths={"家裡硬碟": [("fid_2", old_photo)]}, completed_at=datetime.now(),
+        telegram_id=1017, folder="打錯的夾", destination_label="Google Drive", files=[],
+        written_paths={"Google Drive": [("fid_2", old_photo)]}, completed_at=datetime.now(),
     )
     app.bot_data["sessions"].set_last_batch(batch)
 
@@ -943,7 +932,7 @@ async def test_redownload_integration(env):
     logs: DataLogs = app.bot_data["logs"]
 
     # 寫入兩筆測試紀錄到 file_index.csv
-    logs.log_file_index("2026-07-24 10:00", "秀琴", 1001, "淡水一日遊", "家裡硬碟", "photo1.jpg", "file_abc_123")
+    logs.log_file_index("2026-07-24 10:00", "秀琴", 1001, "淡水一日遊", "Google Drive", "photo1.jpg", "file_abc_123")
     logs.log_file_index("2026-07-24 10:00", "秀琴", 1001, "淡水一日遊", "OneDrive", "photo1.jpg", "file_abc_123")  # 同檔名同file_id
 
     # 載入分組並驗證已自動去重
@@ -975,7 +964,7 @@ async def test_restart_cancel_returns_to_previous_stage_not_receiving(env):
     members: MembersStore = app.bot_data["members"]
     members.register(1020, "小舅")
     members.approve(1020)
-    members.push_recent_folder(1020, "上次的夾", "兩邊都存")
+    members.push_recent_folder(1020, "上次的夾")
 
     await upload.handle_start_upload(DummyUpdate(user, DummyMessage(1, "📷 我要上傳照片", 1020, app.bot)), ctx)
     session = app.bot_data["sessions"].get(1020)
@@ -1048,7 +1037,7 @@ async def test_folder_name_with_newline_is_rejected_with_explanation(env):
         DummyUpdate(user, DummyMessage(3, "2026-07-25大量測試", 1022, app.bot)), ctx
     )
     assert session.folder == "2026-07-25大量測試"
-    assert session.stage == "awaiting_destination"
+    assert session.stage == "receiving_photos"
 
 
 @pytest.mark.asyncio
@@ -1100,59 +1089,6 @@ async def test_inactivity_prompt_workflow(env):
     session.last_activity_at = datetime.now() - timedelta(seconds=30)
     await upload.check_session_timeouts(ctx)
     assert session.inactivity_prompted is True
-
-
-@pytest.mark.asyncio
-async def test_auto_append_late_photos(env):
-    """遲到照片測試：3 分鐘內完工的批次，若傳來遲到的照片，自動補存入同個資料夾。"""
-    app, data_dir, temp_dir, nas_dir, od_dir = env
-    ctx = DummyContext(app)
-    user = DummyUser(1032, "二哥")
-
-    # 1. 正常完成一次上傳
-    session = await _open_session(app, ctx, user, "家庭聚餐")
-    await _send_photo(app, ctx, user, "p1", 1)
-    await session.pipeline.settle()
-    await upload._finalize_upload(ctx, session, timed_out=False)
-
-    # 驗證 session 已結束，且紀錄留在 last_batch
-    assert app.bot_data["sessions"].get(1032) is None
-    last_batch = app.bot_data["sessions"].get_last_batch(1032)
-    assert last_batch is not None
-    assert last_batch.folder == "家庭聚餐"
-
-    # 2. 3 分鐘窗口內丟入一張遲到的照片
-    gate = asyncio.Event()
-    app.bot.get_file_gate = gate
-    dummy_photo_item = MagicMock()
-    dummy_photo_item.file_id = "late_p2"
-    dummy_photo_item.file_unique_id = "uniq_late_p2"
-    late_msg = DummyMessage(50, "", 1032, app.bot, photo=[dummy_photo_item])
-    await asyncio.wait_for(upload.handle_photo_message(DummyUpdate(user, late_msg), ctx), timeout=2)
-
-    # 自動開了一個指向同一個相簿的 session，且照樣是「登記完就返回」不等下載（§3.1）
-    late_session = app.bot_data["sessions"].get(1032)
-    assert late_session is not None
-    assert late_session.auto_appended is True
-    assert late_session.folder == "家庭聚餐"
-    assert late_session.destination == last_batch.destination_label
-    assert late_session.stage == "debounce", "直接進緩衝，收齊後自動結案，使用者不必按我傳完了"
-    assert late_session.received_count == 1
-    assert late_session.files[0].downloaded is False, "下載還被擋著，代表沒有在事件處理裡同步等它"
-    assert any("自動幫你存進剛剛的「家庭聚餐」" in m["text"] for m in app.bot.sent_messages)
-
-    # 3. 放行下載，讓緩衝結束收尾——走的是正常流程，不是另一條土炮路徑
-    gate.set()
-    app.bot.get_file_gate = None
-    await upload._debounce_fire(ctx_with_job(ctx, 1032))
-
-    assert len(list((nas_dir / "家庭聚餐").glob("*.jpg"))) == 2
-    logs: DataLogs = app.bot_data["logs"]
-    rows = logs.upload_log.read_all_rows()
-    assert len(rows) == 2, "補存批次要照常寫入 upload_log"
-    assert rows[-1]["上傳者"] == "二哥", "上傳者要用註冊的稱呼，不是 Telegram 暱稱"
-    # file_index 也要有補存那張，日後才找得回來
-    assert any(r["file_id"] == "late_p2" for r in logs.file_index.read_all_rows())
 
 
 @pytest.mark.asyncio
@@ -1335,8 +1271,8 @@ async def test_locked_csv_does_not_break_correction(env):
     old_photo = old_dir / "20260725_120000_aabbccdd.jpg"
     old_photo.write_bytes(b"photo")
     batch = upload.CompletedBatch(
-        telegram_id=1040, folder="打錯了", destination_label="家裡硬碟", files=[],
-        written_paths={"家裡硬碟": [("fid_lock", old_photo)]}, completed_at=datetime.now(),
+        telegram_id=1040, folder="打錯了", destination_label="Google Drive", files=[],
+        written_paths={"Google Drive": [("fid_lock", old_photo)]}, completed_at=datetime.now(),
     )
     app.bot_data["sessions"].set_last_batch(batch)
 
@@ -1361,7 +1297,7 @@ async def test_locked_csv_does_not_break_correction(env):
     assert any("已經幫你把" in t and "正確的夾" in t for t in user_texts)
 
     # 新資料夾要進「最近使用」（以前被崩潰擋在後面永遠執行不到）
-    recent = [f["name"] for f in members.get_recent_folders(1040)]
+    recent = [f["name"] for f in members.family_recent_folders()]
     assert "正確的夾" in recent
 
     # 管理員要收到「檔案被鎖住」的說明，而不是一則看不懂的例外
@@ -1383,10 +1319,6 @@ async def test_existing_folder_is_announced_to_user(env):
 
     await upload.handle_start_upload(DummyUpdate(user, DummyMessage(1, "📷 我要上傳照片", 1041, app.bot)), ctx)
     await upload.handle_folder_text(DummyUpdate(user, DummyMessage(2, "去年中秋", 1041, app.bot)), ctx)
-    dest_msg = DummyMessage(3, "", 1041, app.bot)
-    await upload.handle_destination_button(
-        DummyUpdate(user, dest_msg, DummyCallbackQuery("dest:家裡硬碟", user, dest_msg)), ctx
-    )
 
     ready = app.bot.sent_messages[-1]["text"]
     assert "準備好了" in ready
@@ -1397,10 +1329,6 @@ async def test_existing_folder_is_announced_to_user(env):
     members.register(1042, "六弟"); members.approve(1042)
     await upload.handle_start_upload(DummyUpdate(user2, DummyMessage(1, "📷 我要上傳照片", 1042, app.bot)), ctx)
     await upload.handle_folder_text(DummyUpdate(user2, DummyMessage(2, "全新的夾", 1042, app.bot)), ctx)
-    dest_msg2 = DummyMessage(3, "", 1042, app.bot)
-    await upload.handle_destination_button(
-        DummyUpdate(user2, dest_msg2, DummyCallbackQuery("dest:家裡硬碟", user2, dest_msg2)), ctx
-    )
     assert "已經有了" not in app.bot.sent_messages[-1]["text"]
 
 
@@ -1444,122 +1372,6 @@ async def test_finish_button_edits_status_in_place_never_deletes(env):
 
 
 @pytest.mark.asyncio
-async def test_onedrive_release_is_deferred_not_immediate(env, monkeypatch):
-    """
-    實測 bug 回歸：OneDrive 的「釋放本機空間」不可以在批次一結束就立刻執行。
-
-    那時 OneDrive 用戶端通常還沒把檔案傳到雲端，雲端沒有副本可以「僅線上」，
-    `attrib +U` 沒有東西可以指向、不會生效。實測結果是 24 個檔案的屬性全都
-    只有 A、完全沒有 U——標記從頭到尾就沒生效過。之後 OneDrive 自己完成上傳
-    並把檔案留在本機，使用者看起來就像「照片被自動下載回來了」。
-
-    正確行為（規格書 §4.2）：延遲到 OneDrive 有足夠時間同步完成後才執行。
-    """
-    app, data_dir, temp_dir, nas_dir, od_dir = env
-    ctx = DummyContext(app)
-    user = DummyUser(1060, "八嬸")
-
-    called = []
-    monkeypatch.setattr(storage, "free_onedrive_space", lambda paths: called.append(list(paths)))
-
-    session = await _open_session(app, ctx, user, "雲端測試", dest="OneDrive")
-    await _send_photo(app, ctx, user, "od_1", 10)
-    await session.pipeline.settle()
-    await upload._finalize_upload(ctx, session, timed_out=False)
-
-    # 收尾當下絕對不可以已經執行——那是太早的時機
-    assert called == [], "釋放空間不可以在批次結束當下立刻執行"
-
-    # 而是排了一個延遲的工作
-    release_jobs = [j for j in app.job_queue.jobs if j.name.startswith("onedrive_release:")]
-    assert len(release_jobs) == 1, "應該排一個延遲執行的釋放空間工作"
-    assert release_jobs[0].data["paths"], "要帶著這批實際寫入 OneDrive 的檔案清單"
-
-    # 時間到了才真的執行
-    ctx.job = release_jobs[0]
-    await upload._release_onedrive_space_job(ctx)
-    assert len(called) == 1
-    assert len(called[0]) == 1, "剛剛那一張照片要被標記為僅線上"
-
-
-@pytest.mark.asyncio
-async def test_onedrive_release_skipped_when_disabled(env, monkeypatch):
-    """ONEDRIVE_FREE_SPACE = False 時，完全不排程、也不碰檔案屬性。"""
-    app, *_ = env
-    ctx = DummyContext(app)
-    user = DummyUser(1061, "九叔")
-
-    called = []
-    monkeypatch.setattr(storage, "free_onedrive_space", lambda paths: called.append(list(paths)))
-    original = config.ONEDRIVE_FREE_SPACE
-    try:
-        config.ONEDRIVE_FREE_SPACE = False
-        session = await _open_session(app, ctx, user, "不釋放", dest="OneDrive")
-        await _send_photo(app, ctx, user, "od_off", 10)
-        await session.pipeline.settle()
-        await upload._finalize_upload(ctx, session, timed_out=False)
-
-        assert called == []
-        assert not [j for j in app.job_queue.jobs if j.name.startswith("onedrive_release:")]
-    finally:
-        config.ONEDRIVE_FREE_SPACE = original
-
-
-@pytest.mark.asyncio
-async def test_onedrive_release_survives_restart(env, monkeypatch):
-    """
-    排程掛在 PTB 的 AsyncIOScheduler，那是行程內記憶體——bot 一關就消失。
-    沒有持久化的話，凡是在延遲的 10 分鐘內被關掉的批次，「僅線上」標記
-    就永遠不會下（實測期間光是改 code 就重啟了五、六次）。
-
-    故排程時必須同步落地待辦檔，啟動時掃描補做（比照 §4.3 側車檔的做法）。
-    """
-    app, data_dir, temp_dir, nas_dir, od_dir = env
-    ctx = DummyContext(app)
-    user = DummyUser(1070, "十嬸")
-
-    called = []
-    monkeypatch.setattr(storage, "free_onedrive_space", lambda paths: called.append(list(paths)))
-
-    session = await _open_session(app, ctx, user, "重啟測試", dest="OneDrive")
-    await _send_photo(app, ctx, user, "restart_1", 10)
-    await session.pipeline.settle()
-    await upload._finalize_upload(ctx, session, timed_out=False)
-
-    # 待辦檔要落地，而且帶著到期時間與這批的實際路徑
-    pending = storage.read_pending_releases(data_dir)
-    assert len(pending) == 1, "排程時必須同步寫一份待辦檔"
-    assert pending[0]["paths"], "要記下這批寫入 OneDrive 的檔案"
-    assert pending[0]["due_at"], "要記下到期時間"
-    assert called == [], "還沒到期，不該執行"
-
-    # ── 模擬重啟：job queue 清空（記憶體裡的排程沒了），但待辦檔還在 ──
-    app.job_queue.jobs.clear()
-    resumed = await upload.resume_pending_onedrive_releases(ctx)
-    assert resumed == 1, "啟動時要把待辦接回來"
-
-    jobs = [j for j in app.job_queue.jobs if j.name.startswith(upload.ONEDRIVE_RELEASE_JOB_PREFIX)]
-    assert len(jobs) == 1, "接回來的待辦要重新排進 job queue"
-
-    # 時間到了執行，檔案被標記，待辦也要被劃掉
-    ctx.job = jobs[0]
-    await upload._release_onedrive_space_job(ctx)
-    assert len(called) == 1
-    assert storage.read_pending_releases(data_dir) == [], "執行完要把待辦移除，不可重複執行"
-
-
-@pytest.mark.asyncio
-async def test_pending_release_file_survives_corruption(env):
-    """待辦檔壞掉時只當作沒有待辦，不可讓啟動流程崩潰。"""
-    app, data_dir, *_ = env
-    (data_dir / storage.PENDING_RELEASE_FILENAME).write_text("{ 這不是合法 JSON", encoding="utf-8")
-    assert storage.read_pending_releases(data_dir) == []
-
-    ctx = DummyContext(app)
-    assert await upload.resume_pending_onedrive_releases(ctx) == 0
-
-
-@pytest.mark.asyncio
 async def test_correction_does_not_block_and_shows_progress(env, monkeypatch):
     """
     §3.1：「這批傳錯了」的搬移不可以佔住 update 佇列。
@@ -1584,8 +1396,8 @@ async def test_correction_does_not_block_and_shows_progress(env, monkeypatch):
         pairs.append((f"fid_{i}", f))
 
     batch = upload.CompletedBatch(
-        telegram_id=1080, folder="搬移前", destination_label="家裡硬碟", files=[],
-        written_paths={"家裡硬碟": pairs}, completed_at=datetime.now(),
+        telegram_id=1080, folder="搬移前", destination_label="Google Drive", files=[],
+        written_paths={"Google Drive": pairs}, completed_at=datetime.now(),
     )
     app.bot_data["sessions"].set_last_batch(batch)
 
@@ -1650,8 +1462,8 @@ async def test_correction_applies_write_throttle(env, monkeypatch):
         f.write_bytes(b"x")
         pairs.append((f"tid_{i}", f))
     app.bot_data["sessions"].set_last_batch(upload.CompletedBatch(
-        telegram_id=1081, folder="節流前", destination_label="家裡硬碟", files=[],
-        written_paths={"家裡硬碟": pairs}, completed_at=datetime.now(),
+        telegram_id=1081, folder="節流前", destination_label="Google Drive", files=[],
+        written_paths={"Google Drive": pairs}, completed_at=datetime.now(),
     ))
 
     sleeps = []
@@ -1674,104 +1486,6 @@ async def test_correction_applies_write_throttle(env, monkeypatch):
         config.WRITE_THROTTLE_SEC = original
 
     assert sleeps.count(0.3) == 3, f"3 張照片應該各有一次寫入節流，實際 {sleeps}"
-
-
-@pytest.mark.asyncio
-async def test_correction_schedules_onedrive_release(env):
-    """
-    實測回報的 bug：「這批傳錯了」搬到新資料夾的照片，沒有被寫進
-    pending_onedrive_release.json，所以永遠不會被標記為「僅線上」，
-    本機空間白白佔著。
-
-    寫入 OneDrive 的每一條路徑都必須排釋放空間（§4.2）。
-    """
-    app, data_dir, temp_dir, nas_dir, od_dir = env
-    ctx = DummyContext(app)
-    user = DummyUser(1090, "十三姑")
-    members: MembersStore = app.bot_data["members"]
-    members.register(1090, "十三姑")
-    members.approve(1090)
-
-    old_dir = od_dir / "更正前"
-    old_dir.mkdir(parents=True, exist_ok=True)
-    old_photo = old_dir / "20260725_130000_deadbeef.jpg"
-    old_photo.write_bytes(b"photo")
-    app.bot_data["sessions"].set_last_batch(upload.CompletedBatch(
-        telegram_id=1090, folder="更正前", destination_label="OneDrive", files=[],
-        written_paths={"OneDrive": [("fid_od", old_photo)]}, completed_at=datetime.now(),
-    ))
-
-    corr_msg = DummyMessage(20, "", 1090, app.bot)
-    await upload.handle_correction_button(
-        DummyUpdate(user, corr_msg, DummyCallbackQuery("correction", user, corr_msg)), ctx
-    )
-    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(21, "更正後", 1090, app.bot)), ctx)
-    await drain_background_tasks(app)
-
-    new_photo = od_dir / "更正後" / old_photo.name
-    assert new_photo.exists(), "照片要搬到新資料夾"
-
-    pending = storage.read_pending_releases(data_dir)
-    assert len(pending) == 1, "更正後的新位置也要排 OneDrive 釋放空間"
-    assert str(new_photo) in pending[0]["paths"], "待辦要指向新位置的檔案"
-
-    jobs = [j for j in app.job_queue.jobs if j.name.startswith(upload.ONEDRIVE_RELEASE_JOB_PREFIX)]
-    assert len(jobs) == 1
-
-
-@pytest.mark.asyncio
-async def test_correction_to_nas_does_not_schedule_onedrive_release(env):
-    """只搬到家裡硬碟時不該排 OneDrive 釋放（那裡根本沒有 OneDrive 檔案）。"""
-    app, data_dir, temp_dir, nas_dir, od_dir = env
-    ctx = DummyContext(app)
-    user = DummyUser(1091, "十四伯")
-    members: MembersStore = app.bot_data["members"]
-    members.register(1091, "十四伯")
-    members.approve(1091)
-
-    old_dir = nas_dir / "硬碟更正前"
-    old_dir.mkdir(parents=True, exist_ok=True)
-    old_photo = old_dir / "20260725_131000_cafebabe.jpg"
-    old_photo.write_bytes(b"photo")
-    app.bot_data["sessions"].set_last_batch(upload.CompletedBatch(
-        telegram_id=1091, folder="硬碟更正前", destination_label="家裡硬碟", files=[],
-        written_paths={"家裡硬碟": [("fid_nas", old_photo)]}, completed_at=datetime.now(),
-    ))
-
-    corr_msg = DummyMessage(20, "", 1091, app.bot)
-    await upload.handle_correction_button(
-        DummyUpdate(user, corr_msg, DummyCallbackQuery("correction", user, corr_msg)), ctx
-    )
-    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(21, "硬碟更正後", 1091, app.bot)), ctx)
-    await drain_background_tasks(app)
-
-    assert (nas_dir / "硬碟更正後" / old_photo.name).exists()
-    assert storage.read_pending_releases(data_dir) == []
-
-
-@pytest.mark.asyncio
-async def test_startup_recovery_schedules_onedrive_release(env):
-    """
-    同一類漏洞的第二處：當機復原補送到 OneDrive 的照片，也要排釋放空間。
-    """
-    app, data_dir, temp_dir, nas_dir, od_dir = env
-
-    user_temp = temp_dir / "1092_十五嬸"
-    session_temp = user_temp / "20260725_1300_復原相簿"
-    session_temp.mkdir(parents=True, exist_ok=True)
-    orphan = session_temp / "file_id_recover.jpg"
-    orphan.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00`\x00`\x00\x00\xff\xd9")
-    storage.write_session_info(session_temp, {
-        "destination": "OneDrive", "folder": "復原相簿",
-        "telegram_id": 1092, "name": "十五嬸",
-    })
-
-    await startup_recover_temp(app)
-
-    assert list((od_dir / "復原相簿").glob("*.jpg")), "照片要被補送到 OneDrive"
-    pending = storage.read_pending_releases(data_dir)
-    assert len(pending) == 1, "復原補送的照片也要排 OneDrive 釋放空間"
-    assert pending[0]["paths"]
 
 
 @pytest.mark.asyncio
@@ -1844,7 +1558,7 @@ async def test_existing_folder_scanned_only_once_per_destination(env, monkeypatc
     original_batch = config.BATCH_SIZE
     try:
         config.BATCH_SIZE = 2
-        session = await _open_session(app, ctx, user, "掃描一次", dest="兩邊都存")
+        session = await _open_session(app, ctx, user, "掃描一次")
         for i in range(6):
             await _send_photo(app, ctx, user, f"scan_{i}", 10 + i)
         await session.pipeline.settle()
@@ -1852,9 +1566,8 @@ async def test_existing_folder_scanned_only_once_per_destination(env, monkeypatc
     finally:
         config.BATCH_SIZE = original_batch
 
-    # 6 張、分 3 個小批、兩個目的地 —— 但每個目的地只該掃一次
-    assert len(scans) == 2, f"兩個目的地各掃一次就好，實際掃了 {len(scans)} 次：{scans}"
-    assert len(set(scans)) == 2
+    # 6 張、分 3 個小批 —— 但目的地資料夾只該掃一次
+    assert len(scans) == 1, f"只該掃一次，實際掃了 {len(scans)} 次：{scans}"
 
 
 @pytest.mark.asyncio
@@ -2041,15 +1754,15 @@ async def test_correction_button_works_on_old_message(env):
     members: MembersStore = app.bot_data["members"]
     members.register(1221, "隔天更正")
     members.approve(1221)
-    members.push_recent_folder(1221, "舊夾", "家裡硬碟")
+    members.push_recent_folder(1221, "舊夾")
 
     old_dir = nas_dir / "打錯的"
     old_dir.mkdir(parents=True, exist_ok=True)
     photo = old_dir / "20260725_120000_11112222.jpg"
     photo.write_bytes(b"x")
     app.bot_data["sessions"].set_last_batch(upload.CompletedBatch(
-        telegram_id=1221, folder="打錯的", destination_label="家裡硬碟", files=[],
-        written_paths={"家裡硬碟": [("fid_old", photo)]}, completed_at=datetime.now(),
+        telegram_id=1221, folder="打錯的", destination_label="Google Drive", files=[],
+        written_paths={"Google Drive": [("fid_old", photo)]}, completed_at=datetime.now(),
     ))
 
     old_msg = InaccessibleDummyMessage(1, 1221)
@@ -2195,8 +1908,8 @@ async def test_correction_done_offers_buttons_and_allows_second_correction(env):
     photo = a / "20260725_120000_aaaa1111.jpg"
     photo.write_bytes(b"photo-content")
     app.bot_data["sessions"].set_last_batch(upload.CompletedBatch(
-        telegram_id=1240, folder="A夾", destination_label="家裡硬碟", files=[],
-        written_paths={"家裡硬碟": [("fid_x", photo)]}, completed_at=datetime.now(),
+        telegram_id=1240, folder="A夾", destination_label="Google Drive", files=[],
+        written_paths={"Google Drive": [("fid_x", photo)]}, completed_at=datetime.now(),
     ))
 
     # 第一次更正 A → B

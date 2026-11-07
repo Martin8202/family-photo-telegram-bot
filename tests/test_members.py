@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 from pathlib import Path
 
 from members import MembersStore, STATUS_APPROVED, STATUS_PENDING, STATUS_REJECTED
@@ -77,43 +78,58 @@ def test_corrupted_members_file_does_not_crash(tmp_path):
     assert store.list_all() == []
 
 
-# ── 近 3 次資料夾（§6.2、測項 B7-B9）───────────────────
+# ── 最近資料夾：全家共用（V2 D19、§3.2）───────────────────
 
-def test_recent_folders_independent_per_user(tmp_path):
+def _at(minute: int) -> datetime:
+    return datetime(2026, 11, 7, 10, minute)
+
+
+def test_family_recent_folders_are_shared_across_members(tmp_path):
+    """媽媽剛傳過的資料夾，爸爸打開就排在最上面。"""
+    store = make_store(tmp_path)
+    store.register(1, "媽媽")
+    store.register(2, "爸爸")
+    store.push_recent_folder(2, "爸爸的舊夾", used_at=_at(1))
+    store.push_recent_folder(1, "金門泉州之旅", used_at=_at(5))
+
+    assert [f["name"] for f in store.family_recent_folders()] == ["金門泉州之旅", "爸爸的舊夾"]
+
+
+def test_family_recent_folders_dedup_keeps_latest_and_caps(tmp_path):
+    store = make_store(tmp_path)
+    store.register(1, "媽媽")
+    store.register(2, "爸爸")
+    for i, name in enumerate(["A", "B", "C", "D", "E", "F"]):
+        store.push_recent_folder(1, name, used_at=_at(i))
+    store.push_recent_folder(2, "A", used_at=_at(30))  # 爸爸最近又用了 A
+
+    names = [f["name"] for f in store.family_recent_folders(5)]
+    assert names == ["A", "F", "E", "D", "C"]  # 同一個資料夾只出現一次，取最新；最多 5 個
+
+
+def test_recent_folder_reuse_moves_to_front_and_keep_cap(tmp_path):
     store = make_store(tmp_path)
     store.register(1, "秀琴")
-    store.register(2, "大姊")
-    store.push_recent_folder(1, "阿嬤生日", "家裡硬碟")
+    for i, name in enumerate(["A", "B", "C", "A"]):
+        store.push_recent_folder(1, name, used_at=_at(i), keep=2)
+    assert [f["name"] for f in store.get(1).recent_folders] == ["A", "C"]
+    assert set(store.get(1).recent_folders[0]) == {"name", "used_at"}  # V2 不再記目的地
 
-    assert len(store.get_recent_folders(1)) == 1
-    assert store.get_recent_folders(2) == []
 
-
-def test_recent_folders_capped_and_most_recent_first(tmp_path):
+def test_migrate_recent_folders_keeps_existing_drops_missing(tmp_path):
+    """V1 舊紀錄（帶 last_dest）：照片底下找得到才留、拿掉 last_dest；新紀錄不動。"""
     store = make_store(tmp_path)
-    store.register(1, "秀琴")
-    for name in ["A", "B", "C", "D"]:
-        store.push_recent_folder(1, name, "家裡硬碟", keep=3)
-    folders = [f["name"] for f in store.get_recent_folders(1)]
-    assert folders == ["D", "C", "B"]  # 最新 3 筆，最新在前
+    store.register(1, "媽媽")
+    store._data["1"]["recent_folders"] = [
+        {"name": "金門泉州之旅", "last_dest": "OneDrive", "used_at": "2026-09-08 10:00"},
+        {"name": "只在OneDrive", "last_dest": "OneDrive", "used_at": "2026-09-01 10:00"},
+        {"name": "V2新紀錄", "used_at": "2026-11-07 10:00"},
+    ]
+    dropped = store.migrate_recent_folders(lambda name: name == "金門泉州之旅")
 
-
-def test_recent_folder_reuse_moves_to_front_without_duplicate(tmp_path):
-    store = make_store(tmp_path)
-    store.register(1, "秀琴")
-    store.push_recent_folder(1, "阿嬤生日", "家裡硬碟")
-    store.push_recent_folder(1, "過年聚餐", "OneDrive")
-    store.push_recent_folder(1, "阿嬤生日", "兩邊都存")  # 再次使用
-
-    folders = store.get_recent_folders(1)
-    assert [f["name"] for f in folders] == ["阿嬤生日", "過年聚餐"]
-    assert folders[0]["last_dest"] == "兩邊都存"  # 目的地紀錄為「本次」，非綁定
-
-
-def test_recent_folder_not_bound_to_destination_is_just_display_hint(tmp_path):
-    """「近 3 次資料夾」不綁定目的地，僅記錄名稱供圖示顯示（§6.2、測項 B8）。"""
-    store = make_store(tmp_path)
-    store.register(1, "秀琴")
-    store.push_recent_folder(1, "阿嬤生日", "家裡硬碟")
-    folders = store.get_recent_folders(1)
-    assert set(folders[0].keys()) >= {"name", "last_dest", "used_at"}
+    assert dropped == ["只在OneDrive"]
+    assert store.get(1).recent_folders == [
+        {"name": "金門泉州之旅", "used_at": "2026-09-08 10:00"},
+        {"name": "V2新紀錄", "used_at": "2026-11-07 10:00"},
+    ]
+    assert store.migrate_recent_folders(lambda name: False) == [], "重跑不可以再刪新格式的紀錄"

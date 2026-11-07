@@ -37,7 +37,6 @@ from telegram import InlineKeyboardMarkup
 from keyboards import (
     CB_CORRECTION,
     CB_CORRECTION_FOLDER_PREFIX,
-    CB_DEST_PREFIX,
     CB_DUP_COPY,
     CB_DUP_SKIP,
     CB_FINISH,
@@ -48,7 +47,6 @@ from keyboards import (
     CB_RESTART_CONFIRM,
     correction_folder_keyboard,
     correction_keyboard,
-    destination_keyboard,
     duplicate_decision_keyboard,
     folder_choice_keyboard,
     in_session_keyboard,
@@ -59,10 +57,7 @@ from keyboards import (
     with_restart,
 )
 from state import (
-    DEST_BOTH_LABEL,
-    DEST_NAS_LABEL,
-    DEST_ONEDRIVE_LABEL,
-    STAGE_AWAITING_DESTINATION,
+    DEST_DRIVE_LABEL,
     STAGE_AWAITING_FOLDER,
     STAGE_AWAITING_RESTART_CONFIRM,
     STAGE_DEBOUNCE,
@@ -86,9 +81,6 @@ AWAITING_CORRECTION_FLAG = "awaiting_correction_folder"
 CORRECTION_FLAG_AT = "awaiting_correction_folder_at"
 
 NOT_STARTED_REMINDER_KEY = "last_not_started_reminder_at"
-# 開 session 當下健檢通過的目的地標籤清單。存在 user_data 是因為選目的地、
-# 以及「🔄 重新開始」後回到選目的地那一步，都要拿同一份結果來畫按鈕。
-HEALTHY_DESTS_KEY = "healthy_destinations"
 NOT_STARTED_REMINDER_COOLDOWN_SEC = 30
 
 # v3 新增參數的預設值，容許尚未同步更新的 config.py 也能運作（見規格書 §12.1）
@@ -101,11 +93,10 @@ _DEFAULTS = {
     "COUNTER_REANCHOR_SEC": 5,
     "CORRECTION_PROMPT_MAX_MIN": 10,
     "STAGE_STUCK_MAX_MIN": 30,
-    "ONEDRIVE_FREE_SPACE_DELAY_MIN": 10,
     "DUPLICATE_PROMPT_MAX_MIN": 10,
     "LAST_BATCH_MAX_MIN": 720,
     "INACTIVITY_PROMPT_TIMEOUT_SEC": 25,
-    "AUTO_APPEND_WINDOW_MIN": 3,
+    "RECENT_FOLDERS_COUNT": 5,
 }
 
 
@@ -205,6 +196,15 @@ async def _write_record_safe(context: ContextTypes.DEFAULT_TYPE, what: str, fn, 
         return False
 
 
+async def _log_step(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, name: str, step: str) -> None:
+    """步驟紀錄（V2 O14）：誰在何時走到哪一步，不記內容。寫不進去不影響照片。"""
+    _, _, _, _, logs = _services(context)
+    await _write_record_safe(
+        context, "步驟紀錄", logs.log_step,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"), name, telegram_id, step,
+    )
+
+
 async def _safe_delete_temp(path, temp_root) -> None:
     """
     刪除暫存區內的檔案／資料夾，以 to_thread 執行避免阻塞事件迴圈（規格書 §3），
@@ -233,53 +233,19 @@ async def remind_not_started(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.effective_message.reply_text(notify.user_msg_not_started())
 
 
-def _destination_roots(config) -> dict:
-    return {
-        DEST_NAS_LABEL: Path(config.DEST_NAS),
-        DEST_ONEDRIVE_LABEL: Path(config.DEST_ONEDRIVE),
-    }
+def drive_root(config) -> Path:
+    """Google Drive 電腦版裡的 `照片` 資料夾（V2 規格 D6、D11）。所有資料夾都相對於它。"""
+    return Path(config.DRIVE_PHOTO_ROOT)
 
 
-def _destination_targets(destination: str, config, folder: str) -> dict:
-    """依使用者選的目的地，展開成實際要寫入的 {標籤: 資料夾路徑} 對照表（含目標資料夾）。"""
-    roots = _destination_roots(config)
-    labels = roots.keys() if destination == DEST_BOTH_LABEL else [destination]
-    return {label: roots[label] / folder for label in labels}
+def _destination_targets(config, folder: str) -> dict:
+    """這批要寫入的 {標籤: 資料夾路徑}。V2 只有 Google Drive 一個目的地。"""
+    return {DEST_DRIVE_LABEL: drive_root(config) / folder}
 
 
-async def _health_check_destinations(config) -> tuple[set, dict]:
-    """
-    逐一健檢每個目的地，回傳 (可用標籤集合, {失敗標籤: 錯誤訊息})。
-
-    刻意**分開判斷**，而不是舊版的「任一失敗就整個不給上傳」：家裡硬碟壞掉的
-    時候 OneDrive 通常好端端的，把雲端備份也一起停掉，等於硬碟故障期間所有
-    照片都沒地方存——這與「照片不遺失」的第一原則正好相反。壞的那個不動，
-    好的那個照常走。
-
-    健檢會對網芳寫測試檔，SMB 卡住可能耗時數十秒；必須以 to_thread 執行，
-    否則會阻塞事件迴圈、害其他家人同時被卡住（規格書 §3）。
-    """
-    roots = _destination_roots(config)
-    labels = [DEST_ONEDRIVE_LABEL]
-    if config.ENABLE_NAS:
-        labels.insert(0, DEST_NAS_LABEL)
-    healthy: set = set()
-    failed: dict = {}
-    for label in labels:
-        ok, err = await asyncio.to_thread(storage.health_check, roots[label])
-        if ok:
-            healthy.add(label)
-        else:
-            failed[label] = err or "未知錯誤"
-    return healthy, failed
-
-
-def _available_destinations(context: ContextTypes.DEFAULT_TYPE, config) -> set:
-    """這次上傳可選的目的地。沒有健檢結果（健檢關閉）就退回 config 的設定。"""
-    stored = context.user_data.get(HEALTHY_DESTS_KEY)
-    if stored:
-        return set(stored)
-    return {DEST_NAS_LABEL, DEST_ONEDRIVE_LABEL} if config.ENABLE_NAS else {DEST_ONEDRIVE_LABEL}
+def _recent_folders(context: ContextTypes.DEFAULT_TYPE) -> list[dict]:
+    members, _, config, _, _ = _services(context)
+    return members.family_recent_folders(_cfg(config, "RECENT_FOLDERS_COUNT"))
 
 
 # ── 啟動上傳 ─────────────────────────────────────────
@@ -308,23 +274,19 @@ async def handle_start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     # 待會輸入的新資料夾名稱，會被誤判成上一批的更正目標。
     _clear_correction_flag(context)
 
-    context.user_data.pop(HEALTHY_DESTS_KEY, None)
     if config.HEALTH_CHECK_ON_SESSION:
-        healthy, failed = await _health_check_destinations(config)
-        for label, err in failed.items():
-            await notifier.notify_admin(notify.msg_health_check_failed(f"開 session 健檢／{label}", err))
-        # 只有「一個都寫不進去」才真的擋下來；還有一個活著就照常上傳到那一個。
-        if not healthy:
+        # 只看資料夾在不在、能不能寫（不寫測試檔）；G: 可能卡住，以 to_thread 執行（§3）
+        ok, err = await asyncio.to_thread(storage.health_check, drive_root(config))
+        if not ok:
+            await notifier.notify_admin(
+                notify.msg_health_check_failed(f"開 session 健檢／{DEST_DRIVE_LABEL}", err or "未知錯誤")
+            )
             await _safe_send(context, telegram_id, notify.user_msg_health_check_failed())
             return
-        if failed:
-            await _safe_send(
-                context, telegram_id, notify.user_msg_destination_unavailable(sorted(failed))
-            )
-        context.user_data[HEALTHY_DESTS_KEY] = sorted(healthy)
 
     session = sessions.start(telegram_id, member.name)
-    recent = members.get_recent_folders(telegram_id)
+    await _log_step(context, telegram_id, member.name, "開始上傳")
+    recent = _recent_folders(context)
     if recent:
         await _safe_send(
             context, telegram_id,
@@ -339,8 +301,10 @@ async def handle_start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
 
-async def _set_folder_and_ask_destination(update_message, context: ContextTypes.DEFAULT_TYPE, session, folder_name: str):
+async def _set_folder_and_start(update_message, context: ContextTypes.DEFAULT_TYPE, session, folder_name: str):
+    """選好資料夾就直接開始收照片（V2 D2：不用再選存哪裡）。"""
     _, _, config, _, _ = _services(context)
+    telegram_id = session.telegram_id
     try:
         folder_name = storage.validate_folder_name(folder_name)
     except storage.FolderNameError as exc:
@@ -348,11 +312,37 @@ async def _set_folder_and_ask_destination(update_message, context: ContextTypes.
         await update_message.reply_text(str(exc))
         return
     session.folder = folder_name
-    session.enter_stage(STAGE_AWAITING_DESTINATION)
-    await update_message.reply_text(
-        f"資料夾：{folder_name}\n請選擇要存到哪裡：",
-        reply_markup=with_restart(destination_keyboard(_available_destinations(context, config))),
+    session.destination = DEST_DRIVE_LABEL
+    dest_targets = _destination_targets(config, folder_name)
+    for label in dest_targets:
+        session.destinations[label] = DestinationOutcome(label=label)
+
+    now = datetime.now()
+    session.temp_dir = storage.session_temp_dir(
+        storage.user_temp_dir(Path(config.TEMP_DIR), telegram_id, session.name), now, session.folder
     )
+    # 側車檔記下資料夾，程式中斷後復原時才知道該補送到哪裡（見 storage.write_session_info）
+    await asyncio.to_thread(
+        storage.write_session_info, session.temp_dir,
+        {"destination": DEST_DRIVE_LABEL, "folder": session.folder, "telegram_id": telegram_id, "name": session.name},
+    )
+    session.enter_stage(STAGE_RECEIVING_PHOTOS, now)
+    await _log_step(context, telegram_id, session.name, "選好資料夾")
+
+    # 讓使用者分得清「這次是開新資料夾」還是「加進既有資料夾」。G: 可能卡住，以 to_thread 執行（§3）。
+    existing_labels = []
+    for label, target in dest_targets.items():
+        try:
+            if await asyncio.to_thread(target.exists):
+                existing_labels.append(label)
+        except Exception:
+            pass  # 檢查失敗不影響上傳本身，頂多少一句提示
+
+    ready_text = notify.user_msg_upload_ready(session.folder, DEST_DRIVE_LABEL)
+    if existing_labels:
+        ready_text += "\n" + notify.user_msg_folder_exists(session.folder, existing_labels)
+
+    await update_message.reply_text(ready_text, reply_markup=in_session_keyboard(show_finish=False))
 
 
 async def handle_folder_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -377,7 +367,7 @@ async def handle_folder_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if session is None:
         return False
     if session.stage == STAGE_AWAITING_FOLDER:
-        await _set_folder_and_ask_destination(update.effective_message, context, session, update.effective_message.text)
+        await _set_folder_and_start(update.effective_message, context, session, update.effective_message.text)
         return True
     return False
 
@@ -391,61 +381,7 @@ async def handle_recent_folder_button(update: Update, context: ContextTypes.DEFA
     if session is None or session.stage != STAGE_AWAITING_FOLDER:
         return
     folder_name = query.data[len(CB_RECENT_FOLDER_PREFIX):]
-    await _set_folder_and_ask_destination(query.message, context, session, folder_name)
-
-
-async def handle_destination_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await _safe_answer(query)
-    _, _, config, sessions, _ = _services(context)
-    telegram_id = update.effective_user.id
-    session = sessions.get(telegram_id)
-    if session is None or session.stage != STAGE_AWAITING_DESTINATION:
-        return
-    destination = query.data[len(CB_DEST_PREFIX):]
-    # 按鈕可能是健檢之前發出的舊訊息（使用者往上捲去點到），此時選到的目的地
-    # 也許已經連不上了。重新確認一次再放行，並把還能用的選項重新給他。
-    available = _available_destinations(context, config)
-    needed = {DEST_NAS_LABEL, DEST_ONEDRIVE_LABEL} if destination == DEST_BOTH_LABEL else {destination}
-    if not needed.issubset(available):
-        await _reply_to_query(
-            query, context,
-            notify.user_msg_destination_unavailable(sorted(needed - available))
-            + "\n請重新選擇要存到哪裡：",
-            reply_markup=with_restart(destination_keyboard(available)),
-        )
-        return
-    session.destination = destination
-    dest_targets = _destination_targets(destination, config, session.folder)
-    for label in dest_targets:
-        session.destinations[label] = DestinationOutcome(label=label)
-
-    now = datetime.now()
-    session.temp_dir = storage.session_temp_dir(
-        storage.user_temp_dir(Path(config.TEMP_DIR), telegram_id, session.name), now, session.folder
-    )
-    # 側車檔記下目的地，程式中斷後復原時才知道該補送到哪裡（見 storage.write_session_info）
-    await asyncio.to_thread(
-        storage.write_session_info, session.temp_dir,
-        {"destination": destination, "folder": session.folder, "telegram_id": telegram_id, "name": session.name},
-    )
-    session.enter_stage(STAGE_RECEIVING_PHOTOS, now)
-
-    # 讓使用者分得清「這次是開新相簿」還是「加進既有相簿」。存在性檢查可能打到
-    # 網芳，以 to_thread 執行避免阻塞事件迴圈（§3）。
-    existing_labels = []
-    for label, target in dest_targets.items():
-        try:
-            if await asyncio.to_thread(target.exists):
-                existing_labels.append(label)
-        except Exception:
-            pass  # 檢查失敗不影響上傳本身，頂多少一句提示
-
-    ready_text = notify.user_msg_upload_ready(session.folder, destination)
-    if existing_labels:
-        ready_text += "\n" + notify.user_msg_folder_exists(session.folder, existing_labels)
-
-    await query.message.reply_text(ready_text, reply_markup=in_session_keyboard(show_finish=False))
+    await _set_folder_and_start(query.message, context, session, folder_name)
 
 
 # ── 背景工作管線：下載 worker ×N ＋ 複製 worker ×1（§3.1、§6.3.3）──
@@ -642,7 +578,7 @@ def _ensure_pipeline(context: ContextTypes.DEFAULT_TYPE, session) -> SessionPipe
 async def _copy_and_account(context: ContextTypes.DEFAULT_TYPE, session, chunk: list) -> bool:
     """複製一個內部小批並更新 session 的統計（已存好張數／待重試清單）。"""
     _, _, config, _, _ = _services(context)
-    dest_targets = _destination_targets(session.destination, config, session.folder)
+    dest_targets = _destination_targets(config, session.folder)
     ok = await _copy_chunk_to_destinations(context, session, chunk, dest_targets)
     session.flushed_count += len(chunk)
     if ok:
@@ -807,52 +743,6 @@ async def _update_status_message(
         logger.warning("更新狀態訊息失敗：%s", exc)
 
 
-async def _start_auto_append_session(update: Update, context: ContextTypes.DEFAULT_TYPE, last_batch, message):
-    """
-    遲到照片自動併案（規格書 §6.6）：上一批剛完成沒多久又收到照片時，自動開一個
-    指向同一個資料夾／目的地的 session，讓照片直接歸案，使用者不必重選一次。
-
-    刻意**不另外寫一條搬檔案的路徑**，而是重用正常流程：背景下載 worker、下載重試、
-    失敗通知、file_index、upload_log、written_paths（供「這批傳錯了」使用）
-    全部自動繼承，不需要把同一套容易出錯的邏輯再寫一遍。
-
-    直接進入 STAGE_DEBOUNCE：遲到照片可能不只一張，靠既有的結案緩衝收齊後
-    一次寫入，使用者連「我傳完了」都不必按。
-    """
-    members, _, config, sessions, _ = _services(context)
-    telegram_id = update.effective_user.id
-    member = members.get(telegram_id)
-    if member is None:
-        return None
-
-    now = datetime.now()
-    session = sessions.start(telegram_id, member.name, now)
-    session.folder = last_batch.folder
-    session.destination = last_batch.destination_label
-    session.auto_appended = True
-    for label in _destination_targets(session.destination, config, session.folder):
-        session.destinations[label] = DestinationOutcome(label=label)
-
-    session.temp_dir = storage.session_temp_dir(
-        storage.user_temp_dir(Path(config.TEMP_DIR), telegram_id, session.name), now, session.folder
-    )
-    # 側車檔照寫，程式中斷後這批遲到照片同樣能被復原（§4.3）
-    await asyncio.to_thread(
-        storage.write_session_info, session.temp_dir,
-        {"destination": session.destination, "folder": session.folder,
-         "telegram_id": telegram_id, "name": session.name},
-    )
-    session.enter_stage(STAGE_DEBOUNCE, now)
-    session.status_last_reanchor = now
-    session.mark_confirm_updated(now)
-
-    try:
-        await message.reply_text(notify.user_msg_auto_appended(last_batch.folder))
-    except Exception:
-        pass
-    return session
-
-
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     收到照片：**只做登記與畫面更新，毫秒級返回**（規格書 §3.1、§6.3）。
@@ -875,21 +765,12 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         return  # 非圖片訊息，交由其他 handler（若有）處理
 
     if session is None:
-        # 上一批才剛完成沒多久 → 視為遲到照片，自動歸案到同一個相簿（§6.6）
-        last_batch = sessions.get_last_batch(telegram_id)
-        auto_append_min = _cfg(config, "AUTO_APPEND_WINDOW_MIN")
-        if (
-            last_batch is not None
-            and not last_batch.corrected
-            and (now - last_batch.completed_at).total_seconds() <= auto_append_min * 60
-        ):
-            session = await _start_auto_append_session(update, context, last_batch, message)
-        if session is None:
-            await remind_not_started(update, context)
-            return
+        # V1 的「遲到照片自動併案」已拿掉（V2 D21）；階段 2 改成直接開一批、問放哪
+        await remind_not_started(update, context)
+        return
 
     if session.stage not in (STAGE_RECEIVING_PHOTOS, STAGE_DEBOUNCE):
-        if session.stage in (STAGE_AWAITING_FOLDER, STAGE_AWAITING_DESTINATION):
+        if session.stage == STAGE_AWAITING_FOLDER:
             await update.effective_message.reply_text(notify.user_msg_choose_folder_first())
         return
 
@@ -988,6 +869,7 @@ async def handle_finish_button(update: Update, context: ContextTypes.DEFAULT_TYP
         return  # 其餘階段沒有這顆按鈕可點
 
     session.finish_clicked = True
+    await _log_step(context, telegram_id, session.name, "傳完了")
     # 靜置提醒訊息在此結束任務（狀態訊息不刪，它要繼續用下去）
     await _delete_message_safe(context, telegram_id, session.inactivity_prompt_message_id)
     session.inactivity_prompt_message_id = None
@@ -1012,107 +894,6 @@ async def handle_continue_receiving_button(update: Update, context: ContextTypes
     session.inactivity_prompted = False
     session.touch()
     await query.message.reply_text(notify.user_msg_continue_receiving(), reply_markup=in_session_keyboard(show_finish=True))
-
-
-ONEDRIVE_RELEASE_JOB_PREFIX = "onedrive_release:"
-
-
-def _data_dir(context: ContextTypes.DEFAULT_TYPE) -> Path:
-    return context.application.bot_data["data_dir"]
-
-
-async def _release_onedrive_space_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """時間到了，真正對這批檔案下 attrib +U -P，並把待辦劃掉。"""
-    data = context.job.data
-    paths = data["paths"]
-    batch_id = data.get("batch_id")
-    await asyncio.to_thread(storage.free_onedrive_space, paths)
-    if batch_id:
-        try:
-            await asyncio.to_thread(storage.remove_pending_release, _data_dir(context), batch_id)
-        except Exception:
-            logger.exception("移除 OneDrive 釋放待辦失敗（batch_id=%s）", batch_id)
-
-
-async def _schedule_onedrive_release(
-    context: ContextTypes.DEFAULT_TYPE, paths: list,
-    delay_sec: Optional[float] = None, batch_id: Optional[str] = None, persist: bool = True,
-) -> None:
-    """
-    延遲執行 OneDrive「釋放本機空間」（規格書 §4.2）。
-
-    ⚠️ 不可以在批次一結束就立刻執行：那時 OneDrive 用戶端通常還沒把檔案傳到
-    雲端，雲端還沒有副本可以「僅線上」，`attrib +U` 沒有東西可以指向、不會
-    生效——之後 OneDrive 自己完成上傳，預設會把剛同步好的檔案留在本機，
-    使用者會誤以為「被自動下載」，但其實我們的標記從頭到尾就沒生效過。
-
-    ⚠️ 排程掛在 PTB 的 AsyncIOScheduler，那是**行程內記憶體**，bot 一關就沒了。
-    故同步落地一份待辦檔，啟動時掃描補做（見 `startup_resume_onedrive_release`），
-    否則凡是在延遲期間關掉 bot 的批次，標記就永遠不會下。
-    """
-    config = context.application.bot_data["config"]
-    if delay_sec is None:
-        delay_sec = _cfg(config, "ONEDRIVE_FREE_SPACE_DELAY_MIN") * 60
-    if batch_id is None:
-        batch_id = f"{datetime.now().timestamp()}"
-
-    if persist:
-        due_at = (datetime.now() + timedelta(seconds=delay_sec)).strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            await asyncio.to_thread(
-                storage.add_pending_release, _data_dir(context), batch_id, due_at, paths
-            )
-        except Exception:
-            logger.exception("寫入 OneDrive 釋放待辦失敗，該批重啟後將無法補做")
-
-    job_queue = context.application.job_queue
-    if job_queue is None:
-        # 沒有 job queue 就沒有延遲排程的能力，退回立即執行（best effort，
-        # 仍優於完全不釋放空間），並記 log 說明這不是理想時機。
-        logger.warning("job_queue 不存在，OneDrive 釋放空間退回立即執行（可能因太早而不生效）")
-        await asyncio.to_thread(storage.free_onedrive_space, paths)
-        if persist:
-            await asyncio.to_thread(storage.remove_pending_release, _data_dir(context), batch_id)
-        return
-
-    job_queue.run_once(
-        _release_onedrive_space_job, when=delay_sec,
-        name=f"{ONEDRIVE_RELEASE_JOB_PREFIX}{batch_id}",
-        data={"paths": paths, "batch_id": batch_id},
-    )
-
-
-async def resume_pending_onedrive_releases(context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    啟動時掃描待辦檔：已到期的立刻執行，未到期的重新排回 job queue。
-    回傳處理的批次數，供啟動日誌使用（規格書 §4.2、§17）。
-    """
-    data_dir = _data_dir(context)
-    try:
-        entries = await asyncio.to_thread(storage.read_pending_releases, data_dir)
-    except Exception:
-        logger.exception("讀取 OneDrive 釋放待辦失敗")
-        return 0
-
-    now = datetime.now()
-    for entry in entries:
-        paths = entry.get("paths") or []
-        batch_id = entry.get("batch_id")
-        if not paths or not batch_id:
-            continue
-        try:
-            due = datetime.strptime(entry.get("due_at", ""), "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            due = now  # 時間欄壞掉就當作已到期，寧可早做也不要漏做
-        remaining = (due - now).total_seconds()
-        # 已到期的不要真的用 0 秒立刻跑——重新排一小段緩衝，讓 OneDrive 在
-        # 開機/重啟後有時間把同步狀態接回來。
-        await _schedule_onedrive_release(
-            context, paths, delay_sec=max(remaining, 30), batch_id=batch_id, persist=False,
-        )
-    if entries:
-        logger.info("已接回 %s 批未完成的 OneDrive 釋放空間排程", len(entries))
-    return len(entries)
 
 
 async def _debounce_fire(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1165,10 +946,12 @@ async def check_session_timeouts(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await _finalize_upload(context, session, timed_out=True)
             else:
                 sessions.clear(session.telegram_id)
+                await _log_step(context, session.telegram_id, session.name, "放棄：選好資料夾但沒傳照片")
         elif session.is_abandoned(abandoned_max_min, now):
-            # 記憶體安全網：點了「我要上傳」後停在選資料夾/目的地就再也沒回來、
+            # 記憶體安全網：點了「我要上傳」後停在選資料夾就再也沒回來、
             # 且一張都沒傳的 session，超過絕對存活上限即靜默清除（不動任何檔案）。
             sessions.clear(session.telegram_id)
+            await _log_step(context, session.telegram_id, session.name, f"放棄：停在{session.stage}")
         elif session.is_stage_stuck(stuck_max_min, now):
             # 兜底：卡在非收件階段回不來（例如按了「重新開始」卻不回答二次確認）。
             # 暫存區可能還有照片，不可靜默丟棄（§6.4）。
@@ -1213,7 +996,7 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
             context, telegram_id, notify.user_msg_uploading(progress_bar(processed, total))
         )
 
-    dest_targets = _destination_targets(session.destination, config, session.folder)
+    dest_targets = _destination_targets(config, session.folder)
     all_chunk_failures: list = list(session.pending_retry_files)
     session.pending_retry_files = []
 
@@ -1273,6 +1056,7 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
 
     session.pipeline = None
     sessions.clear(telegram_id)
+    await _log_step(context, telegram_id, session.name, "逾時自動完成" if timed_out else "完成")
 
     # 有「相簿裡已經有了」而暫緩、尚未複製的照片時，**先問過使用者才發完成訊息**。
     # 反過來的話（先報「✅ 完成！2 張」再問還有 3 張要不要存）等於先報了一個假的
@@ -1286,7 +1070,7 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
 
 async def _complete_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_out: bool) -> None:
     """
-    發出收尾宣告：完成訊息、upload_log、記住這批（供「這批傳錯了」）、OneDrive 釋放。
+    發出收尾宣告：完成訊息、upload_log、記住這批（供「這批傳錯了」）。
 
     抽成獨立函式的原因：有重複照片待決時，這一段必須**等使用者回答之後**才執行，
     完成訊息的張數才會是最終確定的（見 `_ask_about_duplicates`）。
@@ -1309,14 +1093,13 @@ async def _complete_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
     )
     await _write_record_safe(
         context, "最近使用的資料夾", members.push_recent_folder,
-        telegram_id, session.folder, dest_label_text,
+        telegram_id, session.folder, None, _cfg(config, "RECENT_FOLDERS_COUNT"),
     )
 
     if overall_ok:
         text = notify.user_msg_done(stored_now, session.folder, dest_label_text,
                                     skipped_count=skipped)
-        if DEST_ONEDRIVE_LABEL in session.destinations:
-            text += "\n" + notify.user_msg_onedrive_cloud_note()
+        text += "\n" + notify.user_msg_cloud_note()
         if failed_downloads:
             text += "\n" + notify.user_msg_download_failed_summary(len(failed_downloads))
         await _safe_send(context, telegram_id, text, reply_markup=correction_keyboard())
@@ -1338,18 +1121,9 @@ async def _complete_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
         if failed_downloads:
             msg += "\n" + notify.user_msg_download_failed_summary(len(failed_downloads))
         await _safe_send(context, telegram_id, msg)
-        nas_status = "✅" if not session.destinations.get(DEST_NAS_LABEL, DestinationOutcome(DEST_NAS_LABEL)).failed else "❌ 失敗"
-        od_status = "✅" if not session.destinations.get(DEST_ONEDRIVE_LABEL, DestinationOutcome(DEST_ONEDRIVE_LABEL)).failed else "❌ 失敗"
-        if session.destination == DEST_BOTH_LABEL:
-            await notifier.notify_admin(notify.msg_both_partial_failure(session.name, session.folder, nas_status, od_status))
 
     if timed_out and session.received_count > 0:
         await _safe_send(context, telegram_id, "⏱️ 太久沒有動作，已自動幫你把剛剛收到的照片處理完成")
-
-    if config.ONEDRIVE_FREE_SPACE and DEST_ONEDRIVE_LABEL in session.destinations:
-        onedrive_paths = [p for _, p in session.destinations[DEST_ONEDRIVE_LABEL].written_paths]
-        if onedrive_paths:
-            await _schedule_onedrive_release(context, onedrive_paths)
 
 
 async def _ask_about_duplicates(context: ContextTypes.DEFAULT_TYPE, session, timed_out: bool = False) -> None:
@@ -1373,7 +1147,7 @@ async def _ask_about_duplicates(context: ContextTypes.DEFAULT_TYPE, session, tim
         folder=session.folder,
         destination_label=session.destination,
         files=files,
-        dest_targets=_destination_targets(session.destination, config, session.folder),
+        dest_targets=_destination_targets(config, session.folder),
         created_at=datetime.now(),
         temp_dir=session.temp_dir,
         session=session,
@@ -1407,7 +1181,7 @@ async def handle_duplicate_copy(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
     # 借用一個輕量 session 走既有的複製流程，才能沿用重試、file_index、
-    # 待清理清單、OneDrive 釋放等所有既有保護（不另闢路徑，§6.6 同一原則）。
+    # 待清理清單等所有既有保護（不另闢路徑）。
     holder = UploadSession(
         telegram_id=telegram_id, name=pending.name,
         folder=pending.folder, destination=pending.destination_label,
@@ -1422,20 +1196,15 @@ async def handle_duplicate_copy(update: Update, context: ContextTypes.DEFAULT_TY
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     cleanup_rows = []
-    onedrive_written = []
     for label, outcome in holder.destinations.items():
         for _file_id, path in outcome.written_paths:
             path = Path(path)
             cleanup_rows.append((now_str, pending.name, telegram_id, "重複檔案",
                                  str(path.parent), path.name,
                                  "使用者確認後仍選擇存一份，與相簿既有照片是同一張"))
-            if label == DEST_ONEDRIVE_LABEL:
-                onedrive_written.append(path)
 
     if cleanup_rows:
         await _write_record_safe(context, "待清理清單", logs.log_cleanup_batch, cleanup_rows)
-    if getattr(config, "ONEDRIVE_FREE_SPACE", True) and onedrive_written:
-        await _schedule_onedrive_release(context, onedrive_written)
 
     if ok:
         await _discard_pending_duplicates(context, pending)
@@ -1559,6 +1328,7 @@ async def handle_restart_confirm(update: Update, context: ContextTypes.DEFAULT_T
         await _safe_delete_temp(session.temp_dir, Path(config.TEMP_DIR))
 
     sessions.clear(telegram_id)
+    await _log_step(context, telegram_id, session.name, "重新開始")
     # 順手清掉可能還留在畫面下方的舊常駐按鈕（功能已移進 ☰ 選單，見 §6.1），
     # 並用文字明確指出下一步該點哪裡，不讓使用者卡在不知道要做什麼的狀態（§5.1）。
     await query.message.reply_text(
@@ -1584,7 +1354,7 @@ async def handle_restart_cancel(update: Update, context: ContextTypes.DEFAULT_TY
     session.enter_stage(previous)
 
     if previous == STAGE_AWAITING_FOLDER:
-        recent = members.get_recent_folders(telegram_id)
+        recent = _recent_folders(context)
         if recent:
             await query.message.reply_text(
                 "好的，那就繼續。請選一個最近用過的資料夾，或直接打字輸入新資料夾名稱：",
@@ -1595,13 +1365,6 @@ async def handle_restart_cancel(update: Update, context: ContextTypes.DEFAULT_TY
                 "好的，那就繼續。請直接打字輸入資料夾名稱：",
                 reply_markup=InlineKeyboardMarkup([restart_row()]),
             )
-        return
-
-    if previous == STAGE_AWAITING_DESTINATION:
-        await query.message.reply_text(
-            f"好的，那就繼續。\n資料夾：{session.folder}\n請選擇要存到哪裡：",
-            reply_markup=with_restart(destination_keyboard(_available_destinations(context, config))),
-        )
         return
 
     await query.message.reply_text("好的，繼續原本的上傳", reply_markup=in_session_keyboard())
@@ -1657,8 +1420,8 @@ async def handle_correction_button(update: Update, context: ContextTypes.DEFAULT
         return  # 重複點擊一律忽略（§6.3）
     context.user_data[AWAITING_CORRECTION_FLAG] = True
     context.user_data[CORRECTION_FLAG_AT] = datetime.now()
-    # 規格書 §7 第 1 點：須同時提供「近 3 次資料夾」按鈕與打字輸入兩種方式
-    recent = members.get_recent_folders(telegram_id)
+    # 規格書 §7 第 1 點：須同時提供「最近資料夾」按鈕與打字輸入兩種方式
+    recent = _recent_folders(context)
     await _reply_to_query(
         query, context,
         "這批要改放到哪個資料夾？可以點下面用過的，或直接打字輸入新名稱：",
@@ -1720,7 +1483,7 @@ async def _run_correction(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, 
     cleanup_rows = []
     index_rows = []
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    roots = _destination_roots(config)
+    roots = {DEST_DRIVE_LABEL: drive_root(config)}
     # 依「每一張照片的 file_id」而非「每一個 (目的地,路徑) 組合」計算成功數，避免
     # 「兩邊都存」時同一張照片在兩個目的地各成功一次卻被算成 2 張，導致回報張數與
     # upload_log 加倍。written_paths 裡存的是寫入當下就配好的 (file_id, 路徑)，
@@ -1734,8 +1497,6 @@ async def _run_correction(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, 
 
     all_file_ids = set(by_photo)
     failed_file_ids: set = set()
-    # 搬到新資料夾的照片同樣是「寫入 OneDrive 的檔案」，一樣要排釋放空間（§4.2）。
-    onedrive_written: list = []
     # 新位置的 (file_id, 路徑) 配對，用來把「最近一批」改指向新資料夾——
     # 搬到 B 之後才發現 B 也不對時，要能再搬到 C。
     new_written_paths: dict = {}
@@ -1770,8 +1531,6 @@ async def _run_correction(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, 
                 cleanup_rows.append((now_str, uploader_name, telegram_id, "傳錯更正",
                                       str(old_path.parent), old_path.name, f"已改放至「{new_folder}」"))
                 new_written_paths.setdefault(label, []).append((file_id, result.dest_path))
-                if label == DEST_ONEDRIVE_LABEL and result.dest_path:
-                    onedrive_written.append(result.dest_path)
             else:
                 failed_file_ids.add(file_id)
 
@@ -1817,7 +1576,7 @@ async def _run_correction(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, 
         await _safe_send(context, telegram_id, done_text, reply_markup=correction_keyboard())
     await _write_record_safe(
         context, "最近使用的資料夾", members.push_recent_folder,
-        telegram_id, new_folder, batch.destination_label,
+        telegram_id, new_folder, None, _cfg(config, "RECENT_FOLDERS_COUNT"),
     )
 
     if cleanup_rows:
@@ -1829,10 +1588,6 @@ async def _run_correction(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, 
         now_str, uploader_name, telegram_id,
         f"{batch.folder} → {new_folder}", batch.destination_label, total_moved, "傳錯更正",
     )
-    # 新位置的 OneDrive 檔案也要排釋放空間，否則它們會永遠留在本機（§4.2）
-    if getattr(config, "ONEDRIVE_FREE_SPACE", True) and onedrive_written:
-        await _schedule_onedrive_release(context, onedrive_written)
-
     await notifier.notify_admin(
         notify.msg_correction(uploader_name, batch.folder, new_folder, total_moved)
     )

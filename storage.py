@@ -2,7 +2,7 @@
 檔案操作，集中管理（見規格書 §3、§4、§10、§11）。
 
 核心保證：
-- 對「目的地」（區網硬碟／OneDrive）只用 `shutil.copy2` 與 `Path.mkdir`，
+- 對「目的地」（Google Drive 電腦版的資料夾）只用 `shutil.copy2` 與 `Path.mkdir`，
   完全不含刪除／移動指令。
 - 唯一的刪除函式 `safe_delete_in_temp()` 會先驗證路徑位於 TEMP_DIR 底下，
   不是就拒絕執行（刪除圍籬）。
@@ -18,7 +18,6 @@ import logging
 import os
 import re
 import shutil
-import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -472,80 +471,19 @@ def safe_delete_in_temp(path: Path, temp_root: Path) -> None:
 # ── 健檢 ────────────────────────────────────────────
 
 def health_check(dest_dir: Path) -> tuple[bool, Optional[str]]:
-    """於目的地寫入一個極小的暫存測試檔，確認成功後刪除。回傳 (成功與否, 錯誤訊息)。"""
+    """
+    確認目的地資料夾存在而且可寫。回傳 (成功與否, 錯誤訊息)。
+
+    **只看、不寫**（V2）：目的地是 Google Drive 電腦版的資料夾，寫測試檔再刪掉
+    會同步成雲端的一次新增＋刪除。也**不建資料夾**：`G:` 沒掛上或路徑打錯時，
+    要回報失敗，而不是在錯的地方開一個新的。
+    """
     dest_dir = Path(dest_dir)
-    test_file = dest_dir / ".photo-bot-healthcheck.tmp"
     try:
-        ensure_dir(dest_dir)
-        test_file.write_text("ok", encoding="utf-8")
-        test_file.unlink()
+        if not dest_dir.is_dir():
+            return False, f"找不到資料夾：{dest_dir}（Google Drive 電腦版有開嗎？）"
+        if not os.access(dest_dir, os.W_OK):
+            return False, f"資料夾不能寫入：{dest_dir}"
         return True, None
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)
-
-
-# ── OneDrive 釋放本機空間 ─────────────────────────────
-
-PENDING_RELEASE_FILENAME = "pending_onedrive_release.json"
-
-
-def _pending_release_path(data_dir: Path) -> Path:
-    return Path(data_dir) / PENDING_RELEASE_FILENAME
-
-
-def read_pending_releases(data_dir: Path) -> list[dict]:
-    """讀出尚未執行的釋放空間待辦。檔案不存在或損毀一律回傳空清單。"""
-    p = _pending_release_path(data_dir)
-    if not p.exists():
-        return []
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-
-def write_pending_releases(data_dir: Path, entries: list[dict]) -> None:
-    """整份覆寫待辦檔。內容極小（只有到期時間與路徑清單），不需要 append 最佳化。"""
-    p = _pending_release_path(data_dir)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def add_pending_release(data_dir: Path, batch_id: str, due_at: str, paths: list) -> None:
-    """
-    登記一筆「稍後要釋放本機空間」的待辦（規格書 §4.2）。
-
-    排程本身掛在 PTB 的 AsyncIOScheduler，那是**行程內記憶體**——bot 一關就
-    消失，那批照片的「僅線上」標記永遠不會下。比照 §4.3 `_session_info.json`
-    側車檔的做法，同步落地一份待辦，啟動時才能掃描補做。
-    """
-    entries = [e for e in read_pending_releases(data_dir) if e.get("batch_id") != batch_id]
-    entries.append({"batch_id": batch_id, "due_at": due_at, "paths": [str(p) for p in paths]})
-    write_pending_releases(data_dir, entries)
-
-
-def remove_pending_release(data_dir: Path, batch_id: str) -> None:
-    """釋放完成後把該筆待辦移除。"""
-    entries = read_pending_releases(data_dir)
-    remaining = [e for e in entries if e.get("batch_id") != batch_id]
-    if len(remaining) != len(entries):
-        write_pending_releases(data_dir, remaining)
-
-
-
-def free_onedrive_space(paths: list[Path]) -> None:
-    """
-    對指定檔案執行 `attrib +U -P`，標記為「僅線上」（規格書 §4.2）。
-    若尚未同步完成，OneDrive 會等同步完成後才真正轉為僅線上，不會遺失資料。
-    """
-    for p in paths:
-        p = Path(p)
-        if not p.exists():
-            continue
-        subprocess.run(
-            ["attrib", "+U", "-P", str(p)],
-            shell=False,
-            check=False,
-            capture_output=True,
-        )

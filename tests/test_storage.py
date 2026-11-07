@@ -261,9 +261,9 @@ def test_storage_module_has_no_destination_delete_or_move_calls():
     assert "os.remove" not in source
     # shutil.rmtree 只能出現在 safe_delete_in_temp 這個有圍籬保護的函式內
     assert source.count("shutil.rmtree") == 1
-    # .unlink() 只能出現兩處：safe_delete_in_temp（圍籬保護）與
-    # health_check 自己建立又自己刪除的極小健檢暫存檔（不涉及任何照片）
-    assert source.count(".unlink()") == 2
+    # .unlink() 只能出現在 safe_delete_in_temp（圍籬保護）。V2 的健檢只看不寫，
+    # 不再對目的地（Google Drive）寫測試檔再刪掉。
+    assert source.count(".unlink()") == 1
 
 
 # ── 暫存區路徑結構（§4.3，測項 F8）────────────────────
@@ -302,7 +302,7 @@ def test_health_check_failure_on_unwritable_path(tmp_path):
 # ── session 側車檔（§4.3 中斷復原策略，記錄目的地供補送使用）─────
 
 def test_write_and_read_session_info_roundtrip(tmp_path):
-    info = {"destination": "兩邊都存", "folder": "阿嬤生日", "telegram_id": 123, "name": "秀琴"}
+    info = {"destination": "Google Drive", "folder": "阿嬤生日", "telegram_id": 123, "name": "秀琴"}
     storage.write_session_info(tmp_path, info)
     assert storage.read_session_info(tmp_path) == info
 

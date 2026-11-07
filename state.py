@@ -13,23 +13,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-# ── 目的地標籤與圖示 ──────────────────────────────
-
-DEST_NAS_LABEL = "家裡硬碟"
-DEST_ONEDRIVE_LABEL = "OneDrive"
-DEST_BOTH_LABEL = "兩邊都存"
-
-DEST_ICONS = {
-    DEST_NAS_LABEL: "🏠",
-    DEST_ONEDRIVE_LABEL: "☁️",
-    # 「兩邊都存」直接用「房子＋雲」的組合，而不是另一個無關的圖示（原為 📦）：
-    # 使用者在「近 3 次資料夾」清單看到 🏠☁️ 時，一眼就能意會「這個資料夾上次
-    # 兩邊都存了」，不必另外記憶第三個符號代表什麼（規格書 §6.2）。
-    DEST_BOTH_LABEL: "🏠☁️",
-}
+# ── 目的地 ──────────────────────────────────────
+# V2 只有一個目的地：Google Drive 電腦版的本機資料夾（V2 規格 D1、D6）。
+# 仍保留「標籤 → DestinationOutcome」的結構，複製／收尾／更正流程不必重寫。
+DEST_DRIVE_LABEL = "Google Drive"
 
 STAGE_AWAITING_FOLDER = "awaiting_folder"
-STAGE_AWAITING_DESTINATION = "awaiting_destination"
 STAGE_RECEIVING_PHOTOS = "receiving_photos"
 STAGE_DEBOUNCE = "debounce"
 STAGE_PROCESSING = "processing"
@@ -38,13 +27,9 @@ STAGE_AWAITING_RESTART_CONFIRM = "awaiting_restart_confirm"
 # session 早已清除之後，狀態記在 context.user_data（見 handlers/upload.py 的
 # AWAITING_CORRECTION_FLAG 與 §7 第 10 點的失效條件）。
 
-# 唯一會累計「完全閒置」時間的階段：已選好資料夾/目的地、等待傳照片或按「我傳完了」。
-# 處理中、等待選資料夾/目的地、結案緩衝，皆不計入閒置（見規格書 §6.4）。
+# 唯一會累計「完全閒置」時間的階段：已選好資料夾、等待傳照片或按「我傳完了」。
+# 處理中、等待選資料夾、結案緩衝，皆不計入閒置（見規格書 §6.4）。
 IDLE_COUNTING_STAGES = {STAGE_RECEIVING_PHOTOS}
-
-
-def recent_folder_icon(last_dest_label: str) -> str:
-    return DEST_ICONS.get(last_dest_label, "")
 
 
 @dataclass
@@ -72,7 +57,7 @@ class ReceivedFile:
 
 @dataclass
 class DestinationOutcome:
-    """單一目的地（NAS 或 OneDrive）在這次上傳中的狀態，用於「兩邊都存」部分失敗判斷。"""
+    """目的地（Google Drive）在這次上傳中的狀態：成敗與實際寫入的路徑。"""
     label: str
     done: bool = False
     failed: bool = False
@@ -96,7 +81,7 @@ class PendingDuplicates:
     dest_targets: dict    # label -> 目的地資料夾 Path
     created_at: datetime
     temp_dir: object = None  # 這批的暫存子夾，決定之後才能刪
-    # 決定之後才要發的收尾（完成訊息、upload_log、last_batch、OneDrive 釋放）
+    # 決定之後才要發的收尾（完成訊息、upload_log、last_batch）
     # 需要用到整個 session 的狀態，故直接帶著它。session 本身已從 SessionManager
     # 移除，這裡持有的只是那個物件。
     session: object = None
@@ -152,7 +137,6 @@ class UploadSession:
     duplicate_files: dict = field(default_factory=dict)
     # 使用者最後決定「不用存」的重複照片；收尾宣告要據此扣掉張數
     skipped_duplicates: list = field(default_factory=list)
-    auto_appended: bool = False  # 是否為「遲到照片自動併案」開出來的 session（§6.6）
     flushed_count: int = 0  # 已進入過複製流程（成功或失敗）的張數
     stored_count: int = 0   # 已成功複製到「所有」目的地的張數，即畫面上的「已存好 N 張」
     pending_retry_files: list = field(default_factory=list)  # 分批寫入失敗、留待批次後重試的檔案
