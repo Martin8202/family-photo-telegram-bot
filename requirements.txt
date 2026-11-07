@@ -1,4 +1,3 @@
 python-telegram-bot[job-queue]>=21.0
 Pillow>=10.0
 pillow-heif>=0.13   # iPhone 原檔（HEIC）的 EXIF 拍攝時間，缺少時 HEIC 會退回用接收時間命名
-httpx>=0.27         # Google Drive API（drive_gate.py）；python-telegram-bot 本來就會裝，這裡明列是因為直接使用
