@@ -1,10 +1,13 @@
 """
-設定範本 —— 複製這個檔案為 config.py 並填入真實值。
-config.py 已列在 .gitignore，不會被 git 追蹤，可放心填入機密資訊。
+設定範本 —— 複製這個檔案為 config.py 並依這台電腦調整。
+config.py 已列在 .gitignore，不會被 git 追蹤。
+機器人 token 不寫在這裡，放在程式資料夾外面的 secrets 資料夾（見 BOT_TOKEN_FILE）。
 """
 
 # ── Telegram 設定 ──────────────────────────────
-BOT_TOKEN = "請填入向 @BotFather 申請的 token"
+# 機器人 token 檔（內容只有一行 token）。放在 photo-bot 資料夾外，git 不可能把它提交上去。
+# 相對路徑以 photo-bot 資料夾為準；開發用測試機器人時改成 test_bot_token.txt。
+BOT_TOKEN_FILE = r"..\secrets\bot_token.txt"
 ADMIN_ID = 0  # 管理員的 Telegram ID（數字），用 @userinfobot 之類的工具查詢
 
 # ── 路徑設定（日後可自由調整）──────────────────

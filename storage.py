@@ -468,6 +468,23 @@ def safe_delete_in_temp(path: Path, temp_root: Path) -> None:
         path.unlink()
 
 
+# ── 機器人 token ─────────────────────────────────────
+
+def read_bot_token(token_file: str, base_dir: Path) -> str:
+    """
+    從 token 檔讀出機器人 token（V2：token 不寫進 config.py）。
+    相對路徑以 base_dir（photo-bot 資料夾）為準。讀不到或格式不對就給看得懂的錯誤。
+    """
+    path = Path(base_dir) / token_file
+    try:
+        token = path.read_text(encoding="utf-8-sig").strip()
+    except OSError as exc:
+        raise SystemExit(f"讀不到機器人 token 檔：{path}（{exc.strerror}）") from None
+    if ":" not in token:
+        raise SystemExit(f"機器人 token 檔內容不對：{path}（應該是 BotFather 給的 123456:ABC… 那一串）")
+    return token
+
+
 # ── 健檢 ────────────────────────────────────────────
 
 def health_check(dest_dir: Path) -> tuple[bool, Optional[str]]:

@@ -21,7 +21,9 @@ pip install -r requirements.txt
 ## 設定
 
 1. 複製 `config.example.py` 為 `config.py`。
-2. 向 [@BotFather](https://t.me/BotFather) 申請 Bot Token，填入 `config.py` 的 `BOT_TOKEN`。
+2. 向 [@BotFather](https://t.me/BotFather) 申請 Bot Token，存成 photo-bot 資料夾**外面**的
+   `..\secrets\bot_token.txt`（只有一行 token）。token 不寫進 `config.py`，`config.py` 的
+   `BOT_TOKEN_FILE` 指向這個檔；放在程式資料夾外，git 不可能把它提交上去。
 3. 填入你的 Telegram ID 到 `ADMIN_ID`（可用 [@userinfobot](https://t.me/userinfobot) 查詢）。
 4. 依實際環境調整 `DRIVE_PHOTO_ROOT`（Google Drive 電腦版裡的「照片」資料夾）、`TEMP_DIR` 等路徑。
    `config.py` 少了任何設定項時，程式啟動會直接列出來，請對照 `config.example.py` 補上。

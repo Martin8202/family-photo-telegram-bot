@@ -403,7 +403,8 @@ def build_application() -> Application:
         raise SystemExit(
             "config.py 少了這些設定項，請參考 config.example.py 補上後再啟動：\n  " + "\n  ".join(missing)
         )
-    app = Application.builder().token(config.BOT_TOKEN).post_init(on_startup).build()
+    token = storage.read_bot_token(config.BOT_TOKEN_FILE, Path(__file__).parent)
+    app = Application.builder().token(token).post_init(on_startup).build()
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     members = MembersStore(DATA_DIR / "members.json")

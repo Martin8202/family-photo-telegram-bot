@@ -13,6 +13,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import config
+import storage
 from logs import DataLogs
 
 try:
@@ -108,7 +109,7 @@ async def async_main() -> None:
     dest_input = input(f"下載到哪裡？（直接按 Enter 用預設 {config.REDOWNLOAD_DIR}）\n> ").strip()
     base_dir = Path(dest_input) if dest_input else Path(config.REDOWNLOAD_DIR)
 
-    bot = Bot(token=config.BOT_TOKEN)
+    bot = Bot(token=storage.read_bot_token(config.BOT_TOKEN_FILE, Path(__file__).parent))
     for idx in indices:
         (folder, uploader, date), rows = items[idx]
         target_dir = base_dir / folder

@@ -280,6 +280,24 @@ def test_session_temp_dir_naming():
     assert p.name == "20260723_2140_阿嬤生日"
 
 
+# ── 機器人 token 檔 ──────────────────────────────────
+
+def test_read_bot_token_relative_to_base_dir(tmp_path):
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "secrets" / "bot_token.txt").write_text("﻿123456:ABC-def\n", encoding="utf-8")
+    repo = tmp_path / "photo-bot"
+    assert storage.read_bot_token(r"..\secrets\bot_token.txt", repo) == "123456:ABC-def"
+
+
+def test_read_bot_token_missing_or_bad_gives_clear_error(tmp_path):
+    import pytest
+    with pytest.raises(SystemExit, match="讀不到"):
+        storage.read_bot_token("沒有這個檔.txt", tmp_path)
+    (tmp_path / "t.txt").write_text("請填入 token", encoding="utf-8")
+    with pytest.raises(SystemExit, match="內容不對"):
+        storage.read_bot_token("t.txt", tmp_path)
+
+
 # ── 健檢 ────────────────────────────────────────────
 
 def test_health_check_success_leaves_no_trace(tmp_path):
