@@ -202,6 +202,10 @@ def user_msg_restart_done() -> str:
     return "已重新開始。要再傳的話，直接把照片傳給我就可以"
 
 
+def user_msg_restart_while_saving() -> str:
+    return "這批已經在存了（或已經存好），沒辦法中途停下來。存好後如果放錯資料夾，可以按「↩️ 這批傳錯了」"
+
+
 def user_msg_correction_same_folder(folder: str) -> str:
     return f"這批本來就在「{folder}」了，請選另一個資料夾"
 

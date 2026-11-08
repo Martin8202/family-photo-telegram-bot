@@ -1529,6 +1529,10 @@ async def handle_restart_button(update: Update, context: ContextTypes.DEFAULT_TY
     session = sessions.get(update.effective_user.id)
     if session is None:
         return
+    if session.stage == STAGE_PROCESSING:
+        # 11/08 實測：寫入中按重新開始，會同時「完成」又把同一批列成中止殘留。已經在存就讓它存完，放錯用「這批傳錯了」。
+        await _reply_to_query(query, context, notify.user_msg_restart_while_saving())
+        return
     session.stage_before_restart_confirm = session.stage
     session.enter_stage(STAGE_AWAITING_RESTART_CONFIRM)
     await query.message.reply_text(
@@ -1543,7 +1547,9 @@ async def handle_restart_confirm(update: Update, context: ContextTypes.DEFAULT_T
     members, notifier, config, sessions, logs = _services(context)
     telegram_id = update.effective_user.id
     session = sessions.get(telegram_id)
-    if session is None:
+    if session is None or session.stage != STAGE_AWAITING_RESTART_CONFIRM:
+        # 確認畫面還在，但這批已經開始存或存好了：不中止、不列殘留
+        await _reply_to_query(query, context, notify.user_msg_restart_while_saving())
         return
 
     # 先中止背景 worker，否則接下來刪暫存夾時它們還在往裡面寫、也還在往目的地複製

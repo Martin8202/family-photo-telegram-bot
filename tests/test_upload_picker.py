@@ -151,6 +151,35 @@ async def test_create_inside_existing_first_level_folder(env):
 
 
 @pytest.mark.asyncio
+async def test_restart_while_saving_is_refused(env):
+    """11/08 實測：寫入中按重新開始，同一批會同時「完成」又被列成中止殘留。已經在存就不中止。"""
+    from test_antigravity_e2e_suite import DummyCallbackQuery
+
+    app, *_ = env
+    ctx = DummyContext(app)
+    user = DummyUser(2010, "阿公")
+    session = await _open_session(app, ctx, user, "2026-11-08存檔中")
+    await _send_photo(app, ctx, user, "s1", 10)
+    await session.pipeline.settle()
+    session.stage = "processing"  # 模擬正在寫入
+
+    async def press(handler, data):
+        m = DummyMessage(30, "", 2010, app.bot)
+        await handler(DummyUpdate(user, m, DummyCallbackQuery(data, user, m)), ctx)
+
+    await press(upload.handle_restart_button, "restart")
+    assert "這批已經在存了" in app.bot.sent_messages[-1]["text"]
+    assert session.stage == "processing", "不可以把寫入中的批次改成等確認"
+
+    # 確認畫面早就出現、現在才按「確定重來」：一樣不中止、不列殘留
+    await press(upload.handle_restart_confirm, "restart_confirm")
+    assert "這批已經在存了" in app.bot.sent_messages[-1]["text"]
+    assert app.bot_data["sessions"].get(2010) is session and session.temp_dir.exists()
+    assert not app.bot_data["logs"].cleanup_list.read_all_rows()
+    await session.pipeline.drain()
+
+
+@pytest.mark.asyncio
 async def test_correction_to_same_folder_is_refused(env):
     """11/08 實測：「這批傳錯了」選到原本的資料夾，原本會在同一處多一份 _(2) 並把原檔列進待清理清單。"""
     from state import CompletedBatch
