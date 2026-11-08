@@ -22,16 +22,19 @@ from telegram.ext import ContextTypes
 
 import notify
 import storage
-from folder_search import SEP, has_date, location_text
+from folder_search import SEP, has_date, location_text, match
 from keyboards import (
     CB_FP_ADD_DATE,
     CB_FP_CREATE,
     CB_FP_NEW,
     CB_FP_NO_DATE,
+    CB_FP_PARENT_PREFIX,
     CB_FP_PICK_PREFIX,
     CB_FP_RETYPE,
     CB_FP_SEARCH,
+    CB_FP_SUB,
     add_date_keyboard,
+    parent_keyboard,
     picker_keyboard,
     search_none_keyboard,
     search_results_keyboard,
@@ -120,11 +123,61 @@ def _with_date(path: str) -> str:
     return f"{head}{SEP}{dated}" if head else dated
 
 
+def _first_level(folders: list) -> list:
+    return [f for f in folders if SEP not in f["path"]]
+
+
+async def _show_parents(context: ContextTypes.DEFAULT_TYPE, chat_id: int, st: dict, paths: list, header: str):
+    st["parents"] = paths
+    return await _send(
+        context, chat_id, header,
+        reply_markup=parent_keyboard([f"📂 {p}" for p in paths], st["mode"] == MODE_UPLOAD),
+    )
+
+
+async def _start_sub(context: ContextTypes.DEFAULT_TYPE, chat_id: int, st: dict) -> None:
+    """📂 建在某個資料夾裡：先列出最近用過的資料夾的第 1 層（第 2 層的取它的上層），也可以打字找。"""
+    members = context.application.bot_data["members"]
+    recent = [f["name"] for f in members.family_recent_folders(10)]
+    parents = list(dict.fromkeys(p.split(SEP)[0] for p in recent))[:5]
+    st["stage"] = "parent"
+    await _show_parents(context, chat_id, st, parents, notify.user_msg_sub_parent_prompt(bool(parents)))
+
+
+async def _sub_text(update: Update, context: ContextTypes.DEFAULT_TYPE, st: dict, text: str) -> None:
+    """建子資料夾流程中打字：選上層時＝找第 1 層資料夾；選好上層後＝新資料夾名稱。"""
+    chat_id = update.effective_user.id
+    if st["stage"] == "parent":
+        index = context.application.bot_data.get("folders")
+        found = match(text, _first_level(index.folders)) if index is not None else []
+        if not found:
+            await _send(context, chat_id, notify.user_msg_sub_parent_none(text))
+            return
+        await _show_parents(context, chat_id, st, [f["path"] for f in found], notify.user_msg_sub_parent_prompt(True))
+        return
+    try:
+        if _PATH_SPLIT.search(text):
+            raise storage.FolderNameError("這裡只要打新資料夾的名稱，不用打「/」")
+        name = storage.validate_folder_name(text)
+    except storage.FolderNameError as exc:
+        await _send(context, chat_id, str(exc))
+        return
+    st["new_name"] = f"{st['parent']}{SEP}{name}"
+    st["stage"] = None
+    if not has_date(name):
+        await _send(context, chat_id, notify.user_msg_ask_add_date(name), reply_markup=add_date_keyboard())
+        return
+    await _finish(update, context, st["mode"], st["new_name"], is_new=True)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str) -> None:
     """打字＝搜尋（D13 方案 A、D23）；找不到或都不是，再從結果新建。"""
     text = (update.effective_message.text or "").strip()
     st = _state(context)
     st["mode"] = mode
+    if st.get("stage"):
+        await _sub_text(update, context, st, text)
+        return
     index = context.application.bot_data.get("folders")
     new_name, name_error, query = parse_new_folder(text, index.folders if index is not None else [])
     results = index.search(query) if index is not None else []
@@ -172,9 +225,20 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
         await _finish(update, context, mode, folder, is_new=False)
     elif data == CB_FP_SEARCH:
+        st["stage"] = None
         await _send(context, chat_id, notify.user_msg_picker_search_prompt())
     elif data in (CB_FP_NEW, CB_FP_RETYPE):
+        st["stage"] = None
         await _send(context, chat_id, notify.user_msg_picker_new_prompt())
+    elif data == CB_FP_SUB:
+        await _start_sub(context, chat_id, st)
+    elif data.startswith(CB_FP_PARENT_PREFIX):
+        try:
+            parent = st.get("parents", [])[int(data[len(CB_FP_PARENT_PREFIX):])]
+        except (ValueError, IndexError):
+            return
+        st["parent"], st["stage"] = parent, "name"
+        await _send(context, chat_id, notify.user_msg_sub_name_prompt(parent))
     elif data == CB_FP_CREATE:
         name = st.get("new_name")
         if not name:

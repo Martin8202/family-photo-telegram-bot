@@ -151,6 +151,46 @@ async def test_create_inside_existing_first_level_folder(env):
 
 
 @pytest.mark.asyncio
+async def test_sub_folder_button_flow(env):
+    """📂 建在某個資料夾裡：選上層（最近用過的取第 1 層／打字找）→ 打名稱 → 加日期 → 建在第 2 層。"""
+    app, data_dir, _, nas_dir, _ = env
+    (nas_dir / "家人" / "2026-07-02金門").mkdir(parents=True)
+    (nas_dir / "旅行").mkdir()
+    index = FolderIndex(data_dir / "folders.json", nas_dir)
+    index.rescan()
+    app.bot_data["folders"] = index
+    ctx = DummyContext(app)
+    user = DummyUser(2008, "姑姑")
+    _approve(app, user)
+    app.bot_data["members"].push_recent_folder(2008, "家人\\2026-07-02金門", None, 5)
+    await _send_photo(app, ctx, user, "s1", 10)
+    await upload._picker_fire(ctx_with_job(ctx, 2008))
+
+    await _press(app, ctx, user, "fp:sub")
+    labels = [b.text for row in app.bot.sent_messages[-1]["reply_markup"].inline_keyboard for b in row]
+    assert labels[0] == "📂 家人", "最近用過的第 2 層資料夾，列出它的上層"
+
+    # 也可以打字找上層；只列第 1 層
+    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(11, "旅行", 2008, app.bot)), ctx)
+    labels = [b.text for row in app.bot.sent_messages[-1]["reply_markup"].inline_keyboard for b in row]
+    assert labels[0] == "📂 旅行"
+    await _press(app, ctx, user, "fp:parent:0")
+    assert "要在「旅行」裡建的新資料夾叫什麼" in app.bot.sent_messages[-1]["text"]
+
+    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(12, "a/b", 2008, app.bot)), ctx)
+    assert "不用打「/」" in app.bot.sent_messages[-1]["text"], "名稱不合規則就說原因，留在這一步"
+    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(13, "宜蘭", 2008, app.bot)), ctx)
+    assert "好像沒有日期" in app.bot.sent_messages[-1]["text"]
+    await _press(app, ctx, user, "fp:adddate")
+
+    session = app.bot_data["sessions"].get(2008)
+    assert session.folder == f"旅行\\{datetime.now():%Y-%m-%d}宜蘭"
+    await session.pipeline.settle()
+    await upload._debounce_fire(ctx_with_job(ctx, 2008))
+    assert len(list((nas_dir / "旅行" / f"{datetime.now():%Y-%m-%d}宜蘭").glob("*.jpg"))) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("text, reason", [
     ("測試/", "「/」後面打新資料夾的名稱"),
     ("沒有這個/烤肉", "「照片」裡沒有叫「沒有這個」的資料夾"),

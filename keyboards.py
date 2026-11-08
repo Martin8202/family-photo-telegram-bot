@@ -36,6 +36,8 @@ CB_FP_CREATE = "fp:create"
 CB_FP_RETYPE = "fp:retype"
 CB_FP_ADD_DATE = "fp:adddate"
 CB_FP_NO_DATE = "fp:nodate"
+CB_FP_SUB = "fp:sub"                 # 📂 建在某個資料夾裡
+CB_FP_PARENT_PREFIX = "fp:parent:"   # 選了上層資料夾（帶編號）
 
 
 def register_keyboard() -> InlineKeyboardMarkup:
@@ -70,6 +72,7 @@ def picker_keyboard(labels: list[str], with_restart_button: bool) -> InlineKeybo
     """
     rows = [[InlineKeyboardButton(label, callback_data=f"{CB_FP_PICK_PREFIX}{i}")] for i, label in enumerate(labels)]
     rows.append([InlineKeyboardButton("🔍 找資料夾／建新的", callback_data=CB_FP_SEARCH)])
+    rows.append([InlineKeyboardButton("📂 建在某個資料夾裡", callback_data=CB_FP_SUB)])
     if with_restart_button:
         rows.append(restart_row())
     return InlineKeyboardMarkup(rows)
@@ -93,6 +96,14 @@ def search_none_keyboard(new_label, with_restart_button: bool) -> InlineKeyboard
     if new_label:
         rows.append([InlineKeyboardButton(f"✅ 新建{new_label}", callback_data=CB_FP_CREATE)])
     rows.append([InlineKeyboardButton("✏️ 重打", callback_data=CB_FP_RETYPE)])
+    if with_restart_button:
+        rows.append(restart_row())
+    return InlineKeyboardMarkup(rows)
+
+
+def parent_keyboard(labels: list[str], with_restart_button: bool) -> InlineKeyboardMarkup:
+    """「📂 建在某個資料夾裡」第一步：選上層資料夾（只有第 1 層）。"""
+    rows = [[InlineKeyboardButton(label, callback_data=f"{CB_FP_PARENT_PREFIX}{i}")] for i, label in enumerate(labels)]
     if with_restart_button:
         rows.append(restart_row())
     return InlineKeyboardMarkup(rows)
