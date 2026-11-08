@@ -21,6 +21,8 @@ CB_CORRECTION = "correction"
 CB_UPLOAD_AGAIN = "upload_again"
 CB_DUP_COPY = "dup_copy"
 CB_DUP_SKIP = "dup_skip"
+CB_PENDING_KEEP = "pend:keep"
+CB_PENDING_DROP = "pend:drop"
 # 選資料夾畫面（handlers/folder_picker.py）。資料夾一律用編號（fp:pick:3），名稱存在
 # context.user_data：Telegram 的 callback_data 最多 64 bytes，第 2 層中文路徑放不下。
 CB_FP_PREFIX = "fp:"
@@ -120,6 +122,14 @@ def duplicate_decision_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✅ 要，還是存一份", callback_data=CB_DUP_COPY)],
         [InlineKeyboardButton("❌ 不用了，跳過", callback_data=CB_DUP_SKIP)],
     ])
+
+
+def pending_reminder_keyboard() -> InlineKeyboardMarkup:
+    """沒選資料夾的提醒（V2 §3.7）。"""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📥 還要上傳", callback_data=CB_PENDING_KEEP),
+        InlineKeyboardButton("❌ 不用存", callback_data=CB_PENDING_DROP),
+    ]])
 
 
 def correction_keyboard() -> InlineKeyboardMarkup:

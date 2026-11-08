@@ -34,6 +34,16 @@ FOLDER_SCAN_DEPTH = 2         # 只掃「照片」底下第幾層以內
 FOLDER_SCAN_EXCLUDE = []      # 不列入搜尋的資料夾名稱
 FOLDER_RESCAN_IDLE_MIN = 10   # 有上傳完成後，全家多久沒動作才在背景重掃
 
+# ── 沒選資料夾的提醒與清除（V2 §3.7）──────────────
+PENDING_REMIND_MIN = 10                # 收到照片後多久沒回應就提醒
+PENDING_DISCARD_AFTER_REMIND_MIN = 10  # 提醒送達後再多久沒回應就清掉暫存
+
+# ── 收哪些檔案（V2 §3.1、§3.6）─────────────────
+ALLOWED_PHOTO_EXT = [".jpg", ".jpeg", ".png", ".heic"]
+ALLOWED_VIDEO_EXT = [".mp4", ".mov"]
+ALLOWED_DOC_EXT = [".pdf", ".docx", ".xlsx", ".pptx", ".txt"]  # 文件保留原檔名
+MAX_DOWNLOAD_MB = 20                   # Telegram 機器人只能下載這麼大（§6）
+
 # ── 背景 worker（見規格書 §3.1、§6.3.3）──────────
 # 並行度固定、不隨照片數量增加：一次傳 10 張與一次傳 3000 張，對磁碟與網芳的
 # 瞬時壓力完全相同。複製到目的地固定單一 worker（網芳最怕並行寫入），不開放調整。

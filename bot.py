@@ -19,6 +19,7 @@ from pathlib import Path
 from telegram import Update
 from telegram.ext import (
     Application,
+    CallbackContext,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -38,6 +39,8 @@ from keyboards import (
     CB_DUP_COPY,
     CB_DUP_SKIP,
     CB_FP_PREFIX,
+    CB_PENDING_DROP,
+    CB_PENDING_KEEP,
     CB_UPLOAD_AGAIN,
     CB_FINISH,
     CB_CONTINUE_RECEIVING,
@@ -275,7 +278,8 @@ async def startup_recover_temp(app: Application) -> None:
             continue
 
         for session_dir in user_dir.iterdir():
-            if not session_dir.is_dir():
+            # 還沒選資料夾的批次不能補送，由 upload.restore_pending_batches 接回去問放哪
+            if not session_dir.is_dir() or upload.is_pending_dir(session_dir):
                 continue
             files = [p for p in session_dir.iterdir() if p.is_file() and p.name != storage.SESSION_INFO_FILENAME]
             if not files:
@@ -304,11 +308,15 @@ async def startup_recover_temp(app: Application) -> None:
                     # 不可直接用暫存檔名 {file_id}.jpg（那不是給人看的正式檔名，§10）。
                     # 沒有原始接收時間，改用暫存檔的修改時間當回退基準（EXIF 有的話仍優先）。
                     received_fallback = datetime.fromtimestamp(f.stat().st_mtime)
-                    target_name = storage.build_filename(
-                        received_fallback, ext=f.suffix or ".jpg", source_path=f, use_exif=cfg.USE_EXIF_TIME
-                    )
+                    if storage.DOC_NAME_SEP in f.name:
+                        # 文件的暫存檔名是 {file_id}~{原檔名}，補送時保留原檔名（V2 §3.1）
+                        file_id, target_name = f.name.split(storage.DOC_NAME_SEP, 1)
+                    else:
+                        target_name = storage.build_filename(
+                            received_fallback, ext=f.suffix or ".jpg", source_path=f, use_exif=cfg.USE_EXIF_TIME
+                        )
+                        file_id = f.stem  # 照片暫存檔名格式固定為 {file_id}{副檔名}
                     result = storage.copy_file_with_retry(f, dest_dir, target_name, cfg.RETRY_TIMES, cfg.RETRY_DELAYS)
-                    file_id = f.stem  # 暫存檔名格式固定為 {file_id}{副檔名}
                     actual_name = result.dest_path.name if result.success and result.dest_path else target_name
                     index_rows.append((now_str, name, telegram_id, folder_name, label, actual_name, file_id))
                     if result.success:
@@ -391,6 +399,8 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_startup(app: Application) -> None:
+    # 先接回沒選資料夾的照片（不需要 G:，健檢可能要等好幾分鐘）
+    await upload.restore_pending_batches(CallbackContext(app))
     # Drive 不能用時不轉換舊紀錄（會全部被當成找不到）、也不補送（照片留在暫存區，下次啟動再補）
     if await startup_health_check(app):
         await startup_migrate_recent_folders(app)
@@ -449,13 +459,18 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(upload.handle_upload_again_button, pattern=f"^{CB_UPLOAD_AGAIN}$"))
     app.add_handler(CallbackQueryHandler(upload.handle_duplicate_copy, pattern=f"^{CB_DUP_COPY}$"))
     app.add_handler(CallbackQueryHandler(upload.handle_duplicate_skip, pattern=f"^{CB_DUP_SKIP}$"))
+    app.add_handler(CallbackQueryHandler(upload.handle_pending_keep, pattern=f"^{CB_PENDING_KEEP}$"))
+    app.add_handler(CallbackQueryHandler(upload.handle_pending_drop, pattern=f"^{CB_PENDING_DROP}$"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, route_text))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, route_photo))
-    # 非照片訊息（影片、一般文件、語音、貼圖…）：合理拒絕並提示，不靜默忽略（§8 E12）
+    # 照片、影片、文件都先進來，允許清單與 20 MB 由 upload 檢查（V2 §3.1、§3.6）。
+    # 動圖（GIF）在 Telegram 也帶著 document，要排除。
     app.add_handler(MessageHandler(
-        filters.VIDEO | filters.ANIMATION | filters.AUDIO | filters.VOICE
-        | filters.Sticker.ALL | (filters.Document.ALL & ~filters.Document.IMAGE),
+        (filters.PHOTO | filters.VIDEO | filters.Document.ALL) & ~filters.ANIMATION, route_photo
+    ))
+    # 其他訊息（語音、貼圖、動圖…）：每一個都回「這種檔案不能傳」，不靜默忽略
+    app.add_handler(MessageHandler(
+        filters.ANIMATION | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE | filters.Sticker.ALL,
         route_unsupported_media,
     ))
 

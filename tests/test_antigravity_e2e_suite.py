@@ -55,10 +55,14 @@ class DummyBot:
         self.deleted_messages = []
         self.get_file_error: Exception | None = None  # 設了就讓下載失敗，測 §6.3.2 下載重試
         self.get_file_gate: asyncio.Event | None = None  # 設了就把下載擋住，測事件處理層不等下載
+        self.send_error: Exception | None = None  # 設了就讓發訊息失敗，測 §3.7 提醒送不出去
 
-    async def send_message(self, chat_id: int, text: str, reply_markup=None):
+    async def send_message(self, chat_id: int, text: str, reply_markup=None, **kwargs):
+        if self.send_error is not None:
+            raise self.send_error
         msg = DummyMessage(message_id=len(self.sent_messages) + 100, text=text, chat_id=chat_id, bot=self)
-        self.sent_messages.append({"chat_id": chat_id, "text": text, "reply_markup": reply_markup, "msg": msg})
+        self.sent_messages.append({"chat_id": chat_id, "text": text, "reply_markup": reply_markup, "msg": msg,
+                                   **kwargs})
         return msg
 
     async def send_chat_action(self, chat_id: int, action: str):
@@ -327,7 +331,7 @@ async def test_complete_upload_session_to_drive(env):
     # 4. 傳送不支援媒體 (影片/語音)
     unsupported_msg = DummyMessage(14, "", 1001, app.bot)
     await upload.handle_unsupported_media(DummyUpdate(user, unsupported_msg), ctx)
-    assert any("只支援傳照片" in m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1001)
+    assert any("這種檔案不能傳" in m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1001)
 
     # 5. 不用按「傳完了」：照片停了自動上傳（D24）
     await upload._debounce_fire(ctx_with_job(ctx, 1001))

@@ -109,7 +109,38 @@ def user_msg_not_started() -> str:
 
 
 def user_msg_unsupported_media() -> str:
-    return "目前只支援傳照片喔，這個檔案類型還不支援，請見諒"
+    return "這種檔案不能傳喔。可以傳照片、影片（mp4、mov），或 PDF、Word、Excel、PowerPoint、txt 文件"
+
+
+def user_msg_too_large(name: str, size_mb: float, limit_mb: int) -> str:
+    return (
+        f"「{name}」有 {size_mb:.0f} MB，超過 {limit_mb} MB，機器人收不了 🙏\n"
+        "請改用手機的 Google Drive App 上傳，已經通知管理員了"
+    )
+
+
+def msg_too_large_for_admin(uploader: str, name: str, size_mb: float) -> str:
+    return f"⚠️ {uploader} 傳了超過上限的檔案「{name}」（{size_mb:.0f} MB），已請對方改用 Drive App"
+
+
+def user_msg_pending_reminder(count: int) -> str:
+    return f"你剛剛傳的 {count} 張還沒選要放哪裡喔"
+
+
+def user_msg_pending_dropped(count: int) -> str:
+    return f"好的，這 {count} 張不存了"
+
+
+def user_msg_pending_discarded(count: int) -> str:
+    return f"你剛剛傳的 {count} 張沒有選資料夾，已經先清掉了；要存的話請再傳一次。"
+
+
+def msg_pending_discarded_for_admin(uploader: str, count: int) -> str:
+    return f"🗑️ {uploader} {count} 張未選資料夾，已自動清除"
+
+
+def user_msg_pending_gone() -> str:
+    return "這批已經處理過了。要上傳的話，直接把照片傳給我就可以"
 
 
 def user_msg_error_generic() -> str:

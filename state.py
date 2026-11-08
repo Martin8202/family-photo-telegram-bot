@@ -56,6 +56,7 @@ class ReceivedFile:
     download_failed: bool = False      # 重試後仍下載失敗（§6.3.2）
     download_error: Optional[str] = None
     copied: bool = False               # 已成功複製到所有目的地
+    original_name: Optional[str] = None  # 文件才有：保留原檔名寫進 Drive（V2 §3.1），重複判斷用「檔名＋大小」
 
 
 @dataclass
@@ -134,6 +135,8 @@ class UploadSession:
     inactivity_prompt_message_id: Optional[int] = None  # 靜置提醒訊息 id
     picker_message_id: Optional[int] = None  # 選資料夾畫面；又來照片時刪舊發新
     picker_shown_count: int = 0              # 畫面上「收到 N 張」的 N，沒變就不重發
+    first_message_id: Optional[int] = None   # 這批第一張照片；§3.7 提醒回覆在它上面
+    reminded_at: Optional[datetime] = None   # §3.7 提醒「確實送達」的時間；之後有動作就重新計時
     destinations: dict = field(default_factory=dict)  # label -> DestinationOutcome
     # label -> 該目的地資料夾裡「已存在照片」的指紋集合。整個資料夾只掃一次就快取，
     # 網芳列目錄很貴，不可以每張照片都重掃一遍（見 storage.scan_existing_fingerprints）。

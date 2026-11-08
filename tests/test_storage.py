@@ -411,7 +411,9 @@ def test_scan_existing_fingerprints(tmp_path):
     (d / "使用者自己放的.jpg").write_bytes(b"d")
 
     found = storage.scan_existing_fingerprints(d)
-    assert set(found) == {"892e347b", "deadbeef"}
+    assert {k for k in found if not k.startswith("name:")} == {"892e347b", "deadbeef"}
+    # V2：每個檔案也記「檔名 → 大小」，給文件做重複判斷
+    assert found[storage.doc_dup_key("使用者自己放的.jpg")] == {1}
     # 一併帶回檔案大小，用來排除指紋碰撞造成的誤判
     assert found["892e347b"] == {1}   # 兩個同指紋的檔案都是 1 byte
     assert found["deadbeef"] == {1}

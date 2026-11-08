@@ -25,7 +25,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional  # noqa: F401 - 型別註記用
 
-from telegram import Update
+from telegram import ReplyParameters, Update
 from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
@@ -45,6 +45,7 @@ from keyboards import (
     correction_keyboard,
     duplicate_decision_keyboard,
     in_session_keyboard,
+    pending_reminder_keyboard,
     restart_confirm_keyboard,
     clear_persistent_keyboard,
 )
@@ -90,6 +91,18 @@ _DEFAULTS = {
     "LAST_BATCH_MAX_MIN": 720,
     "RECENT_FOLDERS_COUNT": 5,
     "PICKER_QUIET_SEC": 3,
+    "PENDING_REMIND_MIN": 10,
+    "PENDING_DISCARD_AFTER_REMIND_MIN": 10,
+    "ALLOWED_PHOTO_EXT": [".jpg", ".jpeg", ".png", ".heic"],
+    "ALLOWED_VIDEO_EXT": [".mp4", ".mov"],
+    "ALLOWED_DOC_EXT": [".pdf", ".docx", ".xlsx", ".pptx", ".txt"],
+    "MAX_DOWNLOAD_MB": 20,
+}
+
+# 沒有檔名時（例如一般方式傳的影片）靠 MIME 類型推副檔名
+_MIME_EXT = {
+    "image/jpeg": ".jpg", "image/png": ".png", "image/heic": ".heic",
+    "video/mp4": ".mp4", "video/quicktime": ".mov",
 }
 
 PENDING_TEMP_LABEL = "待選資料夾"  # 還沒選資料夾時暫存子夾的名稱；真正的資料夾記在側車檔
@@ -489,8 +502,12 @@ async def _download_one(pipeline: SessionPipeline, rf: ReceivedFile) -> None:
         try:
             await asyncio.to_thread(storage.ensure_dir, session.temp_dir)
             file_obj = await pipeline.context.bot.get_file(rf.file_id)
-            ext = Path(file_obj.file_path or "photo.jpg").suffix or ".jpg"
-            local_path = session.temp_dir / f"{rf.file_id}{ext}"
+            if rf.original_name:
+                # 文件把原檔名帶在暫存檔名裡，重啟補送時才讀得回來（V2 §3.1）
+                local_path = session.temp_dir / f"{rf.file_id}{storage.DOC_NAME_SEP}{rf.original_name}"
+            else:
+                ext = Path(file_obj.file_path or "photo.jpg").suffix or ".jpg"
+                local_path = session.temp_dir / f"{rf.file_id}{ext}"
             await file_obj.download_to_drive(custom_path=str(local_path))
             rf.temp_path = local_path
             rf.filename = local_path.name
@@ -599,6 +616,21 @@ async def _copy_and_account(context: ContextTypes.DEFAULT_TYPE, session, chunk: 
     return ok
 
 
+def _dest_filename(rf: ReceivedFile, config) -> str:
+    """寫進 Drive 的檔名：文件保留原檔名；照片、影片用拍攝時間＋指紋（V2 §3.1）。撞名由複製時自動加 _(2)。"""
+    if rf.original_name:
+        return rf.original_name
+    return storage.build_filename(
+        rf.received_at, ext=Path(rf.temp_path).suffix or ".jpg", source_path=rf.temp_path,
+        use_exif=config.USE_EXIF_TIME, fingerprint=rf.fingerprint,
+    )
+
+
+def _dup_key(rf: ReceivedFile):
+    """重複判斷的鍵：文件看檔名（再加大小），照片、影片看內容指紋（再加大小）。"""
+    return storage.doc_dup_key(rf.original_name) if rf.original_name else rf.fingerprint
+
+
 async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, session, chunk: list, dest_targets: dict) -> bool:
     """
     把一個內部小批複製到所有目的地，寫入 file_index，全部目的地成功才清暫存。
@@ -626,15 +658,16 @@ async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, sessio
         to_copy = []
         for rf in chunk:
             size = rf.temp_path.stat().st_size if rf.temp_path and rf.temp_path.exists() else None
-            if storage.looks_like_duplicate(known_fingerprints, rf.fingerprint, size):
+            key = _dup_key(rf)
+            if storage.looks_like_duplicate(known_fingerprints, key, size):
                 entry = session.duplicate_files.setdefault(rf.file_id, (rf, []))
                 if label not in entry[1]:
                     entry[1].append(label)
             else:
                 to_copy.append(rf)
-                if rf.fingerprint:
+                if key:
                     # 先登記，同一批裡若有兩張一模一樣的，第二張也算重複
-                    known_fingerprints.setdefault(rf.fingerprint, set()).add(size)
+                    known_fingerprints.setdefault(key, set()).add(size)
 
         for rf in to_copy:
             try:
@@ -643,11 +676,7 @@ async def _copy_chunk_to_destinations(context: ContextTypes.DEFAULT_TYPE, sessio
                 pass  # 視覺提示失敗不影響上傳本身（§6.3.1）
 
             def _do_copy(rf=rf, dest_dir=dest_dir):
-                ext = Path(rf.temp_path).suffix or ".jpg"
-                filename = storage.build_filename(
-                    rf.received_at, ext=ext, source_path=rf.temp_path,
-                    use_exif=config.USE_EXIF_TIME, fingerprint=rf.fingerprint,
-                )
+                filename = _dest_filename(rf, config)
                 result = storage.copy_file_with_retry(
                     rf.temp_path, dest_dir, filename, config.RETRY_TIMES, config.RETRY_DELAYS
                 )
@@ -752,6 +781,33 @@ async def _update_status_message(
         logger.warning("更新狀態訊息失敗：%s", exc)
 
 
+def _classify_media(message, config):
+    """
+    回傳 (Telegram 檔案物件, 種類, 文件原檔名)。種類：photo／video／document；
+    不在允許清單上回 None（V2 §3.1）。原畫質照片以檔案傳也算 photo，照片命名規則不變。
+    """
+    if message.photo:
+        return message.photo[-1], "photo", None  # 最大尺寸的壓縮版
+    video = getattr(message, "video", None)
+    tg = video or message.document
+    if tg is None:
+        return None, None, None
+    name = getattr(tg, "file_name", None)
+    name = name if isinstance(name, str) else ""
+    mime = getattr(tg, "mime_type", None)
+    mime = mime.lower() if isinstance(mime, str) else ""
+    ext = Path(name).suffix.lower() or _MIME_EXT.get(mime, "")
+    if video is not None and not ext:
+        ext = ".mp4"  # Telegram 一般方式傳的影片都是 mp4
+    if ext in _cfg(config, "ALLOWED_PHOTO_EXT"):
+        return tg, "photo", None
+    if ext in _cfg(config, "ALLOWED_VIDEO_EXT"):
+        return tg, "video", None
+    if ext in _cfg(config, "ALLOWED_DOC_EXT"):
+        return tg, "document", storage.safe_filename(name or f"文件{ext}")
+    return tg, None, None
+
+
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     收到照片：**只做登記與畫面更新，毫秒級返回**（規格書 §3.1、§6.3）。
@@ -763,15 +819,25 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     now = datetime.now()
 
     message = update.effective_message
-    is_document = message.document is not None and (message.document.mime_type or "").startswith("image/")
-    if message.photo:
-        tg_file = message.photo[-1]  # 最大尺寸的壓縮版
-        is_original = False
-    elif is_document:
-        tg_file = message.document
-        is_original = True
-    else:
-        return  # 非圖片訊息，交由其他 handler（若有）處理
+    tg_file, kind, original_name = _classify_media(message, config)
+    if tg_file is None:
+        return
+    # 收不了的每一個都告訴家人（§3.6），不開批次、不計數
+    if kind is None:
+        await message.reply_text(notify.user_msg_unsupported_media())
+        return
+    size = getattr(tg_file, "file_size", None)
+    limit_mb = _cfg(config, "MAX_DOWNLOAD_MB")
+    if isinstance(size, int) and size > limit_mb * 1024 * 1024:
+        member = members.get(telegram_id)
+        label = getattr(tg_file, "file_name", None) or {"photo": "這張照片", "video": "這段影片"}.get(kind, "這個檔案")
+        size_mb = size / 1024 / 1024
+        await message.reply_text(notify.user_msg_too_large(label, size_mb, limit_mb))
+        await notifier.notify_admin(
+            notify.msg_too_large_for_admin(member.name if member else str(telegram_id), label, size_mb)
+        )
+        return
+    is_original = not message.photo  # 一般方式傳的照片是壓縮版
 
     # 不漏收（§3.6）：任何狀況都先收進暫存區
     if session is None:
@@ -791,7 +857,10 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         media_group_id=getattr(message, "media_group_id", None),
         received_at=now,
         is_original_quality=is_original,
+        original_name=original_name,
     )
+    if session.first_message_id is None:
+        session.first_message_id = message.message_id
     session.add_file(rf)
     session.touch(now)
     _ensure_pipeline(context, session).submit(rf)
@@ -826,15 +895,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_unsupported_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """非照片檔案（影片、PDF、貼圖、語音等）：合理拒絕並提示，不崩潰（§8）。"""
-    _, _, _, sessions, _ = _services(context)
-    telegram_id = update.effective_user.id
-    session = sessions.get(telegram_id)
-    if session is None:
-        await remind_not_started(update, context)
-        return
-    if session.stage not in (STAGE_RECEIVING_PHOTOS, STAGE_DEBOUNCE):
-        return
+    """收不了的訊息（語音、貼圖、動圖等）：每一個都告訴家人（V2 §3.6）。"""
     await update.effective_message.reply_text(notify.user_msg_unsupported_media())
 
 
@@ -943,10 +1004,11 @@ async def check_session_timeouts(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     for session in list(sessions.all_sessions()):
         if session.folder is None and session.received_count > 0:
-            # 有照片但還沒選資料夾：沒有地方可以收尾，絕不能丟（§3.6）。
-            # shortcut: 階段 2a 只把卡在「重新開始確認」的拉回選資料夾；§3.7 提醒與清除在 2b 補上
+            # 有照片但還沒選資料夾：不能自動上傳，只能依 §3.7 提醒、沒反應才清除
             if session.stage == STAGE_AWAITING_RESTART_CONFIRM and session.is_stage_stuck(stuck_max_min, now):
                 session.enter_stage(STAGE_AWAITING_FOLDER)
+            elif session.stage == STAGE_AWAITING_FOLDER:
+                await _check_pending_reminder(context, session, now)
             continue
 
         if session.is_idle_timed_out(config.SESSION_TIMEOUT_MIN, now):
@@ -968,6 +1030,179 @@ async def check_session_timeouts(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await _finalize_upload(context, session, timed_out=True)
             else:
                 sessions.clear(session.telegram_id)
+
+
+# ── 沒選資料夾的提醒與清除（V2 §3.7）──────────────────
+
+async def _check_pending_reminder(context: ContextTypes.DEFAULT_TYPE, session, now: datetime) -> None:
+    """有照片、沒選資料夾：10 分鐘沒動作提醒；提醒送達後又 10 分鐘沒動作才清掉。"""
+    _, _, config, _, _ = _services(context)
+    if session.reminded_at is not None and session.last_activity_at > session.reminded_at:
+        session.reminded_at = None  # 提醒後有任何回應 → 重新計時
+    if session.reminded_at is None:
+        if now - session.last_activity_at >= timedelta(minutes=_cfg(config, "PENDING_REMIND_MIN")):
+            await _send_pending_reminder(context, session, now)
+    elif now - session.reminded_at >= timedelta(minutes=_cfg(config, "PENDING_DISCARD_AFTER_REMIND_MIN")):
+        await _discard_pending(context, session, by_user=False)
+
+
+async def _send_pending_reminder(context: ContextTypes.DEFAULT_TYPE, session, now: datetime) -> bool:
+    """發提醒（回覆在第一張照片上）。確實送到才記時間；送不出去就等下一輪重送、不清除（§3.7 例外 2）。"""
+    kwargs = {}
+    if session.first_message_id is not None:
+        kwargs["reply_parameters"] = ReplyParameters(
+            message_id=session.first_message_id, allow_sending_without_reply=True
+        )
+    try:
+        await context.bot.send_message(
+            chat_id=session.telegram_id, text=notify.user_msg_pending_reminder(session.received_count),
+            reply_markup=pending_reminder_keyboard(), **kwargs,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("沒選資料夾的提醒送不出去（chat_id=%s），下一輪再送：%s", session.telegram_id, exc)
+        return False
+    session.reminded_at = now
+    await _log_step(context, session.telegram_id, session.name, "提醒選資料夾")
+    return True
+
+
+async def _discard_pending(context: ContextTypes.DEFAULT_TYPE, session, by_user: bool) -> int:
+    """清掉沒選資料夾的這批：只刪本機暫存區，不碰 Google Drive（§3.7、§4）。回傳張數。"""
+    _, notifier, config, sessions, logs = _services(context)
+    telegram_id = session.telegram_id
+    count = session.received_count
+    if session.pipeline is not None:
+        await session.pipeline.cancel()  # 先停下載，否則刪暫存時它還在往裡面寫
+        session.pipeline = None
+    job_queue = context.application.job_queue
+    if job_queue is not None:
+        for job in job_queue.get_jobs_by_name(_picker_job_name(telegram_id)):
+            job.schedule_removal()
+    await _delete_message_safe(context, telegram_id, session.picker_message_id)
+    await _safe_delete_temp(session.temp_dir, Path(config.TEMP_DIR))
+    sessions.clear(telegram_id)
+
+    result = "使用者選不用存" if by_user else "未選資料夾，已清除"
+    await _write_record_safe(
+        context, "上傳紀錄 upload_log.csv", logs.log_upload,
+        datetime.now().strftime("%Y-%m-%d %H:%M"), session.name, telegram_id, "", DEST_DRIVE_LABEL, count, result,
+    )
+    await _log_step(context, telegram_id, session.name, result)
+    if not by_user:
+        await _safe_send(context, telegram_id, notify.user_msg_pending_discarded(count))
+        await notifier.notify_admin(notify.msg_pending_discarded_for_admin(session.name, count))
+    return count
+
+
+async def handle_pending_keep(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """提醒上的「📥 還要上傳」：重新計時，重發選資料夾畫面。"""
+    query = update.callback_query
+    await _safe_answer(query)
+    session = _services(context)[3].get(update.effective_user.id)
+    if session is None:
+        await _reply_to_query(query, context, notify.user_msg_pending_gone())
+        return
+    if session.folder:
+        await _reply_to_query(query, context, notify.user_msg_already_chosen(session.folder))
+        return
+    if session.stage != STAGE_AWAITING_FOLDER:
+        return
+    session.touch()
+    session.reminded_at = None
+    session.picker_shown_count = -1  # 強制重發到對話最下面
+    await show_upload_picker(context, session)
+
+
+async def handle_pending_drop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """提醒上的「❌ 不用存」：立刻清掉這批暫存。"""
+    query = update.callback_query
+    await _safe_answer(query)
+    session = _services(context)[3].get(update.effective_user.id)
+    if session is None:
+        await _reply_to_query(query, context, notify.user_msg_pending_gone())
+        return
+    if session.folder:
+        await _reply_to_query(query, context, notify.user_msg_already_chosen(session.folder))
+        return
+    if session.stage != STAGE_AWAITING_FOLDER:
+        return
+    folder_picker.clear(context)
+    count = await _discard_pending(context, session, by_user=True)
+    await _reply_to_query(query, context, notify.user_msg_pending_dropped(count))
+
+
+# ── 重啟後接回「待選資料夾」批次（V2 §3.6、§3.7 例外 1）──────
+
+def is_pending_dir(session_dir: Path) -> bool:
+    """這個暫存子夾是不是還沒選資料夾的批次（側車檔 folder 是 None；沒側車檔就看名稱）。"""
+    info = storage.read_session_info(session_dir)
+    if info is not None and "folder" in info:
+        return not info["folder"]
+    return PENDING_TEMP_LABEL in session_dir.name
+
+
+def _scan_pending_dirs(temp_root: Path) -> list:
+    """找出所有「待選資料夾」暫存子夾：[(telegram_id, 名稱, 子夾, [檔案])]。"""
+    found = []
+    for user_dir in temp_root.iterdir():
+        if not user_dir.is_dir() or "_" not in user_dir.name:
+            continue
+        tid_str, dir_name = user_dir.name.split("_", 1)
+        if not tid_str.isdigit():
+            continue
+        for session_dir in sorted(p for p in user_dir.iterdir() if p.is_dir()):
+            if not is_pending_dir(session_dir):
+                continue
+            files = [p for p in session_dir.iterdir() if p.is_file() and p.name != storage.SESSION_INFO_FILENAME]
+            if files:
+                info = storage.read_session_info(session_dir) or {}
+                found.append((int(tid_str), info.get("name") or dir_name, session_dir, files))
+    return found
+
+
+def _restored_file(path: Path) -> ReceivedFile:
+    """暫存檔還原成 ReceivedFile。文件的暫存檔名是 {file_id}~{原檔名}。"""
+    if storage.DOC_NAME_SEP in path.name:
+        file_id, original_name = path.name.split(storage.DOC_NAME_SEP, 1)
+    else:
+        file_id, original_name = path.stem, None
+    return ReceivedFile(
+        file_id=file_id, received_at=datetime.fromtimestamp(path.stat().st_mtime),
+        is_original_quality=True, temp_path=path, filename=path.name, downloaded=True,
+        fingerprint=storage.content_fingerprint(path), original_name=original_name,
+    )
+
+
+async def restore_pending_batches(context) -> int:
+    """
+    啟動時把還沒選資料夾的照片接回來，立刻補發提醒、重新給 10 分鐘（不直接刪）。
+    不需要 G:，所以 Drive 還沒掛上也照做。回傳接回幾批。
+    """
+    _, notifier, config, sessions, _ = _services(context)
+    temp_root = Path(config.TEMP_DIR)
+    if not temp_root.exists():
+        return 0
+    now = datetime.now()
+    restored = 0
+    for telegram_id, name, session_dir, files in await asyncio.to_thread(_scan_pending_dirs, temp_root):
+        if sessions.get(telegram_id) is not None:
+            # shortcut: 同一人有兩個以上待選批次（極少見）只接回第一個，其餘留在暫存區、通知管理員人工處理
+            logger.warning("同一人有多個待選資料夾批次，這個先不接回：%s", session_dir)
+            await notifier.notify_admin(f"⚠️ {name} 有多批沒選資料夾的照片，這批先留在暫存區：{session_dir}")
+            continue
+        session = sessions.start(telegram_id, name, now)
+        session.temp_dir = session_dir
+        pipeline = _ensure_pipeline(context, session)
+        for path in files:
+            rf = await asyncio.to_thread(_restored_file, path)
+            session.add_file(rf)
+            pipeline.buffer.append(rf)  # 已在暫存區，選好資料夾後收尾時直接複製
+        # 落在停機期間的到期一律先補提醒；送不出去時讓下一輪巡邏立刻重送
+        session.last_activity_at = now - timedelta(minutes=_cfg(config, "PENDING_REMIND_MIN"))
+        await _send_pending_reminder(context, session, now)
+        restored += 1
+        logger.info("已接回 %s 沒選資料夾的 %s 張", name, len(files))
+    return restored
 
 
 # ── 實際處理一次上傳（收尾）───────────────────────────
@@ -1029,13 +1264,8 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
             retry_results = []
             for rf in all_chunk_failures:
                 def _do_copy(rf=rf, dest_dir=dest_dir):
-                    ext = Path(rf.temp_path).suffix or ".jpg"
-                    filename = storage.build_filename(
-                        rf.received_at, ext=ext, source_path=rf.temp_path,
-                        use_exif=config.USE_EXIF_TIME, fingerprint=rf.fingerprint,
-                    )
                     return storage.copy_file_with_retry(
-                        rf.temp_path, dest_dir, filename, config.RETRY_TIMES, config.RETRY_DELAYS
+                        rf.temp_path, dest_dir, _dest_filename(rf, config), config.RETRY_TIMES, config.RETRY_DELAYS
                     )
 
                 retry_results.append(await asyncio.to_thread(_do_copy))

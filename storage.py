@@ -168,15 +168,39 @@ def scan_existing_fingerprints(dest_dir: Path) -> dict:
             for entry in it:
                 if not entry.is_file():
                     continue
+                try:
+                    size = entry.stat().st_size
+                except OSError:
+                    size = None
+                # 文件保留原檔名，重複判斷看「檔名＋大小」（V2 §3.1）
+                keys = [doc_dup_key(entry.name)]
                 fp = extract_fingerprint(entry.name)
                 if fp:
-                    try:
-                        found.setdefault(fp, set()).add(entry.stat().st_size)
-                    except OSError:
-                        found.setdefault(fp, set())
+                    keys.append(fp)
+                for key in keys:
+                    sizes = found.setdefault(key, set())
+                    if size is not None:
+                        sizes.add(size)
     except OSError:
         pass  # 列目錄失敗（權限、網芳斷線）就當作沒有既有檔案，不影響上傳
     return found
+
+
+DOC_NAME_SEP = "~"  # 文件暫存檔名＝{file_id}~{原檔名}；file_id 是 base64url，不會有 ~
+
+
+def doc_dup_key(filename: str) -> str:
+    """文件的重複判斷鍵（跟照片指紋放在同一個 dict，加前綴避免撞到）。"""
+    return "name:" + filename.lower()
+
+
+def safe_filename(name: str) -> str:
+    """把 Telegram 帶來的原檔名變成 Windows 能用的檔名（不合法字元換成 _）。"""
+    cleaned = "".join("_" if c in INVALID_FOLDER_CHARS or ord(c) < 32 else c for c in name).strip().rstrip(".")
+    if len(cleaned) > 150:  # 太長就截主檔名、保留副檔名
+        suffix = Path(cleaned).suffix[:10]
+        cleaned = cleaned[:150 - len(suffix)] + suffix
+    return cleaned or "file"
 
 
 def looks_like_duplicate(known: dict, fingerprint: Optional[str], size: Optional[int]) -> bool:
