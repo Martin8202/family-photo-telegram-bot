@@ -36,6 +36,7 @@ from keyboards import (
     add_date_keyboard,
     parent_keyboard,
     picker_keyboard,
+    subfolder_keyboard,
     search_none_keyboard,
     search_results_keyboard,
 )
@@ -45,6 +46,7 @@ logger = logging.getLogger("photo-bot.picker")
 PICKER_KEY = "picker"
 MODE_UPLOAD = "upload"
 MODE_CORRECTION = "correction"
+SUBFOLDER_LIST_MAX = 8  # 選好上層後最多列幾個裡面原本的資料夾
 _PATH_SPLIT = re.compile(r"[/\\／＼]")  # 「上層/新名稱」的分隔符號（半形、全形都算）
 
 
@@ -238,7 +240,18 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         except (ValueError, IndexError):
             return
         st["parent"], st["stage"] = parent, "name"
-        await _send(context, chat_id, notify.user_msg_sub_name_prompt(parent))
+        # 先讓人看到裡面原本有哪些資料夾（新的在前），點了就放進去，避免重複建（11/08 實測）
+        index = context.application.bot_data.get("folders")
+        subs = [f for f in (index.folders if index is not None else [])
+                if f["path"].startswith(parent + SEP) and f["path"].count(SEP) == 1]
+        subs.sort(key=lambda f: f.get("mtime", 0), reverse=True)
+        st["choices"] = [f["path"] for f in subs[:SUBFOLDER_LIST_MAX]]
+        await _send(
+            context, chat_id, notify.user_msg_sub_name_prompt(parent, bool(st["choices"])),
+            reply_markup=subfolder_keyboard(
+                [f"📥 {p.split(SEP)[-1]}" for p in st["choices"]], st["mode"] == MODE_UPLOAD
+            ),
+        )
     elif data == CB_FP_CREATE:
         name = st.get("new_name")
         if not name:

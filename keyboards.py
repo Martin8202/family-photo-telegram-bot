@@ -109,6 +109,15 @@ def parent_keyboard(labels: list[str], with_restart_button: bool) -> InlineKeybo
     return InlineKeyboardMarkup(rows)
 
 
+def subfolder_keyboard(labels: list[str], with_restart_button: bool) -> InlineKeyboardMarkup:
+    """選好上層後：裡面已經有的資料夾（點了就放進去）＋換一個上層。要新建就直接打名稱。"""
+    rows = [[InlineKeyboardButton(label, callback_data=f"{CB_FP_PICK_PREFIX}{i}")] for i, label in enumerate(labels)]
+    rows.append([InlineKeyboardButton("↩️ 換一個上層資料夾", callback_data=CB_FP_SUB)])
+    if with_restart_button:
+        rows.append(restart_row())
+    return InlineKeyboardMarkup(rows)
+
+
 def add_date_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("📅 加今天的日期", callback_data=CB_FP_ADD_DATE),

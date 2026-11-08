@@ -170,12 +170,20 @@ async def test_sub_folder_button_flow(env):
     labels = [b.text for row in app.bot.sent_messages[-1]["reply_markup"].inline_keyboard for b in row]
     assert labels[0] == "📂 家人", "最近用過的第 2 層資料夾，列出它的上層"
 
+    # 選了上層：先看到裡面原本有哪些資料夾，點了就放進去；也能換一個上層（11/08 實測）
+    await _press(app, ctx, user, "fp:parent:0")
+    sent = app.bot.sent_messages[-1]
+    assert "「家人」裡面已經有這些資料夾" in sent["text"]
+    labels = [b.text for row in sent["reply_markup"].inline_keyboard for b in row]
+    assert labels[:2] == ["📥 2026-07-02金門", "↩️ 換一個上層資料夾"]
+    await _press(app, ctx, user, "fp:sub")
+
     # 也可以打字找上層；只列第 1 層
     await upload.handle_folder_text(DummyUpdate(user, DummyMessage(11, "旅行", 2008, app.bot)), ctx)
     labels = [b.text for row in app.bot.sent_messages[-1]["reply_markup"].inline_keyboard for b in row]
     assert labels[0] == "📂 旅行"
     await _press(app, ctx, user, "fp:parent:0")
-    assert "要在「旅行」裡建的新資料夾叫什麼" in app.bot.sent_messages[-1]["text"]
+    assert "「旅行」裡面還沒有資料夾" in app.bot.sent_messages[-1]["text"]
 
     await upload.handle_folder_text(DummyUpdate(user, DummyMessage(12, "a/b", 2008, app.bot)), ctx)
     assert "不用打「/」" in app.bot.sent_messages[-1]["text"], "名稱不合規則就說原因，留在這一步"

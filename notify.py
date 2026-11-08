@@ -149,8 +149,13 @@ def user_msg_sub_parent_none(query: str) -> str:
     return f"「照片」裡找不到叫「{query}」的資料夾，請換個字再打一次"
 
 
-def user_msg_sub_name_prompt(parent: str) -> str:
-    return f"要在「{parent}」裡建的新資料夾叫什麼？直接打名稱，例如「烤肉」"
+def user_msg_sub_name_prompt(parent: str, has_subs: bool) -> str:
+    if has_subs:
+        return (
+            f"「{parent}」裡面已經有這些資料夾，要放進其中一個就直接點\n"
+            "要建新的，直接打名稱，例如「烤肉」"
+        )
+    return f"「{parent}」裡面還沒有資料夾。新資料夾要叫什麼？直接打名稱，例如「烤肉」"
 
 
 def user_msg_find_prompt() -> str:
