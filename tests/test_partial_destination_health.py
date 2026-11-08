@@ -2,7 +2,7 @@
 Google Drive 資料夾健檢（V2：只剩一個目的地）。
 
 V1 這裡測的是「家裡硬碟壞掉時 OneDrive 照常上傳」；V2 只有 Google Drive，
-改測三件事：健檢只看不寫、Drive 不能用時不開 session、開機時 G: 還沒掛上要等一下再試。
+改測三件事：健檢只看不寫、Drive 不能用時照收照片只通知管理員（V2 §3.6）、開機時 G: 還沒掛上要等一下再試。
 """
 import types
 
@@ -35,7 +35,8 @@ def test_health_check_reads_only(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_dead_drive_blocks_session_and_notifies(env, tmp_path):
+async def test_dead_drive_still_collects_photos_and_notifies(env, tmp_path):
+    """V2 §3.6：G: 不能用也照收照片（留在暫存區），只通知管理員。"""
     app, *_ = env
     config.HEALTH_CHECK_ON_SESSION = True
     config.DRIVE_PHOTO_ROOT = str(tmp_path / "G槽沒掛上" / "照片")
@@ -45,11 +46,13 @@ async def test_dead_drive_blocks_session_and_notifies(env, tmp_path):
     members.register(1001, "媽媽")
     members.approve(1001)
 
-    await upload.handle_start_upload(DummyUpdate(user, DummyMessage(10, "📷 我要上傳照片", 1001, app.bot)), ctx)
+    photo = types.SimpleNamespace(file_id="dead_drive_1")
+    await upload.handle_photo_message(DummyUpdate(user, DummyMessage(10, "", 1001, app.bot, photo=[photo])), ctx)
 
-    assert not app.bot_data["sessions"].has_active(1001)
-    assert any("暫時無法上傳" in m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1001)
+    session = app.bot_data["sessions"].get(1001)
+    assert session is not None and session.received_count == 1, "照片不可以因為 G: 不能用就丟掉"
     assert any("Google Drive" in m["text"] for m in app.bot.sent_messages if m["chat_id"] == 999999)
+    await session.pipeline.drain()
 
 
 @pytest.mark.asyncio

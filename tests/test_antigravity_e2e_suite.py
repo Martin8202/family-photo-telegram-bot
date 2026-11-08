@@ -22,7 +22,7 @@ import config
 import notify
 import storage
 from bot import startup_recover_temp
-from handlers import register, upload
+from handlers import folder_picker, register, upload
 from logs import DataLogs
 from members import STATUS_APPROVED, STATUS_PENDING, MembersStore
 from redownload import download_rows, load_groups
@@ -78,6 +78,9 @@ class DummyBot:
         self.edited_messages.append({"chat_id": chat_id, "message_id": message_id, "text": text})
 
     async def set_my_commands(self, commands):
+        pass
+
+    async def delete_my_commands(self):
         pass
 
 
@@ -161,7 +164,7 @@ class DummyJobQueue:
     def get_jobs_by_name(self, name: str):
         return [j for j in self.jobs if j.name == name and not j.removed]
 
-    def run_once(self, callback, when, name: str, data: dict):
+    def run_once(self, callback, when, name: str, data: dict, **kwargs):
         job = DummyJob(name, data)
         self.jobs.append(job)
         return job
@@ -296,48 +299,38 @@ async def test_complete_upload_session_to_drive(env):
     members.register(1001, "媽媽")
     members.approve(1001)
 
-    # 1. 點擊 📷 我要上傳照片
-    msg = DummyMessage(10, "📷 我要上傳照片", 1001, app.bot)
-    upd = DummyUpdate(user, msg)
-    await upload.handle_start_upload(upd, ctx)
-    assert app.bot_data["sessions"].has_active(1001)
-
-    # 2. 輸入資料夾名稱「2026阿嬤八十大壽」
-    folder_msg = DummyMessage(11, "2026阿嬤八十大壽", 1001, app.bot)
-    folder_upd = DummyUpdate(user, folder_msg)
-    await upload.handle_folder_text(folder_upd, ctx)
-    session = app.bot_data["sessions"].get(1001)
-    assert session.folder == "2026阿嬤八十大壽"
-    # 3. V2 不用再選存哪裡：選好資料夾就直接開始收照片
-    assert session.destination == "Google Drive"
-    assert session.stage == "receiving_photos"
-
-    # 4. 傳送照片 (一張照片 photo，一張檔案原圖 document.image)
+    # 1. V2 D17：不點選單，直接傳照片（一張壓縮 photo、一張原圖 document.image）就開一批
     dummy_photo_item = MagicMock()
     dummy_photo_item.file_id = "photo_id_001"
     photo_msg = DummyMessage(12, "", 1001, app.bot, photo=[dummy_photo_item])
     await upload.handle_photo_message(DummyUpdate(user, photo_msg), ctx)
+    session = app.bot_data["sessions"].get(1001)
+    assert session is not None and session.stage == "awaiting_folder"
 
     dummy_doc = MagicMock()
     dummy_doc.file_id = "doc_id_002"
     dummy_doc.mime_type = "image/png"
     doc_msg = DummyMessage(13, "", 1001, app.bot, document=dummy_doc)
     await upload.handle_photo_message(DummyUpdate(user, doc_msg), ctx)
-
     assert session.received_count == 2
 
-    # 5. 傳送不支援媒體 (影片/語音)
+    # 2. 照片停了 → 選資料夾畫面「收到 2 張！」
+    await upload._picker_fire(ctx_with_job(ctx, 1001))
+    assert any("收到 2 張" in m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1001)
+
+    # 3. 打字＝搜尋；找不到 → 新建（名稱沒日期 → 選「不用」）
+    await _type_new_folder(app, ctx, user, "2026阿嬤八十大壽")
+    assert session.folder == "2026阿嬤八十大壽"
+    assert session.destination == "Google Drive"
+    assert session.stage == "receiving_photos"
+
+    # 4. 傳送不支援媒體 (影片/語音)
     unsupported_msg = DummyMessage(14, "", 1001, app.bot)
     await upload.handle_unsupported_media(DummyUpdate(user, unsupported_msg), ctx)
     assert any("只支援傳照片" in m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1001)
 
-    # 6. 點擊 [✅ 我傳完了]
-    finish_cb = DummyCallbackQuery("finish", user, photo_msg)
-    finish_upd = DummyUpdate(user, photo_msg, finish_cb)
-    await upload.handle_finish_button(finish_upd, ctx)
-
-    # 觸發 debounce 手動執行
-    await upload._debounce_fire(DummyContext(app) if False else ctx_with_job(ctx, 1001))
+    # 5. 不用按「傳完了」：照片停了自動上傳（D24）
+    await upload._debounce_fire(ctx_with_job(ctx, 1001))
 
     # 7. 驗證產生的檔案與 CSV 紀錄
     nas_target = nas_dir / "2026阿嬤八十大壽"
@@ -359,7 +352,7 @@ async def test_complete_upload_session_to_drive(env):
 
     # 步驟紀錄（V2 O14）：誰走到哪一步，不記內容
     steps = [r["步驟"] for r in logs.step_log.read_all_rows() if r["Telegram ID"] == "1001"]
-    assert steps == ["開始上傳", "選好資料夾", "傳完了", "完成"]
+    assert steps == ["開始上傳", "選好資料夾", "完成"]
 
     # 最近資料夾記進去了，而且全家看得到
     assert members.family_recent_folders()[0]["name"] == "2026阿嬤八十大壽"
@@ -382,8 +375,7 @@ async def test_debounce_confirm_message_dual_layer_update(env):
     members.register(1002, "秀琴")
     members.approve(1002)
 
-    await upload.handle_start_upload(DummyUpdate(user, DummyMessage(1, "📷 我要上傳照片", 1002, app.bot)), ctx)
-    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(2, "測試相簿", 1002, app.bot)), ctx)
+    await _open_session(app, ctx, user, "測試相簿")
     session = app.bot_data["sessions"].get(1002)
 
     photo1 = MagicMock(); photo1.file_id = "p1"
@@ -452,8 +444,7 @@ async def test_debounce_defers_flush_until_finalize(env):
         members.register(1003, "大姊")
         members.approve(1003)
 
-        await upload.handle_start_upload(DummyUpdate(user, DummyMessage(1, "📷 我要上傳照片", 1003, app.bot)), ctx)
-        await upload.handle_folder_text(DummyUpdate(user, DummyMessage(2, "烤肉", 1003, app.bot)), ctx)
+        await _open_session(app, ctx, user, "烤肉")
         session = app.bot_data["sessions"].get(1003)
         dest_dir = nas_dir / "烤肉"
 
@@ -539,9 +530,7 @@ async def test_correction_flow_and_cleanup_csv(env):
     assert ctx.user_data.get(upload.AWAITING_CORRECTION_FLAG) is True
 
     # 輸入新資料夾名稱「新相簿」
-    new_folder_msg = DummyMessage(21, "新相簿", 1001, app.bot)
-    handled = await upload.handle_folder_text(DummyUpdate(user, new_folder_msg), ctx)
-    assert handled is True
+    await _type_new_folder(app, ctx, user, "新相簿")
     await drain_background_tasks(app)  # 實際搬移在背景執行（§3.1）
 
     # 驗證新相簿已建立且有照片
@@ -623,14 +612,31 @@ async def test_startup_recover_temp_orphan_files(env):
 # ── v3：事件處理與背景工作分離（規格書 §3.1、§6.3、§6.3.1、§6.3.2、§7）────
 
 async def _open_session(app, ctx, user, folder: str):
-    """把某使用者帶到「已選好資料夾、可以開始傳照片」的狀態。"""
+    """
+    把某使用者帶到「已選好資料夾、可以開始傳照片」的狀態。
+    V2 的真實流程是先傳照片才選資料夾；這裡直接開一批再選好，讓測試能從 0 張開始數。
+    """
     members: MembersStore = app.bot_data["members"]
     if members.get(user.id) is None:
         members.register(user.id, user.first_name)
         members.approve(user.id)
-    await upload.handle_start_upload(DummyUpdate(user, DummyMessage(1, "📷 我要上傳照片", user.id, app.bot)), ctx)
-    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(2, folder, user.id, app.bot)), ctx)
+    await upload._start_batch(ctx, user.id, user.first_name)
+    await upload.on_folder_chosen(ctx, user.id, folder)
     return app.bot_data["sessions"].get(user.id)
+
+
+async def _press(app, ctx, user, data: str, msg_id: int = 90):
+    m = DummyMessage(msg_id, "", user.id, app.bot)
+    await folder_picker.handle_button(DummyUpdate(user, m, DummyCallbackQuery(data, user, m)), ctx)
+
+
+async def _type_new_folder(app, ctx, user, name: str, msg_id: int = 21):
+    """打字（＝搜尋）→ 按新建 →（名稱沒日期時）按「不用」。上傳與更正都適用。"""
+    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(msg_id, name, user.id, app.bot)), ctx)
+    for data in ("fp:create", "fp:nodate"):
+        if ctx.user_data.get("picker") is None:
+            break
+        await _press(app, ctx, user, data, msg_id + 1)
 
 
 async def _send_photo(app, ctx, user, file_id: str, msg_id: int):
@@ -820,15 +826,12 @@ async def test_correction_flag_cleared_when_new_upload_starts(env):
     )
     assert ctx.user_data.get(upload.AWAITING_CORRECTION_FLAG) is True
 
-    # 改變主意，直接開一次新的上傳
-    await upload.handle_start_upload(DummyUpdate(user, DummyMessage(21, "📷 我要上傳照片", 1015, app.bot)), ctx)
+    # 改變主意，直接傳照片開新的一批（V2 D17）
+    await _send_photo(app, ctx, user, "new_batch_1", 21)
     assert ctx.user_data.get(upload.AWAITING_CORRECTION_FLAG) is False
 
     # 輸入的資料夾名稱要進到新 session，不可被當成更正目標
-    handled = await upload.handle_folder_text(
-        DummyUpdate(user, DummyMessage(22, "全新的一批", 1015, app.bot)), ctx
-    )
-    assert handled is True
+    await _type_new_folder(app, ctx, user, "全新的一批", 22)
     assert app.bot_data["sessions"].get(1015).folder == "全新的一批"
     assert batch.corrected is False, "上一批不該被更正"
     assert not (nas_dir / "全新的一批").exists(), "舊照片不該被複製到新上傳的資料夾"
@@ -879,14 +882,12 @@ async def test_correction_offers_recent_folder_buttons(env):
     )
     markup = app.bot.sent_messages[-1]["reply_markup"]
     assert markup is not None, "必須附上近期資料夾按鈕"
-    callbacks = [b.callback_data for row in markup.inline_keyboard for b in row]
-    assert "corrfolder:去年過年" in callbacks
+    buttons = [(b.text, b.callback_data) for row in markup.inline_keyboard for b in row]
+    assert ("📥 去年過年", "fp:pick:0") in buttons
+    assert "restart" not in [cb for _, cb in buttons], "更正不是上傳中，不給重新開始"
 
     # 點下按鈕就直接完成更正，不需要打字
-    pick_msg = DummyMessage(21, "", 1017, app.bot)
-    await upload.handle_correction_folder_button(
-        DummyUpdate(user, pick_msg, DummyCallbackQuery("corrfolder:去年過年", user, pick_msg)), ctx
-    )
+    await _press(app, ctx, user, "fp:pick:0", 21)
     await drain_background_tasks(app)
     assert (nas_dir / "去年過年" / old_photo.name).exists()
     assert old_photo.exists(), "原位置的照片絕不刪除"
@@ -966,7 +967,7 @@ async def test_restart_cancel_returns_to_previous_stage_not_receiving(env):
     members.approve(1020)
     members.push_recent_folder(1020, "上次的夾")
 
-    await upload.handle_start_upload(DummyUpdate(user, DummyMessage(1, "📷 我要上傳照片", 1020, app.bot)), ctx)
+    await _send_photo(app, ctx, user, "pending_1", 1)
     session = app.bot_data["sessions"].get(1020)
     assert session.stage == "awaiting_folder"
 
@@ -984,8 +985,8 @@ async def test_restart_cancel_returns_to_previous_stage_not_receiving(env):
     assert session.stage == "awaiting_folder", "要回到選資料夾，不是跳到收件階段"
     last = app.bot.sent_messages[-1]
     assert "資料夾" in last["text"]
-    callbacks = [b.callback_data for row in last["reply_markup"].inline_keyboard for b in row]
-    assert "recent:上次的夾" in callbacks, "要重新給他近期資料夾按鈕"
+    buttons = [(b.text, b.callback_data) for row in last["reply_markup"].inline_keyboard for b in row]
+    assert ("📥 上次的夾", "fp:pick:0") in buttons, "要重新給他近期資料夾按鈕"
 
 
 @pytest.mark.asyncio
@@ -1021,21 +1022,22 @@ async def test_folder_name_with_newline_is_rejected_with_explanation(env):
     members.register(1022, "阿伯")
     members.approve(1022)
 
-    await upload.handle_start_upload(DummyUpdate(user, DummyMessage(1, "📷 我要上傳照片", 1022, app.bot)), ctx)
+    await _send_photo(app, ctx, user, "nl_1", 1)
     session = app.bot_data["sessions"].get(1022)
 
     handled = await upload.handle_folder_text(
         DummyUpdate(user, DummyMessage(2, "2026-07-0\n25大量測試", 1022, app.bot)), ctx
     )
     assert handled is True
-    assert "換行" in app.bot.sent_messages[-1]["text"]
+    last = app.bot.sent_messages[-1]
+    assert "換行" in last["text"]
+    callbacks = [b.callback_data for row in last["reply_markup"].inline_keyboard for b in row]
+    assert "fp:create" not in callbacks, "不合規則的名稱不給新建"
     assert session.folder is None, "不合規則的名稱不可以被採用"
     assert session.stage == "awaiting_folder", "要留在選資料夾階段讓他重打"
 
     # 改成合規的名稱就能正常往下走
-    await upload.handle_folder_text(
-        DummyUpdate(user, DummyMessage(3, "2026-07-25大量測試", 1022, app.bot)), ctx
-    )
+    await _type_new_folder(app, ctx, user, "2026-07-25大量測試", 3)
     assert session.folder == "2026-07-25大量測試"
     assert session.stage == "receiving_photos"
 
@@ -1059,36 +1061,24 @@ async def test_finish_button_with_zero_photos_blocked(env):
 
 
 @pytest.mark.asyncio
-async def test_inactivity_prompt_workflow(env):
-    """靜置提醒測試：傳照片後靜置 25 秒主動跳出確認選單，點『我還要繼續傳』恢復接收狀態。"""
-    from datetime import timedelta
+async def test_text_after_folder_chosen_is_not_search(env):
+    """V2 D23：選好資料夾後打字不再當搜尋，回「已經選好」；也不再跳「傳完了嗎？」靜置提醒。"""
     app, *_ = env
     ctx = DummyContext(app)
     user = DummyUser(1031, "大姊")
-    session = await _open_session(app, ctx, user, "靜置測試相簿")
+    session = await _open_session(app, ctx, user, "選好的夾")
     await _send_photo(app, ctx, user, "photo_idle_1", 1)
-    assert session.received_count == 1
 
-    # 模擬靜置 30 秒
+    handled = await upload.handle_folder_text(DummyUpdate(user, DummyMessage(2, "金門", 1031, app.bot)), ctx)
+    assert handled is True
+    assert "已經選好「選好的夾」" in app.bot.sent_messages[-1]["text"]
+    assert session.folder == "選好的夾"
+
+    sent_before = len(app.bot.sent_messages)
     session.last_activity_at = datetime.now() - timedelta(seconds=30)
     await upload.check_session_timeouts(ctx)
-
-    # 驗證主動跳出「看起來照片傳得差不多囉」詢問訊息
-    assert session.inactivity_prompted is True
-    assert "看起來照片傳得差不多囉" in app.bot.sent_messages[-1]["text"]
-
-    # 使用者點擊 [📷 我還有照片沒傳完]
-    cont_msg = DummyMessage(10, "", 1031, app.bot)
-    cont_cb = DummyCallbackQuery("continue_receiving", user, cont_msg)
-    await upload.handle_continue_receiving_button(DummyUpdate(user, cont_msg, cont_cb), ctx)
-
-    assert session.inactivity_prompted is False
-    assert "繼續傳送照片" in app.bot.sent_messages[-1]["text"]
-
-    # 再次模擬靜置 30 秒，驗證仍可二次觸發詢問
-    session.last_activity_at = datetime.now() - timedelta(seconds=30)
-    await upload.check_session_timeouts(ctx)
-    assert session.inactivity_prompted is True
+    assert len(app.bot.sent_messages) == sent_before, "V2 拿掉靜置提醒：照片停了就自動上傳"
+    assert app.job_queue.get_jobs_by_name("debounce:1031"), "照片進來就排好自動上傳"
 
 
 @pytest.mark.asyncio
@@ -1285,7 +1275,7 @@ async def test_locked_csv_does_not_break_correction(env):
         DummyUpdate(user, corr_msg, DummyCallbackQuery("correction", user, corr_msg)), ctx
     )
     # 這一行以前會拋 PermissionError
-    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(21, "正確的夾", 1040, app.bot)), ctx)
+    await _type_new_folder(app, ctx, user, "正確的夾", 21)
     await drain_background_tasks(app)
 
     # 照片照樣搬到新資料夾、原檔保留
@@ -1317,18 +1307,16 @@ async def test_existing_folder_is_announced_to_user(env):
 
     (nas_dir / "去年中秋").mkdir(parents=True, exist_ok=True)  # 先讓資料夾存在
 
-    await upload.handle_start_upload(DummyUpdate(user, DummyMessage(1, "📷 我要上傳照片", 1041, app.bot)), ctx)
-    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(2, "去年中秋", 1041, app.bot)), ctx)
+    await _open_session(app, ctx, user, "去年中秋")
 
     ready = app.bot.sent_messages[-1]["text"]
-    assert "準備好了" in ready
+    assert "放進「去年中秋」" in ready
     assert "已經有了" in ready and "去年中秋" in ready
 
     # 全新的資料夾就不該出現這句
     user2 = DummyUser(1042, "六弟")
     members.register(1042, "六弟"); members.approve(1042)
-    await upload.handle_start_upload(DummyUpdate(user2, DummyMessage(1, "📷 我要上傳照片", 1042, app.bot)), ctx)
-    await upload.handle_folder_text(DummyUpdate(user2, DummyMessage(2, "全新的夾", 1042, app.bot)), ctx)
+    await _open_session(app, ctx, user2, "全新的夾")
     assert "已經有了" not in app.bot.sent_messages[-1]["text"]
 
 
@@ -1416,10 +1404,7 @@ async def test_correction_does_not_block_and_shows_progress(env, monkeypatch):
     )
 
     # 關鍵：受理的處理函式必須立刻返回，不等搬移做完
-    await asyncio.wait_for(
-        upload.handle_folder_text(DummyUpdate(user, DummyMessage(21, "搬移後", 1080, app.bot)), ctx),
-        timeout=1,
-    )
+    await asyncio.wait_for(_type_new_folder(app, ctx, user, "搬移後", 21), timeout=1)
     assert not (nas_dir / "搬移後").exists() or not list((nas_dir / "搬移後").glob("*.jpg")), \
         "搬移應該還在背景進行，不該在處理函式返回前就做完"
     assert any("正在把這批搬到" in m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1080)
@@ -1480,7 +1465,7 @@ async def test_correction_applies_write_throttle(env, monkeypatch):
         await upload.handle_correction_button(
             DummyUpdate(user, corr_msg, DummyCallbackQuery("correction", user, corr_msg)), ctx
         )
-        await upload.handle_folder_text(DummyUpdate(user, DummyMessage(21, "節流後", 1081, app.bot)), ctx)
+        await _type_new_folder(app, ctx, user, "節流後", 21)
         await drain_background_tasks(app)
     finally:
         config.WRITE_THROTTLE_SEC = original
@@ -1571,11 +1556,8 @@ async def test_existing_folder_scanned_only_once_per_destination(env, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_start_goes_straight_to_upload_for_approved_user(env):
-    """
-    已開通的使用者點 /start（或選單）時，要**直接進入上傳流程**，
-    不要停在「歡迎回來」那個沒有作用的中繼站再叫他點一次按鈕。
-    """
+async def test_start_tells_approved_user_to_just_send_photos(env):
+    """V2 D17：已開通的使用者點 /start，告訴他直接傳照片就好；照片還沒來，不開空批次。"""
     app, *_ = env
     ctx = DummyContext(app)
     user = DummyUser(1200, "選單測試")
@@ -1587,12 +1569,9 @@ async def test_start_goes_straight_to_upload_for_approved_user(env):
         DummyUpdate(user, DummyMessage(1, "/start", 1200, app.bot)), ctx
     )
 
-    session = app.bot_data["sessions"].get(1200)
-    assert session is not None, "應該直接開好 session"
-    assert session.stage == "awaiting_folder"
+    assert app.bot_data["sessions"].get(1200) is None
     texts = [m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1200]
-    assert not any("歡迎回來" in t for t in texts), "不該再出現沒有作用的中繼訊息"
-    assert any("資料夾" in t for t in texts), "應該直接問資料夾"
+    assert any("直接把照片傳給我" in t for t in texts)
 
 
 @pytest.mark.asyncio
@@ -1633,14 +1612,12 @@ async def test_start_during_session_reports_status(env):
     assert any("你正在上傳中" in m["text"] for m in app.bot.sent_messages[n:])
 
 
-def test_menu_shows_upload_not_start():
-    """選單裡要是「我要上傳照片」，不是「開始使用」。"""
+def test_menu_no_longer_has_upload():
+    """V2 D17：選單拿掉「📷 我要上傳照片」；/start 指令本身必須保留（註冊流程要用）。"""
     src = Path("bot.py").read_text(encoding="utf-8")
-    assert 'BotCommand("upload"' in src
-    assert "我要上傳照片" in src
-    assert 'BotCommand("start", "開始使用")' not in src, "開始使用應已從選單移除"
-    assert 'CommandHandler("start"' in src, "但 /start 指令本身必須保留（註冊流程要用）"
-    assert 'CommandHandler("upload"' in src
+    assert 'BotCommand("upload"' not in src
+    assert "delete_my_commands()" in src
+    assert 'CommandHandler("start"' in src
 
 
 @pytest.mark.asyncio
@@ -1665,12 +1642,12 @@ async def test_persistent_keyboard_is_removed_on_approval(env):
     sent = [m for m in app.bot.sent_messages if m["chat_id"] == 1210]
     assert sent, "使用者要收到開通通知"
     assert isinstance(sent[-1]["reply_markup"], ReplyKeyboardRemove),         "必須主動清除常駐鍵盤，否則舊按鈕會一直留著"
-    assert "選單" in sent[-1]["text"], "要告訴他改從哪裡進入"
+    assert "直接把照片傳給我" in sent[-1]["text"], "要告訴他怎麼開始（V2：直接傳照片）"
 
 
 @pytest.mark.asyncio
-async def test_completion_offers_upload_again(env):
-    """完成訊息要附「📷 再傳一批」，連續傳好幾批時不用每次繞去選單。"""
+async def test_completion_offers_correction_only(env):
+    """V2 拿掉完成訊息上的「📷 再傳一批」（直接傳照片就開新的一批），只留「↩️ 這批傳錯了」。"""
     app, *_ = env
     ctx = DummyContext(app)
     user = DummyUser(1211, "連續傳")
@@ -1682,13 +1659,13 @@ async def test_completion_offers_upload_again(env):
     done = [m for m in app.bot.sent_messages
             if m["chat_id"] == 1211 and "完成" in m["text"]][-1]
     callbacks = [b.callback_data for row in done["reply_markup"].inline_keyboard for b in row]
-    assert "upload_again" in callbacks
+    assert "upload_again" not in callbacks
     assert "correction" in callbacks, "「這批傳錯了」不可以被擠掉"
 
 
 @pytest.mark.asyncio
-async def test_upload_again_starts_new_session(env):
-    """點「📷 再傳一批」要直接開始新的一次上傳，等同從選單進入。"""
+async def test_old_upload_again_button_tells_user_to_send_photos(env):
+    """舊完成訊息上的「📷 再傳一批」被點到：提示直接傳照片，不開空批次。"""
     app, *_ = env
     ctx = DummyContext(app)
     user = DummyUser(1212, "再傳")
@@ -1703,8 +1680,8 @@ async def test_upload_again_starts_new_session(env):
         DummyUpdate(user, again_msg, DummyCallbackQuery("upload_again", user, again_msg)), ctx
     )
 
-    new_session = app.bot_data["sessions"].get(1212)
-    assert new_session is not None and new_session.stage == "awaiting_folder"
+    assert app.bot_data["sessions"].get(1212) is None
+    assert "直接把照片傳給我" in app.bot.sent_messages[-1]["text"]
 
 
 def test_no_persistent_keyboard_left_in_code():
@@ -1739,10 +1716,8 @@ async def test_upload_again_works_on_message_older_than_48h(env):
 
     await upload.handle_upload_again_button(upd, ctx)
 
-    session = app.bot_data["sessions"].get(1220)
-    assert session is not None, "隔幾天再點也必須能正常開始上傳"
-    assert session.stage == "awaiting_folder"
-    assert any("資料夾" in m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1220)
+    assert any("直接把照片傳給我" in m["text"] for m in app.bot.sent_messages if m["chat_id"] == 1220), \
+        "隔幾天再點也必須正常回覆，不可以炸掉"
 
 
 @pytest.mark.asyncio
@@ -1775,9 +1750,7 @@ async def test_correction_button_works_on_old_message(env):
                for m in app.bot.sent_messages if m["chat_id"] == 1221)
 
     # 後續打字更正也要能完成
-    await upload.handle_folder_text(
-        DummyUpdate(user, DummyMessage(9, "正確的", 1221, app.bot)), ctx
-    )
+    await _type_new_folder(app, ctx, user, "正確的", 9)
     await drain_background_tasks(app)
     assert (nas_dir / "正確的" / photo.name).exists()
 
@@ -1891,7 +1864,7 @@ async def test_purge_does_not_touch_files(env):
 @pytest.mark.asyncio
 async def test_correction_done_offers_buttons_and_allows_second_correction(env):
     """
-    「↩️ 這批傳錯了」搬完之後的完成訊息，也要有「📷 再傳一批」與「↩️ 這批傳錯了」。
+    「↩️ 這批傳錯了」搬完之後的完成訊息，也要有「↩️ 這批傳錯了」（V2 已拿掉「📷 再傳一批」）。
 
     關鍵：「最近一批」必須改指向**新位置**。搬到 B 之後才發現 B 也不對時要能再搬到 C；
     若沿用舊批次，它的 corrected 已是 True，按鈕點下去會完全沒反應——比沒有按鈕更糟。
@@ -1917,7 +1890,7 @@ async def test_correction_done_offers_buttons_and_allows_second_correction(env):
     await upload.handle_correction_button(
         DummyUpdate(user, m1, DummyCallbackQuery("correction", user, m1)), ctx
     )
-    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(21, "B夾", 1240, app.bot)), ctx)
+    await _type_new_folder(app, ctx, user, "B夾", 21)
     await drain_background_tasks(app)
 
     assert (nas_dir / "B夾" / photo.name).exists()
@@ -1925,7 +1898,7 @@ async def test_correction_done_offers_buttons_and_allows_second_correction(env):
             if m["chat_id"] == 1240 and "改放到" in m["text"]][-1]
     assert done["reply_markup"] is not None, "完成訊息要有按鈕"
     cbs = [b.callback_data for r in done["reply_markup"].inline_keyboard for b in r]
-    assert "upload_again" in cbs and "correction" in cbs
+    assert "correction" in cbs
 
     # 「最近一批」要指向新位置，才能再更正一次
     batch = app.bot_data["sessions"].get_last_batch(1240)
@@ -1938,7 +1911,7 @@ async def test_correction_done_offers_buttons_and_allows_second_correction(env):
         DummyUpdate(user, m2, DummyCallbackQuery("correction", user, m2)), ctx
     )
     assert ctx.user_data.get(upload.AWAITING_CORRECTION_FLAG) is True, "第二次也要能進更正流程"
-    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(31, "C夾", 1240, app.bot)), ctx)
+    await _type_new_folder(app, ctx, user, "C夾", 31)
     await drain_background_tasks(app)
 
     assert (nas_dir / "C夾" / photo.name).exists(), "要能從 B 再搬到 C"

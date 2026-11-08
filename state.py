@@ -18,7 +18,10 @@ from typing import Optional
 # 仍保留「標籤 → DestinationOutcome」的結構，複製／收尾／更正流程不必重寫。
 DEST_DRIVE_LABEL = "Google Drive"
 
+# V2：「待選資料夾」批次——照片已在收，還沒選放哪（D17）
 STAGE_AWAITING_FOLDER = "awaiting_folder"
+# V2 D24：上一批正在寫入時又傳進來的照片，排隊等上一批結束，接著放同一個資料夾
+STAGE_QUEUED = "queued"
 STAGE_RECEIVING_PHOTOS = "receiving_photos"
 STAGE_DEBOUNCE = "debounce"
 STAGE_PROCESSING = "processing"
@@ -129,6 +132,8 @@ class UploadSession:
     status_message_id: Optional[int] = None
     inactivity_prompted: bool = False  # 是否已發出過「看起來傳得差不多囉，請問傳完了嗎？」靜置提醒
     inactivity_prompt_message_id: Optional[int] = None  # 靜置提醒訊息 id
+    picker_message_id: Optional[int] = None  # 選資料夾畫面；又來照片時刪舊發新
+    picker_shown_count: int = 0              # 畫面上「收到 N 張」的 N，沒變就不重發
     destinations: dict = field(default_factory=dict)  # label -> DestinationOutcome
     # label -> 該目的地資料夾裡「已存在照片」的指紋集合。整個資料夾只掃一次就快取，
     # 網芳列目錄很貴，不可以每張照片都重掃一遍（見 storage.scan_existing_fingerprints）。
@@ -217,10 +222,22 @@ class SessionManager:
         self._sessions: dict[int, UploadSession] = {}
         self._last_batches: dict[int, CompletedBatch] = {}
         self._pending_duplicates: dict[int, PendingDuplicates] = {}
+        # V2 D24：上一批寫入中又傳進來的照片。不放進 _sessions，逾時巡邏才不會碰到它
+        self._queued: dict[int, UploadSession] = {}
 
     # ── session ──
     def get(self, telegram_id: int) -> Optional[UploadSession]:
         return self._sessions.get(telegram_id)
+
+    def get_queued(self, telegram_id: int) -> Optional[UploadSession]:
+        return self._queued.get(telegram_id)
+
+    def start_queued(self, telegram_id: int, name: str, now: Optional[datetime] = None) -> UploadSession:
+        session = UploadSession(telegram_id=telegram_id, name=name, stage=STAGE_QUEUED,
+                                started_at=now or datetime.now(),
+                                last_activity_at=now or datetime.now())
+        self._queued[telegram_id] = session
+        return session
 
     def has_active(self, telegram_id: int) -> bool:
         return telegram_id in self._sessions
@@ -233,7 +250,12 @@ class SessionManager:
         return session
 
     def clear(self, telegram_id: int) -> Optional[UploadSession]:
-        return self._sessions.pop(telegram_id, None)
+        """結束目前的批次；有排隊的批次就接上來（呼叫端再用 get() 取得並設定資料夾）。"""
+        ended = self._sessions.pop(telegram_id, None)
+        queued = self._queued.pop(telegram_id, None)
+        if queued is not None:
+            self._sessions[telegram_id] = queued
+        return ended
 
     def all_sessions(self) -> list[UploadSession]:
         return list(self._sessions.values())

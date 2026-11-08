@@ -16,30 +16,31 @@ from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
-from telegram import BotCommand, Update
+from telegram import Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
 import config
 import notify
 import storage
-from handlers import register, upload
+from folder_search import FolderIndex
+from handlers import folder_picker, register, upload
 from keyboards import (
     CB_APPROVE_PREFIX,
     CB_CORRECTION,
-    CB_CORRECTION_FOLDER_PREFIX,
     CB_DUP_COPY,
     CB_DUP_SKIP,
+    CB_FP_PREFIX,
     CB_UPLOAD_AGAIN,
     CB_FINISH,
     CB_CONTINUE_RECEIVING,
-    CB_RECENT_FOLDER_PREFIX,
     CB_REGISTER,
     CB_REJECT_PREFIX,
     CB_RESTART,
@@ -53,8 +54,6 @@ from state import DEST_DRIVE_LABEL, SessionManager
 
 DATA_DIR = Path(__file__).parent / "data"
 LOG_DIR = Path(__file__).parent / "logs"
-
-UPLOAD_BUTTON_TEXT = "📷 我要上傳照片"
 
 # long polling 的等待秒數（PTB 預設 10）。
 #
@@ -147,17 +146,10 @@ async def route_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await register.handle_unapproved_contact(update, context, member)
         return
 
-    text = (update.effective_message.text or "").strip()
-    # 常駐按鈕雖已移除，仍要認得它送出的文字：清除指令要等下一則訊息才會送達，
-    # 在那之前使用者還是點得到舊按鈕。
-    if text == UPLOAD_BUTTON_TEXT:
-        await upload.handle_start_upload(update, context)
-        return
-
     if await upload.handle_folder_text(update, context):
         return
 
-    # 沒有對應中的流程：提示從按鈕開始（附冷卻，避免連續訊息洗版）
+    # 沒有對應中的流程（含舊常駐按鈕「📷 我要上傳照片」送來的字）：提示直接傳照片（附冷卻）
     sessions: SessionManager = context.application.bot_data["sessions"]
     if not sessions.has_active(telegram_id):
         await upload.remind_not_started(update, context)
@@ -360,8 +352,20 @@ async def startup_recover_temp(app: Application) -> None:
         await notifier.notify_admin(notify.msg_recovery_report(report_lines))
 
 
+async def note_activity(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """每則 update 都記下「全家最後動作時間」，資料夾清單據此決定何時重掃（V2 §3.3）。"""
+    index = context.application.bot_data.get("folders")
+    if index is not None:
+        index.note_activity()
+
+
 async def periodic_timeout_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     await upload.check_session_timeouts(context)
+    index: FolderIndex = context.application.bot_data.get("folders")
+    if index is not None and index.due():
+        # 重掃丟到背景：剛開機第一次可能要好幾分鐘，不能卡住這個每 30 秒的排程
+        index.scanning = True
+        context.application.create_task(asyncio.to_thread(index.rescan))
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -391,10 +395,9 @@ async def on_startup(app: Application) -> None:
     if await startup_health_check(app):
         await startup_migrate_recent_folders(app)
         await startup_recover_temp(app)
-    # 選單只放「我要上傳照片」：使用者最常做的就是這件事，一點就直接進流程。
-    # /start 仍然保留為可用指令（Telegram 對新使用者顯示的 START 按鈕就是送 /start，
-    # 註冊流程靠它），只是不再出現在選單裡佔位置。
-    await app.bot.set_my_commands([BotCommand("upload", "📷 我要上傳照片")])
+    # V2 D17：選單拿掉「📷 我要上傳照片」（直接傳照片就開始）。階段 3 再放「🔍 找照片／檔案」。
+    # /start 仍然保留為可用指令（註冊流程靠它），只是不出現在選單裡。
+    await app.bot.delete_my_commands()
 
 
 def build_application() -> Application:
@@ -418,16 +421,23 @@ def build_application() -> Application:
     app.bot_data["notifier"] = notifier
     app.bot_data["config"] = config
     app.bot_data["data_dir"] = DATA_DIR
+    folders = FolderIndex(
+        DATA_DIR / "folders.json", upload.drive_root(config),
+        config.FOLDER_SCAN_DEPTH, config.FOLDER_SCAN_EXCLUDE, config.FOLDER_RESCAN_IDLE_MIN,
+    )
+    folders.load()  # 沒有 JSON 時會標記要重掃，由 periodic_timeout_check 在背景掃
+    app.bot_data["folders"] = folders
 
+    app.add_handler(TypeHandler(Update, note_activity), group=-1)
     app.add_handler(CommandHandler("start", register.handle_start))
-    # 選單裡那一項。未開通者會被 handle_start_upload 擋下並提示，不必另外判斷。
-    app.add_handler(CommandHandler("upload", upload.handle_start_upload))
+    # 舊選單的 /upload（V2 已拿掉）：提示直接傳照片
+    app.add_handler(CommandHandler("upload", upload.remind_not_started))
 
     app.add_handler(CallbackQueryHandler(register.handle_register_button, pattern=f"^{CB_REGISTER}$"))
     app.add_handler(CallbackQueryHandler(register.handle_approve, pattern=f"^{CB_APPROVE_PREFIX}"))
     app.add_handler(CallbackQueryHandler(register.handle_reject, pattern=f"^{CB_REJECT_PREFIX}"))
 
-    app.add_handler(CallbackQueryHandler(upload.handle_recent_folder_button, pattern=f"^{CB_RECENT_FOLDER_PREFIX}"))
+    app.add_handler(CallbackQueryHandler(folder_picker.handle_button, pattern=f"^{CB_FP_PREFIX}"))
     app.add_handler(CallbackQueryHandler(upload.handle_finish_button, pattern=f"^{CB_FINISH}$"))
     app.add_handler(CallbackQueryHandler(
         upload.handle_continue_receiving_button, pattern=f"^{CB_CONTINUE_RECEIVING}$"
@@ -437,9 +447,6 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(upload.handle_restart_cancel, pattern=f"^{CB_RESTART_CANCEL}$"))
     app.add_handler(CallbackQueryHandler(upload.handle_correction_button, pattern=f"^{CB_CORRECTION}$"))
     app.add_handler(CallbackQueryHandler(upload.handle_upload_again_button, pattern=f"^{CB_UPLOAD_AGAIN}$"))
-    app.add_handler(CallbackQueryHandler(
-        upload.handle_correction_folder_button, pattern=f"^{CB_CORRECTION_FOLDER_PREFIX}"
-    ))
     app.add_handler(CallbackQueryHandler(upload.handle_duplicate_copy, pattern=f"^{CB_DUP_COPY}$"))
     app.add_handler(CallbackQueryHandler(upload.handle_duplicate_skip, pattern=f"^{CB_DUP_SKIP}$"))
 

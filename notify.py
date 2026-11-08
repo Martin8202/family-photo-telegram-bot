@@ -87,10 +87,9 @@ def user_msg_approved() -> str:
 
 def user_msg_how_to_start() -> str:
     """
-    告訴使用者怎麼開始。入口只有 ☰ 選單一個——輸入框下方的常駐按鈕已經移除，
-    因為它在使用者打字時會被 Telegram 用戶端收起來，不是可靠的入口（§6.1）。
+    告訴使用者怎麼開始。V2 只有一種入口：直接傳照片（D17），不用點選單。
     """
-    return "要傳照片時，點左下角的選單 ☰ 選「📷 我要上傳照片」就可以開始了"
+    return "要傳照片時，直接把照片傳給我就可以開始了（從相簿或 LINE 分享過來也可以）"
 
 
 def user_msg_original_quality_tutorial() -> str:
@@ -106,11 +105,7 @@ def user_msg_compressed_hint() -> str:
 
 
 def user_msg_not_started() -> str:
-    return "請先點左下角的選單 ☰ 選『📷 我要上傳照片』開始喔"
-
-
-def user_msg_choose_folder_first() -> str:
-    return "請先選資料夾"
+    return "直接把照片傳給我就可以上傳喔（從相簿或 LINE 分享過來也可以）"
 
 
 def user_msg_unsupported_media() -> str:
@@ -130,7 +125,7 @@ def user_msg_restart_confirm(count: int) -> str:
 
 
 def user_msg_restart_done() -> str:
-    return "已重新開始。要再傳的話，點左下角選單 ☰ 選「📷 我要上傳照片」"
+    return "已重新開始。要再傳的話，直接把照片傳給我就可以"
 
 
 def user_msg_correction_done(count: int, new_folder: str) -> str:
@@ -170,19 +165,46 @@ def user_msg_no_photos_received() -> str:
     return "尚未收到任何照片喔！請先在手機上選擇照片傳送給我，傳完再按此按鈕。"
 
 
-def user_msg_inactivity_prompt(received_count: int, stored_count: int) -> str:
-    return (
-        f"📥 看起來照片傳得差不多囉！目前共收到 {received_count} 張照片"
-        f"（已備份好 {stored_count} 張）。\n請問照片都傳完了嗎？"
-    )
-
-
 def user_msg_continue_receiving() -> str:
     return "好的，請繼續傳送照片，傳完後隨時點下方按鈕："
 
 
-def user_msg_upload_ready(folder: str, dest_label: str) -> str:
-    return f"✅ 準備好了！資料夾：{folder} ／ 存到：{dest_label}\n請開始傳照片，傳完後點下方按鈕"
+def user_msg_upload_ready(folder: str) -> str:
+    return f"✅ 好的，放進「{folder}」。照片停了就會自動開始上傳，不用再按按鈕"
+
+
+# ── 選資料夾畫面（V2 §3.1～§3.4）──
+
+def user_msg_picker(count: int) -> str:
+    return f"收到 {count} 張！要放進哪個資料夾？"
+
+
+def user_msg_picker_search_prompt() -> str:
+    return "請打資料夾名稱裡的字或日期，例如「金門」或「7/2」"
+
+
+def user_msg_picker_new_prompt() -> str:
+    return "請打新資料夾的名稱，記得加日期，例如「2026-07-02金門之旅」"
+
+
+def user_msg_search_results() -> str:
+    return "找到這些相近的資料夾，要放哪一個？"
+
+
+def user_msg_search_none(query: str) -> str:
+    return f"找不到叫「{query}」的資料夾"
+
+
+def user_msg_ask_add_date(name: str) -> str:
+    return f"「{name}」裡好像沒有日期，要加嗎？"
+
+
+def user_msg_already_chosen(folder: str) -> str:
+    return f"已經選好「{folder}」了，照片直接傳就好；要換資料夾請按 🔄 重新開始"
+
+
+def user_msg_queued_next(count: int, folder: str) -> str:
+    return f"上一批存好的時候又收到 {count} 張，一樣放進「{folder}」，照片停了就會自動上傳"
 
 
 def user_msg_folder_exists(folder: str, dest_labels: list) -> str:

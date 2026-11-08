@@ -31,30 +31,22 @@ from telegram.ext import ContextTypes
 
 import notify
 import storage
-from members import STATUS_APPROVED
-from telegram import InlineKeyboardMarkup
+from handlers import folder_picker
 
 from keyboards import (
     CB_CORRECTION,
-    CB_CORRECTION_FOLDER_PREFIX,
     CB_DUP_COPY,
     CB_DUP_SKIP,
     CB_FINISH,
     CB_CONTINUE_RECEIVING,
-    CB_RECENT_FOLDER_PREFIX,
     CB_RESTART,
     CB_RESTART_CANCEL,
     CB_RESTART_CONFIRM,
-    correction_folder_keyboard,
     correction_keyboard,
     duplicate_decision_keyboard,
-    folder_choice_keyboard,
     in_session_keyboard,
-    inactivity_prompt_keyboard,
     restart_confirm_keyboard,
-    restart_row,
     clear_persistent_keyboard,
-    with_restart,
 )
 from state import (
     DEST_DRIVE_LABEL,
@@ -62,6 +54,7 @@ from state import (
     STAGE_AWAITING_RESTART_CONFIRM,
     STAGE_DEBOUNCE,
     STAGE_PROCESSING,
+    STAGE_QUEUED,
     STAGE_RECEIVING_PHOTOS,
     CompletedBatch,
     DestinationOutcome,
@@ -95,9 +88,11 @@ _DEFAULTS = {
     "STAGE_STUCK_MAX_MIN": 30,
     "DUPLICATE_PROMPT_MAX_MIN": 10,
     "LAST_BATCH_MAX_MIN": 720,
-    "INACTIVITY_PROMPT_TIMEOUT_SEC": 25,
     "RECENT_FOLDERS_COUNT": 5,
+    "PICKER_QUIET_SEC": 3,
 }
+
+PENDING_TEMP_LABEL = "待選資料夾"  # 還沒選資料夾時暫存子夾的名稱；真正的資料夾記在側車檔
 
 
 def _cfg(config, name: str):
@@ -220,10 +215,8 @@ async def _safe_delete_temp(path, temp_root) -> None:
 
 async def remind_not_started(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    提醒「請先點『我要上傳照片』」，附冷卻時間避免洗版。
-    典型觸發情境：session 已結束後，手機仍在背景陸續傳入先前已選好但尚未
-    上傳完成的照片（Telegram 客戶端的傳送佇列），這些訊息會逐一落到這裡；
-    沒有冷卻機制的話，每一張都會各自回一則提醒，造成洗版。
+    提醒「直接把照片傳給我就可以」（V2 D17），附冷卻時間避免洗版：
+    沒有進行中的批次時連打好幾則字，不要每一則都回一次。
     """
     now = datetime.now()
     last = context.user_data.get(NOT_STARTED_REMINDER_KEY)
@@ -243,122 +236,146 @@ def _destination_targets(config, folder: str) -> dict:
     return {DEST_DRIVE_LABEL: drive_root(config) / folder}
 
 
-def _recent_folders(context: ContextTypes.DEFAULT_TYPE) -> list[dict]:
-    members, _, config, _, _ = _services(context)
-    return members.family_recent_folders(_cfg(config, "RECENT_FOLDERS_COUNT"))
+# ── 單一入口：直接傳照片就開一批（V2 D17）──────────────
 
-
-# ── 啟動上傳 ─────────────────────────────────────────
-
-async def handle_start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    members, notifier, config, sessions, logs = _services(context)
-    telegram_id = update.effective_user.id
-    # 一律以 chat_id 直接發送，不透過 `update.effective_message`——這個函式也會被
-    # 完成訊息上的「📷 再傳一批」呼叫，而那則訊息可能已經超過 48 小時、
-    # 拿不到完整內容，此時 `effective_message` 會是 None（見 `_reply_to_query`）。
-    member = members.get(telegram_id)
-    if member is None or member.status != STATUS_APPROVED:
-        await _safe_send(context, telegram_id, notify.user_msg_not_started())
-        return
-
-    existing = sessions.get(telegram_id)
-    if existing is not None:
-        # 重複點「我要上傳照片」：不重置，只回報現況（§6.3）
-        await _safe_send(
-            context, telegram_id,
-            f"目前狀態：資料夾 {existing.folder or '（尚未選）'} ／ 已收到 {existing.received_count} 張",
-        )
-        return
-
-    # 開新的上傳一定要清掉「這批傳錯了」的待輸入狀態（§7 第 10 點）：否則使用者
-    # 待會輸入的新資料夾名稱，會被誤判成上一批的更正目標。
-    _clear_correction_flag(context)
-
+async def _start_batch(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, name: str, queued: bool = False):
+    """
+    開一個「待選資料夾」批次（queued=True 時是 D24 的排隊批次）。照片先收進暫存區、再問放哪。
+    暫存子夾先用「待選資料夾」命名，選好的資料夾記在側車檔（復原以側車檔為準）。
+    """
+    _, notifier, config, sessions, _ = _services(context)
+    now = datetime.now()
+    session = sessions.start_queued(telegram_id, name, now) if queued else sessions.start(telegram_id, name, now)
+    session.temp_dir = storage.session_temp_dir(
+        storage.user_temp_dir(Path(config.TEMP_DIR), telegram_id, name), now, PENDING_TEMP_LABEL
+    )
+    # 同一分鐘內接連開兩批（例如排隊批次）會撞到同一個暫存子夾，加秒數區隔
+    if queued:
+        session.temp_dir = session.temp_dir.with_name(f"{session.temp_dir.name}_{now:%S}")
+    await asyncio.to_thread(
+        storage.write_session_info, session.temp_dir,
+        {"destination": DEST_DRIVE_LABEL, "folder": None, "telegram_id": telegram_id, "name": name},
+    )
+    if not queued:
+        _clear_correction_flag(context)
+        await _log_step(context, telegram_id, name, "開始上傳")
     if config.HEALTH_CHECK_ON_SESSION:
-        # 只看資料夾在不在、能不能寫（不寫測試檔）；G: 可能卡住，以 to_thread 執行（§3）
+        # 只看不寫；G: 不能用也照收照片（§3.6），寫入時失敗會留在暫存區、由復原補送
         ok, err = await asyncio.to_thread(storage.health_check, drive_root(config))
         if not ok:
             await notifier.notify_admin(
                 notify.msg_health_check_failed(f"開 session 健檢／{DEST_DRIVE_LABEL}", err or "未知錯誤")
             )
-            await _safe_send(context, telegram_id, notify.user_msg_health_check_failed())
-            return
-
-    session = sessions.start(telegram_id, member.name)
-    await _log_step(context, telegram_id, member.name, "開始上傳")
-    recent = _recent_folders(context)
-    if recent:
-        await _safe_send(
-            context, telegram_id,
-            "請選一個最近用過的資料夾，或直接打字輸入新資料夾名稱：",
-            reply_markup=with_restart(folder_choice_keyboard(recent)),
-        )
-    else:
-        await _safe_send(
-            context, telegram_id,
-            "請直接打字輸入資料夾名稱：",
-            reply_markup=InlineKeyboardMarkup([restart_row()]),
-        )
+    return session
 
 
-async def _set_folder_and_start(update_message, context: ContextTypes.DEFAULT_TYPE, session, folder_name: str):
-    """選好資料夾就直接開始收照片（V2 D2：不用再選存哪裡）。"""
-    _, _, config, _, _ = _services(context)
-    telegram_id = session.telegram_id
-    try:
-        folder_name = storage.validate_folder_name(folder_name)
-    except storage.FolderNameError as exc:
-        # 明確告訴使用者哪裡不合規則、請他改名，而不是靜默改掉他取的名字
-        await update_message.reply_text(str(exc))
+def _picker_job_name(telegram_id: int) -> str:
+    return f"picker:{telegram_id}"
+
+
+def _schedule_picker(context: ContextTypes.DEFAULT_TYPE, telegram_id: int) -> None:
+    """照片停了 PICKER_QUIET_SEC 秒才出現選資料夾畫面，避免按鈕被後面的照片推上去（§3.1）。"""
+    job_queue = context.application.job_queue
+    if job_queue is None:
         return
-    session.folder = folder_name
-    session.destination = DEST_DRIVE_LABEL
-    dest_targets = _destination_targets(config, folder_name)
-    for label in dest_targets:
-        session.destinations[label] = DestinationOutcome(label=label)
+    name = _picker_job_name(telegram_id)
+    for job in job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
+    config = context.application.bot_data["config"]
+    job_queue.run_once(
+        _picker_fire, when=_cfg(config, "PICKER_QUIET_SEC"), name=name,
+        data={"telegram_id": telegram_id}, user_id=telegram_id, chat_id=telegram_id,
+    )
 
-    now = datetime.now()
-    session.temp_dir = storage.session_temp_dir(
-        storage.user_temp_dir(Path(config.TEMP_DIR), telegram_id, session.name), now, session.folder
+
+async def _picker_fire(context: ContextTypes.DEFAULT_TYPE) -> None:
+    telegram_id = context.job.data["telegram_id"]
+    _, _, _, sessions, _ = _services(context)
+    session = sessions.get(telegram_id)
+    if session is None or session.stage != STAGE_AWAITING_FOLDER:
+        return
+    await show_upload_picker(context, session)
+
+
+async def show_upload_picker(context: ContextTypes.DEFAULT_TYPE, session) -> None:
+    """（重新）發出「收到 N 張！要放進哪個資料夾？」；張數沒變就不重發。"""
+    if session.picker_message_id is not None and session.picker_shown_count == session.received_count:
+        return
+    await _delete_message_safe(context, session.telegram_id, session.picker_message_id)
+    sent = await folder_picker.show_picker(
+        context, session.telegram_id, folder_picker.MODE_UPLOAD, notify.user_msg_picker(session.received_count)
     )
-    # 側車檔記下資料夾，程式中斷後復原時才知道該補送到哪裡（見 storage.write_session_info）
-    await asyncio.to_thread(
-        storage.write_session_info, session.temp_dir,
-        {"destination": DEST_DRIVE_LABEL, "folder": session.folder, "telegram_id": telegram_id, "name": session.name},
-    )
-    session.enter_stage(STAGE_RECEIVING_PHOTOS, now)
+    session.picker_message_id = sent.message_id if sent is not None else None
+    session.picker_shown_count = session.received_count
+
+
+def picker_still_wanted(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, mode: str) -> bool:
+    """選資料夾畫面的按鈕還有沒有效：上傳要有待選批次，更正要在有效時間內。"""
+    if mode == folder_picker.MODE_CORRECTION:
+        return _correction_flag_active(context)
+    _, _, _, sessions, _ = _services(context)
+    session = sessions.get(telegram_id)
+    if session is None or session.stage != STAGE_AWAITING_FOLDER:
+        return False
+    session.touch()
+    return True
+
+
+async def on_folder_chosen(context: ContextTypes.DEFAULT_TYPE, telegram_id: int, folder: str) -> None:
+    """選好資料夾：開始寫入，照片停了就自動上傳（D24，不用按「傳完了」）。"""
+    _, _, _, sessions, _ = _services(context)
+    session = sessions.get(telegram_id)
+    if session is None or session.stage != STAGE_AWAITING_FOLDER:
+        return
+    await _assign_folder(context, session, folder)
     await _log_step(context, telegram_id, session.name, "選好資料夾")
 
-    # 讓使用者分得清「這次是開新資料夾」還是「加進既有資料夾」。G: 可能卡住，以 to_thread 執行（§3）。
-    existing_labels = []
-    for label, target in dest_targets.items():
-        try:
-            if await asyncio.to_thread(target.exists):
-                existing_labels.append(label)
-        except Exception:
-            pass  # 檢查失敗不影響上傳本身，頂多少一句提示
+    _, _, config, _, _ = _services(context)
+    ready_text = notify.user_msg_upload_ready(folder)
+    # 讓使用者分得清「開新資料夾」還是「加進既有資料夾」。G: 可能卡住，以 to_thread 執行（§3）。
+    try:
+        if await asyncio.to_thread((drive_root(config) / folder).exists):
+            ready_text += "\n" + notify.user_msg_folder_exists(folder, [DEST_DRIVE_LABEL])
+    except Exception:
+        pass  # 檢查失敗不影響上傳本身，頂多少一句提示
+    await _safe_send(context, telegram_id, ready_text, reply_markup=in_session_keyboard())
 
-    ready_text = notify.user_msg_upload_ready(session.folder, DEST_DRIVE_LABEL)
-    if existing_labels:
-        ready_text += "\n" + notify.user_msg_folder_exists(session.folder, existing_labels)
 
-    await update_message.reply_text(ready_text, reply_markup=in_session_keyboard(show_finish=False))
+async def _assign_folder(context: ContextTypes.DEFAULT_TYPE, session, folder: str) -> None:
+    """把資料夾掛到批次上、更新側車檔、進入收件並排好自動上傳。"""
+    session.folder = folder
+    session.destination = DEST_DRIVE_LABEL
+    _, _, config, _, _ = _services(context)
+    for label in _destination_targets(config, folder):
+        session.destinations[label] = DestinationOutcome(label=label)
+    await asyncio.to_thread(
+        storage.write_session_info, session.temp_dir,
+        {"destination": DEST_DRIVE_LABEL, "folder": folder, "telegram_id": session.telegram_id, "name": session.name},
+    )
+    session.enter_stage(STAGE_RECEIVING_PHOTOS)
+    _schedule_debounce(context, session.telegram_id)
+
+
+async def _activate_queued(context: ContextTypes.DEFAULT_TYPE, ended) -> None:
+    """上一批結束後，排隊的批次接上來，一樣放進同一個資料夾（D24）。"""
+    _, _, _, sessions, _ = _services(context)
+    session = sessions.get(ended.telegram_id)
+    if session is None or session.stage != STAGE_QUEUED:
+        return
+    if not ended.folder:
+        session.enter_stage(STAGE_AWAITING_FOLDER)
+        _schedule_picker(context, session.telegram_id)
+        return
+    await _assign_folder(context, session, ended.folder)
+    await _safe_send(context, session.telegram_id, notify.user_msg_queued_next(session.received_count, ended.folder))
 
 
 async def handle_folder_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """處理「輸入新資料夾名稱」的文字訊息。回傳 True 代表已處理。"""
-    # 傳錯復原（↩️ 這批傳錯了）的新資料夾輸入必須最先檢查：這個情境發生在
-    # 上一次上傳已經完成、session 早已被清除（session is None）之後，
-    # 若放在 session 檢查之後，會被下面的 early return 攔截而永遠進不來。
+    """處理打字。回傳 True 代表已處理。還沒選資料夾＝搜尋；選好之後回提示（D23）。"""
+    # 傳錯復原（↩️ 這批傳錯了）必須最先檢查：它發生在上一次上傳已經完成、
+    # session 早已被清除之後，放在 session 檢查之後會永遠進不來。
     if _correction_flag_active(context):
-        try:
-            new_folder = storage.validate_folder_name(update.effective_message.text or "")
-        except storage.FolderNameError as exc:
-            # 保留待輸入狀態、明確請他重打，不可靜默無反應（§7 第 10 點）
-            await update.effective_message.reply_text(str(exc))
-            return True
-        _clear_correction_flag(context)
-        await _apply_correction(update, context, new_folder)
+        await folder_picker.handle_text(update, context, folder_picker.MODE_CORRECTION)
         return True
 
     _, _, _, sessions, _ = _services(context)
@@ -367,21 +384,13 @@ async def handle_folder_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if session is None:
         return False
     if session.stage == STAGE_AWAITING_FOLDER:
-        await _set_folder_and_start(update.effective_message, context, session, update.effective_message.text)
+        session.touch()
+        await folder_picker.handle_text(update, context, folder_picker.MODE_UPLOAD)
+        return True
+    if session.folder:
+        await update.effective_message.reply_text(notify.user_msg_already_chosen(session.folder))
         return True
     return False
-
-
-async def handle_recent_folder_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await _safe_answer(query)
-    _, _, _, sessions, _ = _services(context)
-    telegram_id = update.effective_user.id
-    session = sessions.get(telegram_id)
-    if session is None or session.stage != STAGE_AWAITING_FOLDER:
-        return
-    folder_name = query.data[len(CB_RECENT_FOLDER_PREFIX):]
-    await _set_folder_and_start(query.message, context, session, folder_name)
 
 
 # ── 背景工作管線：下載 worker ×N ＋ 複製 worker ×1（§3.1、§6.3.3）──
@@ -764,15 +773,15 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         return  # 非圖片訊息，交由其他 handler（若有）處理
 
+    # 不漏收（§3.6）：任何狀況都先收進暫存區
     if session is None:
-        # V1 的「遲到照片自動併案」已拿掉（V2 D21）；階段 2 改成直接開一批、問放哪
-        await remind_not_started(update, context)
-        return
-
-    if session.stage not in (STAGE_RECEIVING_PHOTOS, STAGE_DEBOUNCE):
-        if session.stage == STAGE_AWAITING_FOLDER:
-            await update.effective_message.reply_text(notify.user_msg_choose_folder_first())
-        return
+        member = members.get(telegram_id)
+        session = await _start_batch(context, telegram_id, member.name if member else str(telegram_id))
+    elif session.stage == STAGE_PROCESSING:
+        # 上一批正在寫入：排隊，上一批結束後接著放同一個資料夾（D24）
+        session = sessions.get_queued(telegram_id) or await _start_batch(
+            context, telegram_id, session.name, queued=True
+        )
 
     raw_uid = getattr(tg_file, "file_unique_id", None)
     file_unique_id = raw_uid if isinstance(raw_uid, str) else None
@@ -797,11 +806,17 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception:
             pass
 
+    if session.stage == STAGE_AWAITING_FOLDER:
+        _schedule_picker(context, telegram_id)
+        return
     if session.stage == STAGE_RECEIVING_PHOTOS:
         if should_update_counter(session, now, config.COUNTER_UPDATE_SEC, _cfg(config, "COUNTER_UPDATE_COUNT")):
             session.mark_counter_updated(now)
             await _update_status_message(context, session, message, now)
+        _schedule_debounce(context, telegram_id, restart=True)  # 照片停了就自動上傳（D24）
         return
+    if session.stage != STAGE_DEBOUNCE:
+        return  # 排隊中、等待重新開始確認：照片已收下，等該階段結束再處理
 
     # ── 緩衝期間（STAGE_DEBOUNCE）──
     if should_update_confirm(session, now, _cfg(config, "CONFIRM_UPDATE_SEC"), _cfg(config, "CONFIRM_UPDATE_COUNT")):
@@ -893,15 +908,19 @@ async def handle_continue_receiving_button(update: Update, context: ContextTypes
         return
     session.inactivity_prompted = False
     session.touch()
-    await query.message.reply_text(notify.user_msg_continue_receiving(), reply_markup=in_session_keyboard(show_finish=True))
+    await query.message.reply_text(notify.user_msg_continue_receiving(), reply_markup=in_session_keyboard())
+    _schedule_debounce(context, telegram_id)  # V2：舊訊息上的按鈕，照片停了一樣自動上傳
 
 
 async def _debounce_fire(context: ContextTypes.DEFAULT_TYPE) -> None:
     telegram_id = context.job.data["telegram_id"]
     _, _, _, sessions, _ = _services(context)
     session = sessions.get(telegram_id)
-    if session is None or session.stage != STAGE_DEBOUNCE:
+    # 收件中（選好資料夾、照片停了）也直接收尾：V2 D24 不用按「傳完了」
+    if session is None or session.stage not in (STAGE_RECEIVING_PHOTOS, STAGE_DEBOUNCE):
         return
+    if session.received_count == 0:
+        return  # 選好資料夾時一張都還沒到（理論上不會），等照片
     await _finalize_upload(context, session, timed_out=False)
 
 
@@ -920,25 +939,15 @@ async def check_session_timeouts(context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now()
     abandoned_max_min = getattr(config, "ABANDONED_SESSION_MAX_MIN", 60)
     stuck_max_min = _cfg(config, "STAGE_STUCK_MAX_MIN")
-    inactivity_sec = _cfg(config, "INACTIVITY_PROMPT_TIMEOUT_SEC")
+    # V2 拿掉「傳完了嗎？」靜置提醒：選好資料夾後照片停了就自動上傳（D24）
 
     for session in list(sessions.all_sessions()):
-        # 主動巡邏提醒：收件階段、已收到照片、連續 25 秒無新照片、且尚未提醒過
-        if (
-            session.stage == STAGE_RECEIVING_PHOTOS
-            and session.received_count > 0
-            and not session.inactivity_prompted
-            and (now - session.last_activity_at).total_seconds() >= inactivity_sec
-        ):
-            session.inactivity_prompted = True
-            sent = await _safe_send(
-                context,
-                session.telegram_id,
-                notify.user_msg_inactivity_prompt(session.received_count, session.stored_count),
-                reply_markup=inactivity_prompt_keyboard(),
-            )
-            if sent:
-                session.inactivity_prompt_message_id = sent.message_id
+        if session.folder is None and session.received_count > 0:
+            # 有照片但還沒選資料夾：沒有地方可以收尾，絕不能丟（§3.6）。
+            # shortcut: 階段 2a 只把卡在「重新開始確認」的拉回選資料夾；§3.7 提醒與清除在 2b 補上
+            if session.stage == STAGE_AWAITING_RESTART_CONFIRM and session.is_stage_stuck(stuck_max_min, now):
+                session.enter_stage(STAGE_AWAITING_FOLDER)
+            continue
 
         if session.is_idle_timed_out(config.SESSION_TIMEOUT_MIN, now):
             # 收件階段閒置逾時：有照片就自動當一批收尾，沒照片就清掉（§6.3 保險機制）
@@ -1057,6 +1066,10 @@ async def _finalize_upload(context: ContextTypes.DEFAULT_TYPE, session, timed_ou
     session.pipeline = None
     sessions.clear(telegram_id)
     await _log_step(context, telegram_id, session.name, "逾時自動完成" if timed_out else "完成")
+    folder_index = context.application.bot_data.get("folders")
+    if folder_index is not None:
+        folder_index.mark_upload_done()  # 全家 10 分鐘沒動作後才在背景重掃（§3.3）
+    await _activate_queued(context, session)
 
     # 有「相簿裡已經有了」而暫緩、尚未複製的照片時，**先問過使用者才發完成訊息**。
     # 反過來的話（先報「✅ 完成！2 張」再問還有 3 張要不要存）等於先報了一個假的
@@ -1328,7 +1341,9 @@ async def handle_restart_confirm(update: Update, context: ContextTypes.DEFAULT_T
         await _safe_delete_temp(session.temp_dir, Path(config.TEMP_DIR))
 
     sessions.clear(telegram_id)
+    folder_picker.clear(context)
     await _log_step(context, telegram_id, session.name, "重新開始")
+    await _activate_queued(context, session)
     # 順手清掉可能還留在畫面下方的舊常駐按鈕（功能已移進 ☰ 選單，見 §6.1），
     # 並用文字明確指出下一步該點哪裡，不讓使用者卡在不知道要做什麼的狀態（§5.1）。
     await query.message.reply_text(
@@ -1354,17 +1369,8 @@ async def handle_restart_cancel(update: Update, context: ContextTypes.DEFAULT_TY
     session.enter_stage(previous)
 
     if previous == STAGE_AWAITING_FOLDER:
-        recent = _recent_folders(context)
-        if recent:
-            await query.message.reply_text(
-                "好的，那就繼續。請選一個最近用過的資料夾，或直接打字輸入新資料夾名稱：",
-                reply_markup=with_restart(folder_choice_keyboard(recent)),
-            )
-        else:
-            await query.message.reply_text(
-                "好的，那就繼續。請直接打字輸入資料夾名稱：",
-                reply_markup=InlineKeyboardMarkup([restart_row()]),
-            )
+        session.picker_message_id = None  # 強制重發一次選資料夾畫面
+        await show_upload_picker(context, session)
         return
 
     await query.message.reply_text("好的，繼續原本的上傳", reply_markup=in_session_keyboard())
@@ -1398,10 +1404,10 @@ def _correction_flag_active(context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 async def handle_upload_again_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """完成訊息上的「📷 再傳一批」：等同從 ☰ 選單進入，直接開始新的一次上傳。"""
+    """舊完成訊息上的「📷 再傳一批」（V2 已拿掉）：提示直接傳照片就好。"""
     query = update.callback_query
     await _safe_answer(query)
-    await handle_start_upload(update, context)
+    await _safe_send(context, update.effective_user.id, notify.user_msg_not_started())
 
 
 async def handle_correction_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1420,30 +1426,20 @@ async def handle_correction_button(update: Update, context: ContextTypes.DEFAULT
         return  # 重複點擊一律忽略（§6.3）
     context.user_data[AWAITING_CORRECTION_FLAG] = True
     context.user_data[CORRECTION_FLAG_AT] = datetime.now()
-    # 規格書 §7 第 1 點：須同時提供「最近資料夾」按鈕與打字輸入兩種方式
-    recent = _recent_folders(context)
-    await _reply_to_query(
-        query, context,
-        "這批要改放到哪個資料夾？可以點下面用過的，或直接打字輸入新名稱：",
-        reply_markup=correction_folder_keyboard(recent) if recent else None,
+    # 新資料夾也用選資料夾畫面（V2 O8）：最近 5 個、搜尋、新建
+    await folder_picker.show_picker(
+        context, telegram_id, folder_picker.MODE_CORRECTION, "這批要改放到哪個資料夾？"
     )
 
 
-async def handle_correction_folder_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await _safe_answer(query)
-    if not _correction_flag_active(context):
-        return
-    # 這裡的名稱來自我們自己產生的「近期資料夾」按鈕，必然已經是合規的，
-    # 仍走一次 sanitize 當作防線即可，不需要對使用者報錯。
-    folder_name = storage.sanitize_folder_name(query.data[len(CB_CORRECTION_FOLDER_PREFIX):])
-    if not folder_name:
-        return
+async def finish_correction_pick(update: Update, context: ContextTypes.DEFAULT_TYPE, folder: str) -> None:
+    """選資料夾畫面在更正模式下選好了資料夾。"""
     _clear_correction_flag(context)
+    query = update.callback_query
     # query.message 可能是超過 48 小時的 InaccessibleMessage（沒有 reply_text），
     # 傳 None 讓 _apply_correction 走 chat_id 直送的路徑。
-    msg = query.message if hasattr(query.message, "reply_text") else None
-    await _apply_correction(update, context, folder_name, message=msg)
+    msg = getattr(query, "message", None)
+    await _apply_correction(update, context, folder, message=msg if hasattr(msg, "reply_text") else None)
 
 
 async def _apply_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, new_folder: str, message=None) -> None:

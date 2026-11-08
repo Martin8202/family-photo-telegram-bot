@@ -26,7 +26,13 @@ RETRY_DELAYS = [1, 3, 5]      # 重試間隔（秒）
 WRITE_THROTTLE_SEC = 0.3      # 每張寫入間隔
 RETRY_AFTER_BATCH = True      # 本次結束後自動重試失敗檔
 RECENT_FOLDERS_COUNT = 5      # 選資料夾畫面列出全家最近用過的幾個資料夾（V2 D19）
-FINISH_DEBOUNCE_SEC = 4       # 靜置自動結案倒數秒數（4 秒自適應倒數）
+FINISH_DEBOUNCE_SEC = 4       # 選好資料夾後，照片停了幾秒就自動開始上傳（V2 D24）
+PICKER_QUIET_SEC = 3          # 照片停了幾秒才出現選資料夾畫面（V2 §3.1）
+
+# ── 資料夾清單（data/folders.json，V2 §3.3）──────
+FOLDER_SCAN_DEPTH = 2         # 只掃「照片」底下第幾層以內
+FOLDER_SCAN_EXCLUDE = []      # 不列入搜尋的資料夾名稱
+FOLDER_RESCAN_IDLE_MIN = 10   # 有上傳完成後，全家多久沒動作才在背景重掃
 
 # ── 背景 worker（見規格書 §3.1、§6.3.3）──────────
 # 並行度固定、不隨照片數量增加：一次傳 10 張與一次傳 3000 張，對磁碟與網芳的
@@ -39,7 +45,6 @@ DOWNLOAD_RETRY_TIMES = 3      # 從 Telegram 下載單張照片的重試次數
 # 加上張數門檻，小批量快速傳送時畫面同樣會明顯跳動。
 COUNTER_UPDATE_SEC = 5        # 收件計數：時間門檻（秒）
 COUNTER_UPDATE_COUNT = 8      # 收件計數：張數門檻（新增滿幾張就更新一次）
-INACTIVITY_PROMPT_TIMEOUT_SEC = 25 # 靜置無新照片時主動詢問的沉寂秒數
 # ⚠️ CONFIRM_UPDATE_SEC 必須明顯小於 FINISH_DEBOUNCE_SEC，否則「確認中」的張數
 #    根本來不及更新就結案了（v2 兩者都是 5 秒，正是「數字不會跳」的成因）。
 CONFIRM_UPDATE_SEC = 2        # 「確認中」張數：時間門檻（秒）

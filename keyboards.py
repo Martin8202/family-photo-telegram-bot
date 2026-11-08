@@ -21,10 +21,16 @@ CB_CORRECTION = "correction"
 CB_UPLOAD_AGAIN = "upload_again"
 CB_DUP_COPY = "dup_copy"
 CB_DUP_SKIP = "dup_skip"
-CB_RECENT_FOLDER_PREFIX = "recent:"
-# 更正流程的資料夾按鈕另用一組 prefix：它發生在 session 已結束之後，
-# 不可與 session 內的選資料夾按鈕（CB_RECENT_FOLDER_PREFIX）混用。
-CB_CORRECTION_FOLDER_PREFIX = "corrfolder:"
+# 選資料夾畫面（handlers/folder_picker.py）。資料夾一律用編號（fp:pick:3），名稱存在
+# context.user_data：Telegram 的 callback_data 最多 64 bytes，第 2 層中文路徑放不下。
+CB_FP_PREFIX = "fp:"
+CB_FP_PICK_PREFIX = "fp:pick:"
+CB_FP_SEARCH = "fp:search"
+CB_FP_NEW = "fp:new"
+CB_FP_CREATE = "fp:create"
+CB_FP_RETYPE = "fp:retype"
+CB_FP_ADD_DATE = "fp:adddate"
+CB_FP_NO_DATE = "fp:nodate"
 
 
 def register_keyboard() -> InlineKeyboardMarkup:
@@ -51,28 +57,44 @@ def clear_persistent_keyboard() -> ReplyKeyboardRemove:
     return ReplyKeyboardRemove()
 
 
-def folder_choice_keyboard(recent_folders: list[dict]) -> InlineKeyboardMarkup:
-    """全家最近用過的資料夾（V2 規格 D19）。`name` 是相對 `照片` 的路徑。"""
-    rows = []
-    for f in recent_folders:
-        rows.append([InlineKeyboardButton(f"📁 {f['name']}", callback_data=f"{CB_RECENT_FOLDER_PREFIX}{f['name']}")])
-    return InlineKeyboardMarkup(rows) if rows else InlineKeyboardMarkup([])
-
-
-def correction_folder_keyboard(recent_folders: list[dict]) -> InlineKeyboardMarkup:
-    """
-    「↩️ 這批傳錯了」要改放到哪個資料夾（規格書 §7 第 1 點）。
-    規格明訂須同時提供「最近資料夾」按鈕與打字輸入兩種方式，不可只接受打字。
-    """
-    rows = []
-    for f in recent_folders:
-        rows.append([InlineKeyboardButton(
-            f"📁 {f['name']}", callback_data=f"{CB_CORRECTION_FOLDER_PREFIX}{f['name']}"
-        )])
+def picker_keyboard(labels: list[str], with_restart_button: bool) -> InlineKeyboardMarkup:
+    """選資料夾畫面（V2 §3.1）：最近 5 個 → 🔍 找資料夾 → ➕ 新的資料夾 →（上傳時）🔄 重新開始。"""
+    rows = [[InlineKeyboardButton(label, callback_data=f"{CB_FP_PICK_PREFIX}{i}")] for i, label in enumerate(labels)]
+    rows.append([InlineKeyboardButton("🔍 找資料夾", callback_data=CB_FP_SEARCH)])
+    rows.append([InlineKeyboardButton("➕ 新的資料夾", callback_data=CB_FP_NEW)])
+    if with_restart_button:
+        rows.append(restart_row())
     return InlineKeyboardMarkup(rows)
 
 
-def in_session_keyboard(show_finish: bool = True) -> InlineKeyboardMarkup:
+def search_results_keyboard(labels: list[str], new_name, with_restart_button: bool) -> InlineKeyboardMarkup:
+    """搜尋結果（V2 §3.3）：相近資料夾，最後一顆是「➕ 都不是，新建」（名稱不合規則時不給）。"""
+    rows = [[InlineKeyboardButton(label, callback_data=f"{CB_FP_PICK_PREFIX}{i}")] for i, label in enumerate(labels)]
+    if new_name:
+        rows.append([InlineKeyboardButton(f"➕ 都不是，新建「{new_name}」", callback_data=CB_FP_CREATE)])
+    if with_restart_button:
+        rows.append(restart_row())
+    return InlineKeyboardMarkup(rows)
+
+
+def search_none_keyboard(new_name, with_restart_button: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if new_name:
+        rows.append([InlineKeyboardButton(f"✅ 新建一個叫「{new_name}」的", callback_data=CB_FP_CREATE)])
+    rows.append([InlineKeyboardButton("✏️ 重打", callback_data=CB_FP_RETYPE)])
+    if with_restart_button:
+        rows.append(restart_row())
+    return InlineKeyboardMarkup(rows)
+
+
+def add_date_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📅 加今天的日期", callback_data=CB_FP_ADD_DATE),
+        InlineKeyboardButton("不用", callback_data=CB_FP_NO_DATE),
+    ]])
+
+
+def in_session_keyboard(show_finish: bool = False) -> InlineKeyboardMarkup:
     rows = []
     if show_finish:
         rows.append([InlineKeyboardButton("⚡ 沒照片了，發送並寫入", callback_data=CB_FINISH)])
@@ -83,16 +105,6 @@ def in_session_keyboard(show_finish: bool = True) -> InlineKeyboardMarkup:
 
 def restart_row() -> list:
     return [InlineKeyboardButton("🔄 重新開始", callback_data=CB_RESTART)]
-
-
-def with_restart(markup: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
-    """
-    在任何 inline keyboard 底下附加一顆「🔄 重新開始」。
-    規格書 §6.5：這顆按鈕在 session 進行中全程可見（選資料夾、選目的地、
-    傳照片、處理中皆可見），不是只有收到照片之後才出現。
-    """
-    rows = list(markup.inline_keyboard) + [restart_row()]
-    return InlineKeyboardMarkup(rows)
 
 
 def restart_confirm_keyboard() -> InlineKeyboardMarkup:
@@ -112,20 +124,9 @@ def duplicate_decision_keyboard() -> InlineKeyboardMarkup:
 
 def correction_keyboard() -> InlineKeyboardMarkup:
     """
-    上傳完成後的按鈕列。
-
-    「📷 再傳一批」是 contextual 入口：連續傳好幾批是很常見的操作，每次都要繞去
-    ☰ 選單很煩；做成 inline 按鈕則是需要時才出現，不佔常駐螢幕空間。
+    上傳完成後的按鈕列。V2 拿掉「📷 再傳一批」：直接傳照片就會開新的一批（D17）。
+    CB_UPLOAD_AGAIN 仍保留，舊訊息上的按鈕被點到時回一句提示。
     """
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("📷 再傳一批", callback_data=CB_UPLOAD_AGAIN),
         InlineKeyboardButton("↩️ 這批傳錯了", callback_data=CB_CORRECTION),
     ]])
-
-
-def inactivity_prompt_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ 確定傳完了，開始上傳", callback_data=CB_FINISH)],
-        [InlineKeyboardButton("📷 我還有照片沒傳完", callback_data=CB_CONTINUE_RECEIVING)],
-        restart_row(),
-    ])

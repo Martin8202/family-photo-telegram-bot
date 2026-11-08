@@ -49,11 +49,8 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    # 沒有進行中的 session：直接進上傳流程，不要停在「歡迎回來」這個沒有作用的中繼站。
-    # 規格書 §5.1 對已開通者的規定本來就是「正常進入上傳流程」——先前的實作只是
-    # 把按鈕遞出去，等於多要求使用者再點一次。
-    from handlers import upload  # 區域匯入：避免 register ↔ upload 的模組級循環相依
-    await upload.handle_start_upload(update, context)
+    # 沒有進行中的批次：V2 只有一種入口，直接傳照片就開始（D17）
+    await update.effective_message.reply_text(notify.user_msg_not_started())
 
 
 async def handle_register_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
