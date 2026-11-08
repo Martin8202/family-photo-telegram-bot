@@ -139,6 +139,30 @@ def msg_pending_discarded_for_admin(uploader: str, count: int) -> str:
     return f"🗑️ {uploader} {count} 張未選資料夾，已自動清除"
 
 
+def user_msg_find_prompt() -> str:
+    return "要找什麼？打資料夾名稱裡的字或日期，例如「金門」或「7/2」"
+
+
+def user_msg_find_results() -> str:
+    return "找到這些資料夾，點一下看在哪裡："
+
+
+def user_msg_find_none(query: str) -> str:
+    return f"找不到叫「{query}」的資料夾"
+
+
+def user_msg_find_location(name: str, where: str) -> str:
+    return f"📁 「{name}」{where}\n到 Google Drive App 搜尋「{name}」就找得到"
+
+
+def msg_cleanup_pruned(removed: int, remaining: int) -> str:
+    return f"🧹 待清理清單：拿掉 {removed} 筆已處理的，還剩 {remaining} 筆"
+
+
+def msg_backup_failed(error: str) -> str:
+    return f"🔴 data 每週備份失敗：{error}"
+
+
 def user_msg_pending_gone() -> str:
     return "這批已經處理過了。要上傳的話，直接把照片傳給我就可以"
 

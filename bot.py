@@ -16,7 +16,7 @@ from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
-from telegram import Update
+from telegram import BotCommand, BotCommandScopeChat, Update
 from telegram.ext import (
     Application,
     CallbackContext,
@@ -32,12 +32,13 @@ import config
 import notify
 import storage
 from folder_search import FolderIndex
-from handlers import folder_picker, register, upload
+from handlers import admin, folder_picker, register, search, upload
 from keyboards import (
     CB_APPROVE_PREFIX,
     CB_CORRECTION,
     CB_DUP_COPY,
     CB_DUP_SKIP,
+    CB_FIND_PREFIX,
     CB_FP_PREFIX,
     CB_PENDING_DROP,
     CB_PENDING_KEEP,
@@ -149,6 +150,10 @@ async def route_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await register.handle_unapproved_contact(update, context, member)
         return
 
+    # 剛點過「🔍 找照片／檔案」：這句話是要找的字（V2 §3.5），比上傳的搜尋優先
+    if await search.handle_text(update, context):
+        return
+
     if await upload.handle_folder_text(update, context):
         return
 
@@ -174,6 +179,19 @@ async def route_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     await upload.handle_photo_message(update, context)
+
+
+async def route_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """選單「🔍 找照片／檔案」：只有開通的家人能用（V2 §3.5）。"""
+    members: MembersStore = context.application.bot_data["members"]
+    member = members.get(update.effective_user.id)
+    if member is None or member.status not in (STATUS_APPROVED, STATUS_PENDING):
+        await register.show_welcome(update, context)
+        return
+    if member.status == STATUS_PENDING:
+        await register.handle_unapproved_contact(update, context, member)
+        return
+    await search.handle_find_command(update, context)
 
 
 async def route_unsupported_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -405,9 +423,25 @@ async def on_startup(app: Application) -> None:
     if await startup_health_check(app):
         await startup_migrate_recent_folders(app)
         await startup_recover_temp(app)
-    # V2 D17：選單拿掉「📷 我要上傳照片」（直接傳照片就開始）。階段 3 再放「🔍 找照片／檔案」。
-    # /start 仍然保留為可用指令（註冊流程靠它），只是不出現在選單裡。
-    await app.bot.delete_my_commands()
+    await setup_menu(app)
+
+
+async def setup_menu(app: Application) -> None:
+    """
+    ☰ 選單：家人只看到「🔍 找照片／檔案」（上傳不用選單，直接傳照片，D17）；管理員多一個 /status。
+    Telegram 指令名稱只能用英文小寫，中文放在說明裡。/start 照樣能用，只是不列在選單。
+    選單設不上去不影響收照片，失敗只記 log。
+    """
+    family = [BotCommand("find", "🔍 找照片／檔案")]
+    try:
+        await app.bot.set_my_commands(family)
+        admin_id = app.bot_data["config"].ADMIN_ID
+        if admin_id:
+            await app.bot.set_my_commands(
+                family + [BotCommand("status", "📊 機器人狀態（管理員）")], scope=BotCommandScopeChat(admin_id)
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("設定選單失敗：%s", exc)
 
 
 def build_application() -> Application:
@@ -431,6 +465,7 @@ def build_application() -> Application:
     app.bot_data["notifier"] = notifier
     app.bot_data["config"] = config
     app.bot_data["data_dir"] = DATA_DIR
+    app.bot_data["started_at"] = datetime.now()
     folders = FolderIndex(
         DATA_DIR / "folders.json", upload.drive_root(config),
         config.FOLDER_SCAN_DEPTH, config.FOLDER_SCAN_EXCLUDE, config.FOLDER_RESCAN_IDLE_MIN,
@@ -442,6 +477,9 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("start", register.handle_start))
     # 舊選單的 /upload（V2 已拿掉）：提示直接傳照片
     app.add_handler(CommandHandler("upload", upload.remind_not_started))
+    app.add_handler(CommandHandler("find", route_find))
+    app.add_handler(CommandHandler("status", admin.handle_status))  # 非管理員一律不回應
+    app.add_handler(CallbackQueryHandler(search.handle_button, pattern=f"^{CB_FIND_PREFIX}"))
 
     app.add_handler(CallbackQueryHandler(register.handle_register_button, pattern=f"^{CB_REGISTER}$"))
     app.add_handler(CallbackQueryHandler(register.handle_approve, pattern=f"^{CB_APPROVE_PREFIX}"))
@@ -479,6 +517,8 @@ def build_application() -> Application:
 
     if app.job_queue is not None:
         app.job_queue.run_repeating(periodic_timeout_check, interval=30, first=30)
+        # 待清理清單整理＋data 備份：啟動 5 分鐘後一次，之後每 24 小時（不綁半夜，hn143 不一定開著）
+        app.job_queue.run_repeating(admin.run_maintenance, interval=24 * 3600, first=300)
 
     return app
 

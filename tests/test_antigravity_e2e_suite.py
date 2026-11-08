@@ -81,8 +81,8 @@ class DummyBot:
     async def edit_message_text(self, chat_id: int, message_id: int, text: str, reply_markup=None):
         self.edited_messages.append({"chat_id": chat_id, "message_id": message_id, "text": text})
 
-    async def set_my_commands(self, commands):
-        pass
+    async def set_my_commands(self, commands, scope=None):
+        self.commands_set = getattr(self, "commands_set", []) + [(commands, scope)]
 
     async def delete_my_commands(self):
         pass
@@ -1617,10 +1617,9 @@ async def test_start_during_session_reports_status(env):
 
 
 def test_menu_no_longer_has_upload():
-    """V2 D17：選單拿掉「📷 我要上傳照片」；/start 指令本身必須保留（註冊流程要用）。"""
+    """V2 D17：選單拿掉「📷 我要上傳照片」；/start 指令本身必須保留（註冊流程要用）。選單內容見 test_admin。"""
     src = Path("bot.py").read_text(encoding="utf-8")
     assert 'BotCommand("upload"' not in src
-    assert "delete_my_commands()" in src
     assert 'CommandHandler("start"' in src
 
 

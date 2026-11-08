@@ -72,6 +72,25 @@ class CsvLog:
             logger.error("寫入 %s 失敗（%s）；未能寫入的內容：%s", self.path.name, exc, rows)
             raise
 
+    def rewrite_rows(self, keep) -> tuple[int, int]:
+        """
+        整份重寫，只留 keep(row_dict) 為 True 的列；回傳 (拿掉幾列, 剩幾列)。
+        讀與寫都在寫入佇列裡做，不會跟同時進來的追加互相蓋掉；用原子寫入，任何時候讀到的都是完整檔案。
+        """
+        result = {}
+
+        def _write():
+            rows = self.read_all_rows()
+            kept = [r for r in rows if keep(r)]
+            result["counts"] = (len(rows) - len(kept), len(kept))
+            if len(kept) != len(rows):
+                atomic_write_text(self.path, self._render([self.header] + [[r.get(h, "") for h in self.header] for r in kept]))
+
+        self._write_queue.submit(_write)
+        if "counts" not in result:
+            raise TimeoutError(f"整理 {self.path.name} 逾時")
+        return result["counts"]
+
     def read_all_rows(self) -> list[dict]:
         if not self.path.exists():
             return []

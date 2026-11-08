@@ -21,6 +21,9 @@ CB_CORRECTION = "correction"
 CB_UPLOAD_AGAIN = "upload_again"
 CB_DUP_COPY = "dup_copy"
 CB_DUP_SKIP = "dup_skip"
+CB_FIND_PREFIX = "find:"        # 找東西的按鈕（只回位置文字，不上傳）
+CB_FIND_PICK_PREFIX = "find:pick:"
+CB_FIND_RETYPE = "find:retype"
 CB_PENDING_KEEP = "pend:keep"
 CB_PENDING_DROP = "pend:drop"
 # 選資料夾畫面（handlers/folder_picker.py）。資料夾一律用編號（fp:pick:3），名稱存在
@@ -122,6 +125,17 @@ def duplicate_decision_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✅ 要，還是存一份", callback_data=CB_DUP_COPY)],
         [InlineKeyboardButton("❌ 不用了，跳過", callback_data=CB_DUP_SKIP)],
     ])
+
+
+def find_results_keyboard(labels: list[str]) -> InlineKeyboardMarkup:
+    """找東西的結果（V2 §3.5）：按鈕是 🔗，跟上傳時的 📥 明顯不同。"""
+    rows = [[InlineKeyboardButton(label, callback_data=f"{CB_FIND_PICK_PREFIX}{i}")] for i, label in enumerate(labels)]
+    rows.append([InlineKeyboardButton("✏️ 重打", callback_data=CB_FIND_RETYPE)])
+    return InlineKeyboardMarkup(rows)
+
+
+def find_none_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✏️ 重打", callback_data=CB_FIND_RETYPE)]])
 
 
 def pending_reminder_keyboard() -> InlineKeyboardMarkup:
