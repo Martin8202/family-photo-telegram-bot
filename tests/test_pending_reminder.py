@@ -192,3 +192,6 @@ async def test_restart_restores_pending_batch_and_reminds(env):
     names = sorted(p.name for p in (nas_dir / "2026-11-01秋遊").iterdir())
     assert "旅遊行程.pdf" in names and len(names) == 2
     assert app.bot_data["sessions"].get(4006) is None
+    rows = app.bot_data["logs"].upload_log.read_all_rows()
+    assert rows[-1]["張數"] == "2" and rows[-1]["結果"] == "成功", "接回的批次張數要記對"
+    assert len([r for r in app.bot_data["logs"].file_index.read_all_rows() if r["目標資料夾"] == "2026-11-01秋遊"]) == 2
