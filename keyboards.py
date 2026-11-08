@@ -63,29 +63,35 @@ def clear_persistent_keyboard() -> ReplyKeyboardRemove:
 
 
 def picker_keyboard(labels: list[str], with_restart_button: bool) -> InlineKeyboardMarkup:
-    """選資料夾畫面（V2 §3.1）：最近 5 個 → 🔍 找資料夾 → ➕ 新的資料夾 →（上傳時）🔄 重新開始。"""
+    """
+    選資料夾畫面（V2 §3.1）：最近 5 個 → 🔍 找資料夾／建新的 →（上傳時）🔄 重新開始。
+    11/08 實測後拿掉「➕ 新的資料夾」：打字一律先搜尋，找不到再從結果新建，不用分兩個入口。
+    CB_FP_NEW 仍保留處理，舊訊息上的按鈕被點到時不會沒反應。
+    """
     rows = [[InlineKeyboardButton(label, callback_data=f"{CB_FP_PICK_PREFIX}{i}")] for i, label in enumerate(labels)]
-    rows.append([InlineKeyboardButton("🔍 找資料夾", callback_data=CB_FP_SEARCH)])
-    rows.append([InlineKeyboardButton("➕ 新的資料夾", callback_data=CB_FP_NEW)])
+    rows.append([InlineKeyboardButton("🔍 找資料夾／建新的", callback_data=CB_FP_SEARCH)])
     if with_restart_button:
         rows.append(restart_row())
     return InlineKeyboardMarkup(rows)
 
 
-def search_results_keyboard(labels: list[str], new_name, with_restart_button: bool) -> InlineKeyboardMarkup:
-    """搜尋結果（V2 §3.3）：相近資料夾，最後一顆是「➕ 都不是，新建」（名稱不合規則時不給）。"""
+def search_results_keyboard(labels: list[str], new_label, with_restart_button: bool) -> InlineKeyboardMarkup:
+    """
+    搜尋結果（V2 §3.3）：相近資料夾，最後一顆是「➕ 都不是，新建」（名稱不合規則時不給）。
+    new_label 是帶引號的顯示文字，例如「金門」或「行程」（在「照片」裡的「金門」裡）。
+    """
     rows = [[InlineKeyboardButton(label, callback_data=f"{CB_FP_PICK_PREFIX}{i}")] for i, label in enumerate(labels)]
-    if new_name:
-        rows.append([InlineKeyboardButton(f"➕ 都不是，新建「{new_name}」", callback_data=CB_FP_CREATE)])
+    if new_label:
+        rows.append([InlineKeyboardButton(f"➕ 都不是，新建{new_label}", callback_data=CB_FP_CREATE)])
     if with_restart_button:
         rows.append(restart_row())
     return InlineKeyboardMarkup(rows)
 
 
-def search_none_keyboard(new_name, with_restart_button: bool) -> InlineKeyboardMarkup:
+def search_none_keyboard(new_label, with_restart_button: bool) -> InlineKeyboardMarkup:
     rows = []
-    if new_name:
-        rows.append([InlineKeyboardButton(f"✅ 新建一個叫「{new_name}」的", callback_data=CB_FP_CREATE)])
+    if new_label:
+        rows.append([InlineKeyboardButton(f"✅ 新建{new_label}", callback_data=CB_FP_CREATE)])
     rows.append([InlineKeyboardButton("✏️ 重打", callback_data=CB_FP_RETYPE)])
     if with_restart_button:
         rows.append(restart_row())

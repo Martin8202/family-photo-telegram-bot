@@ -111,6 +111,73 @@ async def test_new_folder_without_date_offers_today(env):
 
 
 @pytest.mark.asyncio
+async def test_picker_has_no_separate_new_folder_button(env):
+    """11/08 實測：拿掉「➕ 新的資料夾」，打字一律先搜尋、找不到再新建。"""
+    app, *_ = env
+    ctx = DummyContext(app)
+    user = DummyUser(2005, "妹妹")
+    _approve(app, user)
+    await _send_photo(app, ctx, user, "n1", 10)
+    await upload._picker_fire(ctx_with_job(ctx, 2005))
+    labels = [b.text for row in app.bot.sent_messages[-1]["reply_markup"].inline_keyboard for b in row]
+    assert "➕ 新的資料夾" not in labels and "🔍 找資料夾／建新的" in labels
+    await app.bot_data["sessions"].get(2005).pipeline.drain()
+
+
+@pytest.mark.asyncio
+async def test_create_inside_existing_first_level_folder(env):
+    """11/08 實測：打「上層/新名稱」可以建在第 2 層；加日期只加在新名稱上。"""
+    app, data_dir, _, nas_dir, _ = env
+    (nas_dir / "測試").mkdir()
+    index = FolderIndex(data_dir / "folders.json", nas_dir)
+    index.rescan()
+    app.bot_data["folders"] = index
+    ctx = DummyContext(app)
+    user = DummyUser(2006, "弟弟")
+    _approve(app, user)
+    await _send_photo(app, ctx, user, "sub1", 10)
+
+    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(11, "測試／烤肉", 2006, app.bot)), ctx)
+    labels = [b.text for row in app.bot.sent_messages[-1]["reply_markup"].inline_keyboard for b in row]
+    assert any("新建「烤肉」（在「照片」裡的「測試」裡）" in t for t in labels)
+    await _press(app, ctx, user, "fp:create")
+    await _press(app, ctx, user, "fp:adddate")
+
+    session = app.bot_data["sessions"].get(2006)
+    assert session.folder == f"測試\\{datetime.now():%Y-%m-%d}烤肉"
+    await session.pipeline.settle()
+    await upload._debounce_fire(ctx_with_job(ctx, 2006))
+    assert len(list((nas_dir / "測試" / f"{datetime.now():%Y-%m-%d}烤肉").glob("*.jpg"))) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text, reason", [
+    ("測試/", "「/」後面打新資料夾的名稱"),
+    ("沒有這個/烤肉", "「照片」裡沒有叫「沒有這個」的資料夾"),
+    ("測試/a/b", "請打「上層/新名稱」"),
+    ("測試?", "不能有這些符號"),
+])
+async def test_cannot_create_always_says_why(env, text, reason):
+    """11/08 實測：有搜尋結果時，不能新建也要說原因（原本只有找不到時才說）。"""
+    app, data_dir, _, nas_dir, _ = env
+    (nas_dir / "測試").mkdir()
+    index = FolderIndex(data_dir / "folders.json", nas_dir)
+    index.rescan()
+    app.bot_data["folders"] = index
+    ctx = DummyContext(app)
+    user = DummyUser(2007, "表姊")
+    _approve(app, user)
+    await _send_photo(app, ctx, user, "e1", 10)
+
+    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(11, text, 2007, app.bot)), ctx)
+    sent = app.bot.sent_messages[-1]
+    assert reason in sent["text"]
+    labels = [b.text for row in sent["reply_markup"].inline_keyboard for b in row]
+    assert not any("新建" in t for t in labels)
+    await app.bot_data["sessions"].get(2007).pipeline.drain()
+
+
+@pytest.mark.asyncio
 async def test_photos_during_processing_go_to_same_folder_next(env):
     """D24：上一批寫入中又傳照片 → 先收下排隊，上一批結束後接著放同一個資料夾。"""
     app, _, _, nas_dir, _ = env

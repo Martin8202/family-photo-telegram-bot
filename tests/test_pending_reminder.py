@@ -21,6 +21,14 @@ from test_antigravity_e2e_suite import (  # noqa: F401 - env 是 fixture，靠 i
 )
 
 
+@pytest.fixture(autouse=True)
+def _ten_minutes(monkeypatch):
+    """測試固定用規格的 10 分鐘，不受本機 config.py（例如手機實測時縮短）影響。"""
+    import config
+    monkeypatch.setattr(config, "PENDING_REMIND_MIN", 10, raising=False)
+    monkeypatch.setattr(config, "PENDING_DISCARD_AFTER_REMIND_MIN", 10, raising=False)
+
+
 def _approve(app, user):
     members = app.bot_data["members"]
     members.register(user.id, user.first_name)

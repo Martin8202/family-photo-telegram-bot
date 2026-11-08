@@ -235,7 +235,10 @@ def user_msg_picker(count: int) -> str:
 
 
 def user_msg_picker_search_prompt() -> str:
-    return "請打資料夾名稱裡的字或日期，例如「金門」或「7/2」"
+    return (
+        "請打資料夾名稱裡的字或日期，例如「金門」或「7/2」，找不到可以直接新建\n"
+        "要建在某個資料夾裡面，請打「上層/新名稱」，例如「金門/第一天」"
+    )
 
 
 def user_msg_picker_new_prompt() -> str:

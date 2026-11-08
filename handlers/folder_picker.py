@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime
 
 from telegram import Update
@@ -41,6 +42,7 @@ logger = logging.getLogger("photo-bot.picker")
 PICKER_KEY = "picker"
 MODE_UPLOAD = "upload"
 MODE_CORRECTION = "correction"
+_PATH_SPLIT = re.compile(r"[/\\／＼]")  # 「上層/新名稱」的分隔符號（半形、全形都算）
 
 
 def folder_label(path: str) -> str:
@@ -79,33 +81,73 @@ async def show_picker(context: ContextTypes.DEFAULT_TYPE, chat_id: int, mode: st
     )
 
 
+def parse_new_folder(text: str, folders: list) -> tuple:
+    """
+    打的字當成新資料夾時的路徑。回傳 (路徑或 None, 錯誤說明或 None, 要拿去搜尋的字)。
+    - 「名稱」→ 建在「照片」底下（第 1 層）
+    - 「上層/名稱」→ 建在既有的第 1 層資料夾裡（第 2 層，11/08 實測補上）；/、\\、全形／都算
+    """
+    parts = _PATH_SPLIT.split(text)
+    if len(parts) == 1:
+        try:
+            return storage.validate_folder_name(text), None, text
+        except storage.FolderNameError as exc:
+            return None, str(exc), text
+    parent, child = parts[0].strip(), parts[-1].strip()
+    query = child or parent
+    if len(parts) > 2:
+        return None, "新資料夾只能建在「照片」底下，或「照片」裡的某個資料夾裡：請打「上層/新名稱」", query
+    if not any(f["path"] == parent for f in folders):
+        return None, f"「照片」裡沒有叫「{parent}」的資料夾，要建在它裡面，上層名稱要打完整", query
+    if not child:
+        return None, f"要建在「{parent}」裡面的話，請在「/」後面打新資料夾的名稱", query
+    try:
+        return f"{parent}{SEP}{storage.validate_folder_name(child)}", None, query
+    except storage.FolderNameError as exc:
+        return None, str(exc), query
+
+
+def new_folder_label(path: str) -> str:
+    """新建按鈕上的名稱：「金門」或「行程」（在「照片」裡的「金門」裡）。"""
+    name = path.split(SEP)[-1]
+    return f"「{name}」" if SEP not in path else f"「{name}」{location_text(path)}"
+
+
+def _with_date(path: str) -> str:
+    """在最後一段名稱前面加今天的日期（第 2 層只加在新資料夾名稱上）。"""
+    head, _, name = path.rpartition(SEP)
+    dated = f"{datetime.now():%Y-%m-%d}{name}"
+    return f"{head}{SEP}{dated}" if head else dated
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str) -> None:
-    """打字＝搜尋（D13 方案 A、D23）。"""
+    """打字＝搜尋（D13 方案 A、D23）；找不到或都不是，再從結果新建。"""
     text = (update.effective_message.text or "").strip()
     st = _state(context)
     st["mode"] = mode
     index = context.application.bot_data.get("folders")
-    results = index.search(text) if index is not None else []
-    try:
-        new_name = storage.validate_folder_name(text)
-        name_error = None
-    except storage.FolderNameError as exc:
-        new_name, name_error = None, str(exc)
+    new_name, name_error, query = parse_new_folder(text, index.folders if index is not None else [])
+    results = index.search(query) if index is not None else []
     st["choices"] = [f["path"] for f in results]
     st["new_name"] = new_name
     with_restart = mode == MODE_UPLOAD
     chat_id = update.effective_user.id
+    new_label = new_folder_label(new_name) if new_name else None
 
+    # 不能新建時一定說明原因（11/08 實測：有搜尋結果時原本沒說，看起來像壞掉）
     if results:
+        msg = notify.user_msg_search_results()
+        if name_error:
+            msg += "\n\n⚠️ 不能新建：" + name_error
         await _send(
-            context, chat_id, notify.user_msg_search_results(),
-            reply_markup=search_results_keyboard([folder_label(p) for p in st["choices"]], new_name, with_restart),
+            context, chat_id, msg,
+            reply_markup=search_results_keyboard([folder_label(p) for p in st["choices"]], new_label, with_restart),
         )
         return
-    msg = notify.user_msg_search_none(text)
+    msg = notify.user_msg_search_none(query)
     if name_error:
         msg += "\n" + name_error
-    await _send(context, chat_id, msg, reply_markup=search_none_keyboard(new_name, with_restart))
+    await _send(context, chat_id, msg, reply_markup=search_none_keyboard(new_label, with_restart))
 
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -137,8 +179,9 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         name = st.get("new_name")
         if not name:
             return
-        if not has_date(name):
-            await _send(context, chat_id, notify.user_msg_ask_add_date(name), reply_markup=add_date_keyboard())
+        if not has_date(name.split(SEP)[-1]):
+            await _send(context, chat_id, notify.user_msg_ask_add_date(name.split(SEP)[-1]),
+                        reply_markup=add_date_keyboard())
             return
         await _finish(update, context, mode, name, is_new=True)
     elif data in (CB_FP_ADD_DATE, CB_FP_NO_DATE):
@@ -146,7 +189,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if not name:
             return
         if data == CB_FP_ADD_DATE:
-            name = f"{datetime.now():%Y-%m-%d}{name}"
+            name = _with_date(name)
         await _finish(update, context, mode, name, is_new=True)
 
 
