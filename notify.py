@@ -202,6 +202,10 @@ def user_msg_restart_done() -> str:
     return "已重新開始。要再傳的話，直接把照片傳給我就可以"
 
 
+def user_msg_correction_same_folder(folder: str) -> str:
+    return f"這批本來就在「{folder}」了，請選另一個資料夾"
+
+
 def user_msg_correction_done(count: int, new_folder: str) -> str:
     return f"✅ 已經幫你把這 {count} 張改放到「{new_folder}」了"
 

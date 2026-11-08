@@ -1664,6 +1664,14 @@ async def handle_correction_button(update: Update, context: ContextTypes.DEFAULT
 
 async def finish_correction_pick(update: Update, context: ContextTypes.DEFAULT_TYPE, folder: str) -> None:
     """選資料夾畫面在更正模式下選好了資料夾。"""
+    batch = _services(context)[3].get_last_batch(update.effective_user.id)
+    if batch is not None and batch.folder == folder:
+        # 11/08 實測：選到原本的資料夾會在同一個資料夾多複製一份 _(2)，再把原檔列進待清理清單。擋下來重選。
+        await folder_picker.show_picker(
+            context, update.effective_user.id, folder_picker.MODE_CORRECTION,
+            notify.user_msg_correction_same_folder(folder),
+        )
+        return
     _clear_correction_flag(context)
     query = update.callback_query
     # query.message 可能是超過 48 小時的 InaccessibleMessage（沒有 reply_text），

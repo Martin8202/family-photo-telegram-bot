@@ -151,6 +151,35 @@ async def test_create_inside_existing_first_level_folder(env):
 
 
 @pytest.mark.asyncio
+async def test_correction_to_same_folder_is_refused(env):
+    """11/08 實測：「這批傳錯了」選到原本的資料夾，原本會在同一處多一份 _(2) 並把原檔列進待清理清單。"""
+    from state import CompletedBatch
+    from test_antigravity_e2e_suite import DummyCallbackQuery
+
+    app, _, _, nas_dir, _ = env
+    ctx = DummyContext(app)
+    user = DummyUser(2009, "舅舅")
+    _approve(app, user)
+    folder = nas_dir / "2026-11-08測試"
+    folder.mkdir()
+    photo = folder / "20261108_105925_a1905e49.jpg"
+    photo.write_bytes(b"x")
+    app.bot_data["members"].push_recent_folder(2009, "2026-11-08測試", None, 5)
+    app.bot_data["sessions"].set_last_batch(CompletedBatch(
+        telegram_id=2009, folder="2026-11-08測試", destination_label="Google Drive", files=[],
+        written_paths={"Google Drive": [("fid", photo)]}, completed_at=datetime.now(),
+    ))
+    m = DummyMessage(20, "", 2009, app.bot)
+    await upload.handle_correction_button(DummyUpdate(user, m, DummyCallbackQuery("correction", user, m)), ctx)
+    await _press(app, ctx, user, "fp:pick:0")  # 最近第一個就是原本的資料夾
+
+    assert app.bot.sent_messages[-1]["text"] == "這批本來就在「2026-11-08測試」了，請選另一個資料夾"
+    assert sorted(p.name for p in folder.iterdir()) == [photo.name], "不可以在原資料夾多複製一份"
+    assert not app.bot_data["logs"].cleanup_list.read_all_rows()
+    assert ctx.user_data.get(upload.AWAITING_CORRECTION_FLAG) is True, "還可以接著選別的資料夾"
+
+
+@pytest.mark.asyncio
 async def test_sub_folder_button_flow(env):
     """📂 建在某個資料夾裡：選上層（最近用過的取第 1 層／打字找）→ 打名稱 → 加日期 → 建在第 2 層。"""
     app, data_dir, _, nas_dir, _ = env
