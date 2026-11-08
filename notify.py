@@ -146,7 +146,12 @@ def user_msg_sub_parent_prompt(has_choices: bool) -> str:
 
 
 def user_msg_sub_parent_none(query: str) -> str:
-    return f"「照片」裡找不到叫「{query}」的資料夾，請換個字再打一次"
+    return f"「照片」裡找不到叫「{query}」的資料夾。換個字再打一次，或新建一個"
+
+
+def user_msg_new_parent_note(parent: str, has_results: bool) -> str:
+    note = f"💡「照片」裡還沒有「{parent}」，按新建會連它一起建"
+    return note + ("。如果是要放進上面既有的資料夾，直接點那一個" if has_results else "")
 
 
 def user_msg_sub_name_prompt(parent: str, has_subs: bool) -> str:
@@ -156,6 +161,10 @@ def user_msg_sub_name_prompt(parent: str, has_subs: bool) -> str:
             "要建新的，直接打名稱，例如「烤肉」"
         )
     return f"「{parent}」裡面還沒有資料夾。新資料夾要叫什麼？直接打名稱，例如「烤肉」"
+
+
+def user_msg_new_parent_name_prompt(parent: str) -> str:
+    return f"「{parent}」會跟裡面的新資料夾一起建。裡面的新資料夾要叫什麼？直接打名稱，例如「第一天」"
 
 
 def user_msg_find_prompt() -> str:

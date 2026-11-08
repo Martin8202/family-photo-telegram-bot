@@ -38,6 +38,7 @@ CB_FP_ADD_DATE = "fp:adddate"
 CB_FP_NO_DATE = "fp:nodate"
 CB_FP_SUB = "fp:sub"                 # 📂 建在某個資料夾裡
 CB_FP_PARENT_PREFIX = "fp:parent:"   # 選了上層資料夾（帶編號）
+CB_FP_NEW_PARENT = "fp:newparent"    # 上層也是新的
 
 
 def register_keyboard() -> InlineKeyboardMarkup:
@@ -101,9 +102,11 @@ def search_none_keyboard(new_label, with_restart_button: bool) -> InlineKeyboard
     return InlineKeyboardMarkup(rows)
 
 
-def parent_keyboard(labels: list[str], with_restart_button: bool) -> InlineKeyboardMarkup:
-    """「📂 建在某個資料夾裡」第一步：選上層資料夾（只有第 1 層）。"""
+def parent_keyboard(labels: list[str], with_restart_button: bool, new_parent=None) -> InlineKeyboardMarkup:
+    """「📂 建在某個資料夾裡」第一步：選上層資料夾（只有第 1 層）；打的名稱不存在時可以新建上層。"""
     rows = [[InlineKeyboardButton(label, callback_data=f"{CB_FP_PARENT_PREFIX}{i}")] for i, label in enumerate(labels)]
+    if new_parent:
+        rows.append([InlineKeyboardButton(f"➕ 新建上層「{new_parent}」", callback_data=CB_FP_NEW_PARENT)])
     if with_restart_button:
         rows.append(restart_row())
     return InlineKeyboardMarkup(rows)

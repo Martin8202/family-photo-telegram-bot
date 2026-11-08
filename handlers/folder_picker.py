@@ -27,6 +27,7 @@ from keyboards import (
     CB_FP_ADD_DATE,
     CB_FP_CREATE,
     CB_FP_NEW,
+    CB_FP_NEW_PARENT,
     CB_FP_NO_DATE,
     CB_FP_PARENT_PREFIX,
     CB_FP_PICK_PREFIX,
@@ -90,7 +91,8 @@ def parse_new_folder(text: str, folders: list) -> tuple:
     """
     打的字當成新資料夾時的路徑。回傳 (路徑或 None, 錯誤說明或 None, 要拿去搜尋的字)。
     - 「名稱」→ 建在「照片」底下（第 1 層）
-    - 「上層/名稱」→ 建在既有的第 1 層資料夾裡（第 2 層，11/08 實測補上）；/、\\、全形／都算
+    - 「上層/名稱」→ 建在第 1 層資料夾裡（第 2 層，11/08 實測補上）；/、\\、全形／都算
+      上層還不存在時兩層一起建（11/08 實測補上），拿上層去搜尋，讓人看得到是不是打錯了既有的名稱
     """
     parts = _PATH_SPLIT.split(text)
     if len(parts) == 1:
@@ -99,23 +101,31 @@ def parse_new_folder(text: str, folders: list) -> tuple:
         except storage.FolderNameError as exc:
             return None, str(exc), text
     parent, child = parts[0].strip(), parts[-1].strip()
-    query = child or parent
+    parent_exists = any(f["path"] == parent for f in folders)
+    query = child if (child and parent_exists) else parent
     if len(parts) > 2:
         return None, "新資料夾只能建在「照片」底下，或「照片」裡的某個資料夾裡：請打「上層/新名稱」", query
-    if not any(f["path"] == parent for f in folders):
-        return None, f"「照片」裡沒有叫「{parent}」的資料夾，要建在它裡面，上層名稱要打完整", query
+    if not parent:
+        return None, "「/」前面要打上層資料夾的名稱", child
     if not child:
         return None, f"要建在「{parent}」裡面的話，請在「/」後面打新資料夾的名稱", query
     try:
+        if not parent_exists:
+            parent = storage.validate_folder_name(parent)
         return f"{parent}{SEP}{storage.validate_folder_name(child)}", None, query
     except storage.FolderNameError as exc:
         return None, str(exc), query
 
 
-def new_folder_label(path: str) -> str:
-    """新建按鈕上的名稱：「金門」或「行程」（在「照片」裡的「金門」裡）。"""
+def new_folder_label(path: str, folders: list = ()) -> str:
+    """新建按鈕上的名稱：「金門」、「行程」（在「照片」裡的「金門」裡）、上層也是新的就寫清楚兩個一起建。"""
     name = path.split(SEP)[-1]
-    return f"「{name}」" if SEP not in path else f"「{name}」{location_text(path)}"
+    if SEP not in path:
+        return f"「{name}」"
+    parent = path.split(SEP)[0]
+    if not any(f["path"] == parent for f in folders):
+        return f"「{parent}」和裡面的「{name}」"
+    return f"「{name}」{location_text(path)}"
 
 
 def _with_date(path: str) -> str:
@@ -129,11 +139,13 @@ def _first_level(folders: list) -> list:
     return [f for f in folders if SEP not in f["path"]]
 
 
-async def _show_parents(context: ContextTypes.DEFAULT_TYPE, chat_id: int, st: dict, paths: list, header: str):
+async def _show_parents(context: ContextTypes.DEFAULT_TYPE, chat_id: int, st: dict, paths: list, header: str,
+                        new_parent=None):
     st["parents"] = paths
+    st["new_parent"] = new_parent
     return await _send(
         context, chat_id, header,
-        reply_markup=parent_keyboard([f"📂 {p}" for p in paths], st["mode"] == MODE_UPLOAD),
+        reply_markup=parent_keyboard([f"📂 {p}" for p in paths], st["mode"] == MODE_UPLOAD, new_parent),
     )
 
 
@@ -152,10 +164,17 @@ async def _sub_text(update: Update, context: ContextTypes.DEFAULT_TYPE, st: dict
     if st["stage"] == "parent":
         index = context.application.bot_data.get("folders")
         found = match(text, _first_level(index.folders)) if index is not None else []
-        if not found:
-            await _send(context, chat_id, notify.user_msg_sub_parent_none(text))
-            return
-        await _show_parents(context, chat_id, st, [f["path"] for f in found], notify.user_msg_sub_parent_prompt(True))
+        paths = [f["path"] for f in found]
+        # 找不到、或找到的都不是：可以新建這個上層（11/08 實測補上）；打的名稱剛好已存在就不給
+        try:
+            new_parent = storage.validate_folder_name(text) if text not in paths else None
+            name_error = None
+        except storage.FolderNameError as exc:
+            new_parent, name_error = None, str(exc)
+        header = notify.user_msg_sub_parent_prompt(True) if paths else notify.user_msg_sub_parent_none(text)
+        if name_error:
+            header += "\n" + name_error
+        await _show_parents(context, chat_id, st, paths, header, new_parent)
         return
     try:
         if _PATH_SPLIT.search(text):
@@ -181,19 +200,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: 
         await _sub_text(update, context, st, text)
         return
     index = context.application.bot_data.get("folders")
-    new_name, name_error, query = parse_new_folder(text, index.folders if index is not None else [])
+    folders = index.folders if index is not None else []
+    new_name, name_error, query = parse_new_folder(text, folders)
     results = index.search(query) if index is not None else []
     st["choices"] = [f["path"] for f in results]
     st["new_name"] = new_name
     with_restart = mode == MODE_UPLOAD
     chat_id = update.effective_user.id
-    new_label = new_folder_label(new_name) if new_name else None
+    new_label = new_folder_label(new_name, folders) if new_name else None
+    new_parent = None
+    if new_name and SEP in new_name and not any(f["path"] == new_name.split(SEP)[0] for f in folders):
+        new_parent = new_name.split(SEP)[0]  # 上層也是新的，提醒一句，看看是不是打錯既有的名稱
 
     # 不能新建時一定說明原因（11/08 實測：有搜尋結果時原本沒說，看起來像壞掉）
     if results:
         msg = notify.user_msg_search_results()
         if name_error:
             msg += "\n\n⚠️ 不能新建：" + name_error
+        if new_parent:
+            msg += "\n\n" + notify.user_msg_new_parent_note(new_parent, True)
         await _send(
             context, chat_id, msg,
             reply_markup=search_results_keyboard([folder_label(p) for p in st["choices"]], new_label, with_restart),
@@ -202,6 +227,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: 
     msg = notify.user_msg_search_none(query)
     if name_error:
         msg += "\n" + name_error
+    if new_parent:
+        msg += "\n" + notify.user_msg_new_parent_note(new_parent, False)
     await _send(context, chat_id, msg, reply_markup=search_none_keyboard(new_label, with_restart))
 
 
@@ -234,6 +261,12 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _send(context, chat_id, notify.user_msg_picker_new_prompt())
     elif data == CB_FP_SUB:
         await _start_sub(context, chat_id, st)
+    elif data == CB_FP_NEW_PARENT:
+        parent = st.get("new_parent")
+        if not parent:
+            return
+        st["parent"], st["stage"], st["choices"] = parent, "name", []
+        await _send(context, chat_id, notify.user_msg_new_parent_name_prompt(parent))
     elif data.startswith(CB_FP_PARENT_PREFIX):
         try:
             parent = st.get("parents", [])[int(data[len(CB_FP_PARENT_PREFIX):])]
@@ -278,6 +311,8 @@ async def _finish(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str,
         index = context.application.bot_data.get("folders")
         if index is not None:
             try:
+                if SEP in folder:  # 上層也可能是新的，一起進清單（add_folder 已存在就略過）
+                    await asyncio.to_thread(index.add_folder, folder.split(SEP)[0])
                 await asyncio.to_thread(index.add_folder, folder)  # 新建的立刻進清單（§3.3）
             except Exception:  # noqa: BLE001 - 清單寫不進去不影響上傳
                 logger.exception("新資料夾寫進 folders.json 失敗")

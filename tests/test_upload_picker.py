@@ -257,9 +257,53 @@ async def test_sub_folder_button_flow(env):
 
 
 @pytest.mark.asyncio
+async def test_create_new_parent_and_child_together(env):
+    """11/08 實測：上層還不存在時，打字或用 📂 都可以兩層一起建；會提醒上層是新的。"""
+    app, data_dir, _, nas_dir, _ = env
+    (nas_dir / "測試").mkdir()
+    index = FolderIndex(data_dir / "folders.json", nas_dir)
+    index.rescan()
+    app.bot_data["folders"] = index
+    ctx = DummyContext(app)
+    user = DummyUser(2011, "阿嬤")
+    _approve(app, user)
+
+    # 打字：「新旅行/第一天」
+    await _send_photo(app, ctx, user, "np1", 10)
+    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(11, "2026-12-01新旅行/第一天", 2011, app.bot)), ctx)
+    sent = app.bot.sent_messages[-1]
+    assert "還沒有「2026-12-01新旅行」，按新建會連它一起建" in sent["text"]
+    labels = [b.text for row in sent["reply_markup"].inline_keyboard for b in row]
+    assert "✅ 新建「2026-12-01新旅行」和裡面的「第一天」" in labels
+    await _press(app, ctx, user, "fp:create")
+    await _press(app, ctx, user, "fp:nodate")
+    session = app.bot_data["sessions"].get(2011)
+    assert session.folder == "2026-12-01新旅行\\第一天"
+    assert any(f["path"] == "2026-12-01新旅行" for f in index.folders), "新上層也進資料夾清單"
+    await session.pipeline.settle()
+    await upload._debounce_fire(ctx_with_job(ctx, 2011))
+    assert len(list((nas_dir / "2026-12-01新旅行" / "第一天").glob("*.jpg"))) == 1
+
+    # 📂：打一個不存在的上層 →「➕ 新建上層」→ 打名稱
+    await _send_photo(app, ctx, user, "np2", 20)
+    await upload._picker_fire(ctx_with_job(ctx, 2011))
+    await _press(app, ctx, user, "fp:sub")
+    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(21, "2026-12-24聖誕", 2011, app.bot)), ctx)
+    labels = [b.text for row in app.bot.sent_messages[-1]["reply_markup"].inline_keyboard for b in row]
+    assert "➕ 新建上層「2026-12-24聖誕」" in labels
+    await _press(app, ctx, user, "fp:newparent")
+    assert "會跟裡面的新資料夾一起建" in app.bot.sent_messages[-1]["text"]
+    await upload.handle_folder_text(DummyUpdate(user, DummyMessage(22, "2026-12-24交換禮物", 2011, app.bot)), ctx)
+    session = app.bot_data["sessions"].get(2011)
+    assert session.folder == "2026-12-24聖誕\\2026-12-24交換禮物"
+    await session.pipeline.drain()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("text, reason", [
     ("測試/", "「/」後面打新資料夾的名稱"),
-    ("沒有這個/烤肉", "「照片」裡沒有叫「沒有這個」的資料夾"),
+    ("/烤肉", "「/」前面要打上層資料夾的名稱"),
+    ("壞?上層/烤肉", "不能有這些符號"),
     ("測試/a/b", "請打「上層/新名稱」"),
     ("測試?", "不能有這些符號"),
 ])
